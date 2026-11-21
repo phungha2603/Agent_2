@@ -69,9 +69,9 @@ async function cmdContinue(id: string, decision?: "approve" | "reject", feedback
   await runUntilCheckpoint(task);
 }
 
-async function cmdRetry(id: string): Promise<void> {
+async function cmdRetry(id: string, clearFeedback: boolean): Promise<void> {
   const task = await loadTask(id);
-  retryFromRejected(task);
+  retryFromRejected(task, { clearFeedback });
   await saveTask(task);
   await runUntilCheckpoint(task);
 }
@@ -97,7 +97,7 @@ async function main() {
       await cmdStatus(rest[0]);
       break;
     case "retry":
-      await cmdRetry(rest[0]);
+      await cmdRetry(rest[0], rest.includes("--clear-feedback"));
       break;
     default:
       console.log(
@@ -106,7 +106,7 @@ async function main() {
           '  tsx src/cli.ts new "<idea title>"',
           "  tsx src/cli.ts continue <taskId> [--approve|--reject \"feedback\"]",
           "  tsx src/cli.ts status <taskId>",
-          "  tsx src/cli.ts retry <taskId>   (gives a rejected task a fresh implementation attempt)",
+          "  tsx src/cli.ts retry <taskId> [--clear-feedback]   (fresh implementation attempt; keeps the last reviewer's feedback unless --clear-feedback)",
         ].join("\n"),
       );
   }

@@ -133,23 +133,33 @@ describe("pipeline", () => {
     expect(task.context.reviewFeedback?.[0]).toMatch(/Too risky/);
   });
 
-  it("retry gives a rejected task a fresh implementation budget without redoing idea/architecture", () => {
+  it("retry keeps the last reviewer's feedback by default (that's what the engineer needs next)", () => {
     const task = createTask("Something that failed");
     task.context.ideaBrief = "kept";
     task.context.architectureSpec = "kept";
     task.stage = "rejected";
     task.implementationAttempts = 3;
     task.reviewRejections = 2;
-    task.context.reviewFeedback = ["old feedback"];
+    task.context.reviewFeedback = ["fix the B constant"];
 
     retryFromRejected(task);
 
     expect(task.stage).toBe("implementation");
     expect(task.implementationAttempts).toBe(0);
     expect(task.reviewRejections).toBe(0);
-    expect(task.context.reviewFeedback).toEqual([]);
+    expect(task.context.reviewFeedback).toEqual(["fix the B constant"]);
     expect(task.context.ideaBrief).toBe("kept");
     expect(task.context.architectureSpec).toBe("kept");
+  });
+
+  it("retry clears feedback only when asked to", () => {
+    const task = createTask("Something that failed for an unrelated reason");
+    task.stage = "rejected";
+    task.context.reviewFeedback = ["stale feedback about a now-fixed orchestrator bug"];
+
+    retryFromRejected(task, { clearFeedback: true });
+
+    expect(task.context.reviewFeedback).toEqual([]);
   });
 
   it("refuses to retry a task that isn't rejected", () => {
