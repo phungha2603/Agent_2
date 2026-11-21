@@ -2,7 +2,14 @@ import { mkdtempSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { describe, expect, it } from "vitest";
-import { advance, createTask, isTerminal, isWaitingForHuman, resolveCheckpoint } from "../src/orchestrator/pipeline.js";
+import {
+  advance,
+  createTask,
+  isTerminal,
+  isWaitingForHuman,
+  resolveCheckpoint,
+  retryFromRejected,
+} from "../src/orchestrator/pipeline.js";
 import { createMockAgent } from "../src/agents/mock.js";
 import type { Agent, AgentResponse, TaskContext } from "../src/types.js";
 import type { PipelineConfig } from "../src/orchestrator/pipeline.js";
@@ -124,6 +131,30 @@ describe("pipeline", () => {
     resolveCheckpoint(task, false, "Too risky, rethink the approach.");
     expect(task.stage).toBe("ideation");
     expect(task.context.reviewFeedback?.[0]).toMatch(/Too risky/);
+  });
+
+  it("retry gives a rejected task a fresh implementation budget without redoing idea/architecture", () => {
+    const task = createTask("Something that failed");
+    task.context.ideaBrief = "kept";
+    task.context.architectureSpec = "kept";
+    task.stage = "rejected";
+    task.implementationAttempts = 3;
+    task.reviewRejections = 2;
+    task.context.reviewFeedback = ["old feedback"];
+
+    retryFromRejected(task);
+
+    expect(task.stage).toBe("implementation");
+    expect(task.implementationAttempts).toBe(0);
+    expect(task.reviewRejections).toBe(0);
+    expect(task.context.reviewFeedback).toEqual([]);
+    expect(task.context.ideaBrief).toBe("kept");
+    expect(task.context.architectureSpec).toBe("kept");
+  });
+
+  it("refuses to retry a task that isn't rejected", () => {
+    const task = createTask("Still in progress");
+    expect(() => retryFromRejected(task)).toThrow(/not rejected/);
   });
 
   it("refuses to advance a stage that needs a human decision", async () => {

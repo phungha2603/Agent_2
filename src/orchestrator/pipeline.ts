@@ -179,3 +179,21 @@ export function resolveCheckpoint(task: TaskRecord, approved: boolean, feedback?
   }
   return task;
 }
+
+/**
+ * Gives a "rejected" task a fresh implementation budget without redoing
+ * ideation/architecture — for when the engineer/verification/review loop
+ * failed for a reason that's since been fixed outside the task itself
+ * (e.g. a bug in how an agent's reply was being read).
+ */
+export function retryFromRejected(task: TaskRecord, note?: string): TaskRecord {
+  if (task.stage !== "rejected") {
+    throw new Error(`Task is not rejected (stage: ${task.stage}) — nothing to retry.`);
+  }
+  task.implementationAttempts = 0;
+  task.reviewRejections = 0;
+  task.context.reviewFeedback = [];
+  task.stage = "implementation";
+  log(task, task.stage, "ceo", note ?? "Retrying implementation with a fresh budget.");
+  return task;
+}

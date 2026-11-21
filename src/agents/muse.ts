@@ -47,13 +47,26 @@ export function createMuseAgent(opts: { serverPath: string; profileDir?: string;
         // first by the transport layer.
         { timeout: (timeoutSec + 60) * 1000 },
       );
-      const text = Array.isArray(result.content)
+      const rawText = Array.isArray(result.content)
         ? result.content
             .filter((b: any) => b.type === "text")
             .map((b: any) => b.text)
             .join("\n")
         : "";
-      return { role: "muse", content: text };
+      // muse-server.mjs wraps muse_chat's whole result object
+      // ({ reply, messages, threadUrl, ... }) as one JSON-stringified text
+      // block, so the actual chat reply is nested inside it — unwrap it,
+      // falling back to the raw text if it isn't JSON shaped that way.
+      let reply = rawText;
+      try {
+        const parsed = JSON.parse(rawText);
+        if (parsed && typeof parsed.reply === "string") {
+          reply = parsed.reply;
+        }
+      } catch {
+        // Not JSON (e.g. an error string) — use rawText as-is.
+      }
+      return { role: "muse", content: reply };
     },
   };
 }

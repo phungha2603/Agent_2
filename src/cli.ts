@@ -1,5 +1,12 @@
 import { createInterface } from "node:readline/promises";
-import { advance, createTask, isTerminal, isWaitingForHuman, resolveCheckpoint } from "./orchestrator/pipeline.js";
+import {
+  advance,
+  createTask,
+  isTerminal,
+  isWaitingForHuman,
+  resolveCheckpoint,
+  retryFromRejected,
+} from "./orchestrator/pipeline.js";
 import { loadTask, saveTask } from "./store/taskStore.js";
 import { buildAgents, buildPipelineConfig } from "./config.js";
 import type { TaskRecord } from "./types.js";
@@ -62,6 +69,13 @@ async function cmdContinue(id: string, decision?: "approve" | "reject", feedback
   await runUntilCheckpoint(task);
 }
 
+async function cmdRetry(id: string): Promise<void> {
+  const task = await loadTask(id);
+  retryFromRejected(task);
+  await saveTask(task);
+  await runUntilCheckpoint(task);
+}
+
 async function cmdStatus(id: string): Promise<void> {
   const task = await loadTask(id);
   console.log(JSON.stringify(task, null, 2));
@@ -82,6 +96,9 @@ async function main() {
     case "status":
       await cmdStatus(rest[0]);
       break;
+    case "retry":
+      await cmdRetry(rest[0]);
+      break;
     default:
       console.log(
         [
@@ -89,6 +106,7 @@ async function main() {
           '  tsx src/cli.ts new "<idea title>"',
           "  tsx src/cli.ts continue <taskId> [--approve|--reject \"feedback\"]",
           "  tsx src/cli.ts status <taskId>",
+          "  tsx src/cli.ts retry <taskId>   (gives a rejected task a fresh implementation attempt)",
         ].join("\n"),
       );
   }
