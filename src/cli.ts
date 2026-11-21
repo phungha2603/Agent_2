@@ -1,11 +1,15 @@
 import { setDefaultResultOrder } from "node:dns";
+import { setDefaultAutoSelectFamily } from "node:net";
 import { createInterface } from "node:readline/promises";
 
 // Some networks route IPv6 to Google's hosts but the route is actually
-// dead ("No route to host"). Node tries those addresses before IPv4 by
-// default, which can burn through the whole connection timeout before it
-// ever reaches a working IPv4 address — this makes it try IPv4 first.
+// dead ("No route to host"). dns.setDefaultResultOrder alone isn't enough:
+// Node's fetch still races IPv4 and IPv6 ("Happy Eyeballs") regardless of
+// that preference, so the dead IPv6 attempts can still eat the whole
+// connection timeout. Turning the race off entirely makes it use plain
+// IPv4-first resolution instead.
 setDefaultResultOrder("ipv4first");
+setDefaultAutoSelectFamily(false);
 import {
   advance,
   createTask,
