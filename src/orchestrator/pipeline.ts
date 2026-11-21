@@ -27,21 +27,23 @@ export interface Agents {
 
 /**
  * Optional visual review loop: Gemini generates a reference style image at
- * ideation time, and a real screenshot of the running implementation is
- * taken after verification passes, so review_gemini can compare the two
- * instead of only reading text. Both steps degrade gracefully (logged, not
- * fatal) if generation or the dev server fails — a missing image means the
- * review just falls back to text only, it doesn't block the pipeline.
+ * ideation time, and a real screenshot of the just-built output is taken
+ * after verification passes, so review_gemini can compare the two instead
+ * of only reading text. Both steps degrade gracefully (logged, not fatal)
+ * if generation or the screenshot fails — a missing image means the review
+ * just falls back to text only, it doesn't block the pipeline. The
+ * screenshot serves `buildDir` as static files on a fresh port rather than
+ * running the project's own dev server, so there's nothing that can be
+ * left over from a previous attempt to serve stale content.
  */
 export interface VisualConfig {
   referenceImagePrompt: string;
   referenceImagePath: string;
   screenshotPath: string;
-  devCommand: string;
-  devUrl: string;
+  buildDir: string;
   screenshotWaitMs?: number;
   generateImage: (prompt: string, outPath: string) => Promise<string>;
-  captureScreenshot: (opts: { cwd: string; devCommand: string; url: string; outPath: string; waitMs?: number }) => Promise<string>;
+  captureScreenshot: (opts: { cwd: string; buildDir: string; outPath: string; waitMs?: number }) => Promise<string>;
 }
 
 export interface PipelineConfig {
@@ -96,8 +98,7 @@ function resolveVisual(task: TaskRecord, config: PipelineConfig): VisualConfig |
     referenceImagePrompt: pc.referenceImagePrompt,
     referenceImagePath: pc.referenceImagePath ?? config.visual.referenceImagePath,
     screenshotPath: pc.screenshotPath ?? config.visual.screenshotPath,
-    devCommand: pc.devCommand ?? config.visual.devCommand,
-    devUrl: pc.devUrl ?? config.visual.devUrl,
+    buildDir: pc.buildDir ?? config.visual.buildDir,
     screenshotWaitMs: pc.screenshotWaitMs ?? config.visual.screenshotWaitMs,
   };
 }
@@ -201,8 +202,7 @@ export async function advance(task: TaskRecord, agents: Agents, config: Pipeline
           try {
             await visual.captureScreenshot({
               cwd: verify.cwd,
-              devCommand: visual.devCommand,
-              url: visual.devUrl,
+              buildDir: visual.buildDir,
               outPath: visual.screenshotPath,
               waitMs: visual.screenshotWaitMs,
             });

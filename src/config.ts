@@ -9,7 +9,7 @@ import { createGeminiImageGenerator } from "./agents/geminiImage.js";
 import { createClaudeAgent } from "./agents/claude.js";
 import { createClaudeCliAgent } from "./agents/claude-cli.js";
 import { createMuseAgent } from "./agents/muse.js";
-import { screenshotDevServer } from "./verify/screenshot.js";
+import { screenshotBuildOutput } from "./verify/screenshot.js";
 
 function provider(name: string): "real" | "mock" {
   const v = (process.env[name] ?? "mock").toLowerCase();
@@ -46,8 +46,7 @@ export function buildProjectConfigSnapshot(): ProjectConfig {
     referenceImagePrompt,
     referenceImagePath: referenceImagePrompt ? path.join(VISUAL_DATA_DIR, "reference.png") : undefined,
     screenshotPath: referenceImagePrompt ? path.join(VISUAL_DATA_DIR, "screenshot.png") : undefined,
-    devCommand: process.env.DEV_SERVER_COMMAND,
-    devUrl: process.env.DEV_SERVER_URL,
+    buildDir: process.env.BUILD_OUTPUT_DIR,
     screenshotWaitMs: process.env.SCREENSHOT_WAIT_MS ? Number(process.env.SCREENSHOT_WAIT_MS) : undefined,
   };
 }
@@ -111,11 +110,10 @@ function buildVisualConfig(): VisualConfig | undefined {
     referenceImagePrompt,
     referenceImagePath: path.join(VISUAL_DATA_DIR, "reference.png"),
     screenshotPath: path.join(VISUAL_DATA_DIR, "screenshot.png"),
-    devCommand: process.env.DEV_SERVER_COMMAND ?? "npm run dev",
-    devUrl: process.env.DEV_SERVER_URL ?? "http://localhost:5173",
+    buildDir: process.env.BUILD_OUTPUT_DIR ?? "dist",
     screenshotWaitMs: process.env.SCREENSHOT_WAIT_MS ? Number(process.env.SCREENSHOT_WAIT_MS) : undefined,
     generateImage: (prompt, outPath) => imageGenerator.generate(prompt, outPath),
-    captureScreenshot: (opts) => screenshotDevServer(opts),
+    captureScreenshot: (opts) => screenshotBuildOutput(opts),
   };
 }
 

@@ -26,8 +26,7 @@ describe("per-task project config isolation", () => {
       referenceImagePrompt: "totally unrelated project's style",
       referenceImagePath: "/tmp/ref.png",
       screenshotPath: "/tmp/shot.png",
-      devCommand: "npm run dev",
-      devUrl: "http://localhost:5173",
+      buildDir: "dist",
       generateImage,
       captureScreenshot: vi.fn(),
     });
@@ -51,8 +50,7 @@ describe("per-task project config isolation", () => {
       referenceImagePrompt: "a NEW project's style (set after this task was created)",
       referenceImagePath: "/tmp/new-ref.png",
       screenshotPath: "/tmp/new-shot.png",
-      devCommand: "npm run dev",
-      devUrl: "http://localhost:5173",
+      buildDir: "dist",
       generateImage,
       captureScreenshot: vi.fn(),
     });
@@ -78,8 +76,7 @@ describe("visual review hooks", () => {
       referenceImagePrompt: "a cyberpunk street",
       referenceImagePath: "/tmp/ref.png",
       screenshotPath: "/tmp/shot.png",
-      devCommand: "npm run dev",
-      devUrl: "http://localhost:5173",
+      buildDir: "dist",
       generateImage,
       captureScreenshot: vi.fn(),
     });
@@ -97,8 +94,7 @@ describe("visual review hooks", () => {
       referenceImagePrompt: "a cyberpunk street",
       referenceImagePath: "/tmp/ref.png",
       screenshotPath: "/tmp/shot.png",
-      devCommand: "npm run dev",
-      devUrl: "http://localhost:5173",
+      buildDir: "dist",
       generateImage,
       captureScreenshot: vi.fn(),
     });
@@ -116,8 +112,7 @@ describe("visual review hooks", () => {
       referenceImagePrompt: "a cyberpunk street",
       referenceImagePath: "/tmp/ref.png",
       screenshotPath: "/tmp/shot.png",
-      devCommand: "npm run dev",
-      devUrl: "http://localhost:5173",
+      buildDir: "dist",
       generateImage,
       captureScreenshot: vi.fn(),
     });
@@ -136,8 +131,7 @@ describe("visual review hooks", () => {
       referenceImagePrompt: "a cyberpunk street",
       referenceImagePath: "/tmp/ref.png",
       screenshotPath: "/tmp/shot.png",
-      devCommand: "npm run dev",
-      devUrl: "http://localhost:5173",
+      buildDir: "dist",
       generateImage,
       captureScreenshot: vi.fn(),
     });
@@ -157,8 +151,7 @@ describe("visual review hooks", () => {
       referenceImagePrompt: "a cyberpunk street",
       referenceImagePath: "/tmp/ref.png",
       screenshotPath: "/tmp/shot.png",
-      devCommand: "npm run dev",
-      devUrl: "http://localhost:5173",
+      buildDir: "dist",
       generateImage: vi.fn(),
       captureScreenshot,
     });
@@ -168,7 +161,7 @@ describe("visual review hooks", () => {
     await advance(task, agents(), config);
 
     expect(captureScreenshot).toHaveBeenCalledWith(
-      expect.objectContaining({ devCommand: "npm run dev", url: "http://localhost:5173", outPath: "/tmp/shot.png" }),
+      expect.objectContaining({ buildDir: "dist", outPath: "/tmp/shot.png" }),
     );
     expect(task.context.implementationScreenshotPath).toBe("/tmp/shot.png");
     expect(task.stage).toBe("review_gemini");
@@ -180,8 +173,7 @@ describe("visual review hooks", () => {
       referenceImagePrompt: "a cyberpunk street",
       referenceImagePath: "/tmp/ref.png",
       screenshotPath: "/tmp/shot.png",
-      devCommand: "npm run dev",
-      devUrl: "http://localhost:5173",
+      buildDir: "dist",
       generateImage: vi.fn(),
       captureScreenshot,
     });

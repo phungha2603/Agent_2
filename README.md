@@ -105,8 +105,8 @@ in and the commands that prove it works (e.g.
 For projects where "matches the spec" is partly a visual judgment (a
 3D scene, a UI), set `REFERENCE_IMAGE_PROMPT` in `.env`. Each task
 **snapshots** `VERIFY_CWD`, `VERIFY_COMMANDS`, `REFERENCE_IMAGE_PROMPT` and
-the dev-server settings from `.env` at the moment it's created (`new`) —
-so switching `.env` to a different project afterwards doesn't retroactively
+`BUILD_OUTPUT_DIR` from `.env` at the moment it's created (`new`) — so
+switching `.env` to a different project afterwards doesn't retroactively
 change an in-flight task's rules, and a task created without an image
 prompt never picks one up from a later, unrelated task's `.env` change.
 (Tasks from before this existed have no snapshot and fall back to
@@ -118,18 +118,23 @@ Setting `REFERENCE_IMAGE_PROMPT` turns on:
    (saved to `data/visual/reference.png`) — write the prompt yourself to
    describe exactly the look you want; it isn't derived automatically from
    the idea brief.
-2. After each verification pass, the orchestrator starts `DEV_SERVER_COMMAND`
-   (default `npm run dev`) in `VERIFY_CWD`, waits for `DEV_SERVER_URL`
-   (default `http://localhost:5173`) to respond, and takes a real headless
-   screenshot (`data/visual/screenshot.png`) with Playwright.
+2. After each verification pass, the orchestrator serves `BUILD_OUTPUT_DIR`
+   (default `dist`) as static files on a fresh, randomly assigned port and
+   takes a real headless screenshot (`data/visual/screenshot.png`) with
+   Playwright. This deliberately does **not** start the project's own dev
+   server: a dev server left running from a crashed or interrupted earlier
+   attempt could otherwise keep answering on the same port and silently
+   get screenshotted instead of the current build — serving the build
+   output directly on a new port each time means a screenshot can only
+   ever reflect what's on disk right now.
 3. Gemini's review is then given both images and asked to compare them
    directly — composition, color, mood, missing/extra elements — not just
    whether the build succeeded.
 
-Both steps fail soft: if image generation or the dev server/screenshot
-fails, it's logged and the pipeline continues with a text-only review
-rather than blocking. Needs `npm install` (pulls in `playwright`) and,
-once, `npx playwright install chromium` on this machine.
+Both steps fail soft: if image generation or the screenshot fails, it's
+logged and the pipeline continues with a text-only review rather than
+blocking. Needs `npm install` (pulls in `playwright`) and, once,
+`npx playwright install chromium` on this machine.
 
 ## What's next
 

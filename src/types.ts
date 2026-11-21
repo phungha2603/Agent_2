@@ -65,8 +65,8 @@ export interface ProjectConfig {
   referenceImagePrompt?: string;
   referenceImagePath?: string;
   screenshotPath?: string;
-  devCommand?: string;
-  devUrl?: string;
+  /** Built output directory to screenshot, relative to verifyCwd (e.g. "dist"). */
+  buildDir?: string;
   screenshotWaitMs?: number;
 }
 
