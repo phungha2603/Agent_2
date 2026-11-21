@@ -1,7 +1,24 @@
-/** True for errors worth retrying: transient server overload / rate limiting. */
+const TRANSIENT_NETWORK_CODES = new Set(["ETIMEDOUT", "ECONNRESET", "ECONNREFUSED", "EAI_AGAIN", "ENOTFOUND"]);
+
+/**
+ * True for errors worth retrying: transient server overload/rate limiting,
+ * or a lower-level network blip (connection timeout, DNS hiccup, reset)
+ * from fetch itself rather than a response from the server at all —
+ * Node's fetch wraps those as TypeError("fetch failed") with a `cause`.
+ */
 export function isTransientApiError(err: unknown): boolean {
   const status = (err as { status?: number } | undefined)?.status;
-  return status === 429 || status === 503 || status === 529;
+  if (status === 429 || status === 503 || status === 529) return true;
+
+  if (err instanceof TypeError && /fetch failed/i.test(err.message)) return true;
+
+  const cause = (err as { cause?: unknown } | undefined)?.cause as
+    | { code?: string; errors?: { code?: string }[] }
+    | undefined;
+  if (cause?.code && TRANSIENT_NETWORK_CODES.has(cause.code)) return true;
+  if (cause?.errors?.some((e) => e.code && TRANSIENT_NETWORK_CODES.has(e.code))) return true;
+
+  return false;
 }
 
 /** Retries `fn` with exponential backoff while `shouldRetry` says so. */
