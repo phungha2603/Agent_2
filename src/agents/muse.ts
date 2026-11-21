@@ -1,6 +1,7 @@
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
 import type { Agent, AgentResponse, TaskContext } from "../types.js";
+import { formatContext } from "./context.js";
 
 /**
  * Drives the Muse-Chat-MCP server (github.com/duclm1x1/Muse-Chat-MCP) over
@@ -33,7 +34,7 @@ export function createMuseAgent(opts: { serverPath: string; profileDir?: string;
       const result = await c.callTool({
         name: "muse_chat",
         arguments: {
-          prompt: `${prompt}\n\nTask: ${context.title}`,
+          prompt: `${prompt}\n\n${formatContext(context)}`,
           timeout_sec: opts.timeoutSec ?? 120,
         },
       });

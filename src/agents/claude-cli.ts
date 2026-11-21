@@ -1,6 +1,7 @@
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import type { Agent, AgentResponse, TaskContext } from "../types.js";
+import { formatContext } from "./context.js";
 
 const execFileAsync = promisify(execFile);
 
@@ -15,7 +16,7 @@ export function createClaudeCliAgent(opts: { command?: string; model?: string } 
   return {
     role: "claude",
     async send(prompt: string, context: TaskContext): Promise<AgentResponse> {
-      const args = ["-p", `${prompt}\n\nTask: ${context.title}`];
+      const args = ["-p", `${prompt}\n\n${formatContext(context)}`];
       if (opts.model) args.push("--model", opts.model);
       const { stdout } = await execFileAsync(bin, args, { maxBuffer: 10 * 1024 * 1024 });
       const text = stdout.trim();

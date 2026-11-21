@@ -1,4 +1,5 @@
 import type { Agent, AgentResponse, TaskContext } from "../types.js";
+import { formatContext } from "./context.js";
 
 const DEFAULT_MODEL = "claude-sonnet-5";
 
@@ -21,7 +22,7 @@ export function createClaudeAgent(opts: { apiKey: string; model?: string }): Age
         body: JSON.stringify({
           model,
           max_tokens: 2048,
-          messages: [{ role: "user", content: `${prompt}\n\nTask: ${context.title}` }],
+          messages: [{ role: "user", content: `${prompt}\n\n${formatContext(context)}` }],
         }),
       });
       if (!res.ok) {

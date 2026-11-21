@@ -1,4 +1,5 @@
 import type { Agent, AgentResponse, TaskContext } from "../types.js";
+import { formatContext } from "./context.js";
 
 const DEFAULT_MODEL = "gemini-2.5-pro";
 
@@ -16,7 +17,7 @@ export function createGeminiAgent(opts: { apiKey: string; model?: string }): Age
           "x-goog-api-key": opts.apiKey,
         },
         body: JSON.stringify({
-          contents: [{ role: "user", parts: [{ text: `${prompt}\n\nTask: ${context.title}` }] }],
+          contents: [{ role: "user", parts: [{ text: `${prompt}\n\n${formatContext(context)}` }] }],
         }),
       });
       if (!res.ok) {
