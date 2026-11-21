@@ -51,11 +51,22 @@ npx tsx src/cli.ts status <taskId>
 
 ### Turning on real agents
 
-Set `GEMINI_PROVIDER=real` / `CLAUDE_PROVIDER=real` / `MUSE_PROVIDER=real`
+Set `GEMINI_PROVIDER=real` / `CLAUDE_PROVIDER=api|cli` / `MUSE_PROVIDER=real`
 in `.env` as you wire each one up, with these keys:
 
-- **Gemini** — `GEMINI_API_KEY` (Google AI Studio key).
-- **Claude** — `ANTHROPIC_API_KEY`.
+- **Gemini** — `GEMINI_API_KEY` (Google AI Studio key). Flash/Flash-Lite
+  models have the most generous free tier; Pro is more capable but has a
+  much tighter (or no) free quota — check what's free for your account at
+  https://aistudio.google.com.
+- **Claude** — two ways to run it, no code change needed:
+  - `CLAUDE_PROVIDER=api` + `ANTHROPIC_API_KEY` — calls `api.anthropic.com`
+    directly, billed per token via the Claude Console (separate from any
+    claude.ai subscription).
+  - `CLAUDE_PROVIDER=cli` — shells out to the local `claude` CLI
+    (`claude -p "..."`) instead, using whatever Claude Code subscription
+    it's already logged in with on this machine (Pro/Max usage), so no
+    extra per-token billing and no `ANTHROPIC_API_KEY` needed. Requires
+    `claude` to be installed and logged in on this machine.
 - **Muse** — needs a real, logged-in Chrome session, so this only works on
   a machine you keep running (your own computer / a server you control),
   not in a throwaway container:

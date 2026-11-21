@@ -4,11 +4,17 @@ import type { PipelineConfig } from "./orchestrator/pipeline.js";
 import { createMockAgent } from "./agents/mock.js";
 import { createGeminiAgent } from "./agents/gemini.js";
 import { createClaudeAgent } from "./agents/claude.js";
+import { createClaudeCliAgent } from "./agents/claude-cli.js";
 import { createMuseAgent } from "./agents/muse.js";
 
 function provider(name: string): "real" | "mock" {
   const v = (process.env[name] ?? "mock").toLowerCase();
   return v === "real" ? "real" : "mock";
+}
+
+function claudeProvider(): "api" | "cli" | "mock" {
+  const v = (process.env.CLAUDE_PROVIDER ?? "mock").toLowerCase();
+  return v === "api" || v === "cli" ? v : "mock";
 }
 
 export function buildAgents(): Agents {
@@ -17,10 +23,13 @@ export function buildAgents(): Agents {
       ? createGeminiAgent({ apiKey: requireEnv("GEMINI_API_KEY"), model: process.env.GEMINI_MODEL })
       : createMockAgent("gemini");
 
+  const claudeMode = claudeProvider();
   const claude =
-    provider("CLAUDE_PROVIDER") === "real"
+    claudeMode === "api"
       ? createClaudeAgent({ apiKey: requireEnv("ANTHROPIC_API_KEY"), model: process.env.CLAUDE_MODEL })
-      : createMockAgent("claude");
+      : claudeMode === "cli"
+        ? createClaudeCliAgent({ command: process.env.CLAUDE_CLI_COMMAND, model: process.env.CLAUDE_MODEL })
+        : createMockAgent("claude");
 
   const muse =
     provider("MUSE_PROVIDER") === "real"
