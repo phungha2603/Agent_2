@@ -33,6 +33,10 @@ export interface TaskContext {
   implementationFiles?: string[];
   verificationLog?: string;
   reviewFeedback?: string[];
+  /** Path to an image Gemini generated as the visual style target, if configured. */
+  referenceImagePath?: string;
+  /** Path to a real screenshot of the running implementation, if configured. */
+  implementationScreenshotPath?: string;
 }
 
 export interface HistoryEntry {

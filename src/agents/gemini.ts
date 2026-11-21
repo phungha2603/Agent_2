@@ -1,5 +1,6 @@
 import type { Agent, AgentResponse, TaskContext } from "../types.js";
 import { formatContext } from "./context.js";
+import { readImageParts } from "./imageParts.js";
 import { HttpStatusError, withRetry } from "./retry.js";
 
 const DEFAULT_MODEL = "gemini-2.5-pro";
@@ -11,6 +12,11 @@ export function createGeminiAgent(opts: { apiKey: string; model?: string }): Age
     role: "gemini",
     async send(prompt: string, context: TaskContext): Promise<AgentResponse> {
       const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent`;
+      const parts: unknown[] = [{ text: `${prompt}\n\n${formatContext(context)}` }];
+      if (prompt.startsWith("REVIEW:")) {
+        parts.push(...(await readImageParts("Reference style image (target look):", context.referenceImagePath)));
+        parts.push(...(await readImageParts("Actual screenshot of the running implementation:", context.implementationScreenshotPath)));
+      }
       const data = await withRetry(async () => {
         const res = await fetch(url, {
           method: "POST",
@@ -19,7 +25,7 @@ export function createGeminiAgent(opts: { apiKey: string; model?: string }): Age
             "x-goog-api-key": opts.apiKey,
           },
           body: JSON.stringify({
-            contents: [{ role: "user", parts: [{ text: `${prompt}\n\n${formatContext(context)}` }] }],
+            contents: [{ role: "user", parts }],
           }),
         });
         if (!res.ok) {

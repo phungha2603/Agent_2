@@ -24,10 +24,30 @@ export interface Agents {
   muse: Agent;
 }
 
+/**
+ * Optional visual review loop: Gemini generates a reference style image at
+ * ideation time, and a real screenshot of the running implementation is
+ * taken after verification passes, so review_gemini can compare the two
+ * instead of only reading text. Both steps degrade gracefully (logged, not
+ * fatal) if generation or the dev server fails — a missing image means the
+ * review just falls back to text only, it doesn't block the pipeline.
+ */
+export interface VisualConfig {
+  referenceImagePrompt: string;
+  referenceImagePath: string;
+  screenshotPath: string;
+  devCommand: string;
+  devUrl: string;
+  screenshotWaitMs?: number;
+  generateImage: (prompt: string, outPath: string) => Promise<string>;
+  captureScreenshot: (opts: { cwd: string; devCommand: string; url: string; outPath: string; waitMs?: number }) => Promise<string>;
+}
+
 export interface PipelineConfig {
   verify: VerifyConfig;
   maxImplementationAttempts: number;
   maxReviewRejections: number;
+  visual?: VisualConfig;
 }
 
 const PROMPTS = {
@@ -42,7 +62,11 @@ const PROMPTS = {
     "FILE: relative/path/to/file.ext\n" +
     "followed by the FULL contents of that file (not a diff), then the next FILE: line for the next file. " +
     "Do not skip writing a file's contents, and do not just describe what a file would contain.",
-  reviewGemini: "REVIEW: Review this implementation against the idea brief and verification log. Approve or reject, with reasons.",
+  reviewGemini:
+    "REVIEW: Review this implementation against the idea brief and verification log. " +
+    "If a reference style image and a screenshot of the running implementation are attached, compare them directly — " +
+    "say concretely where the screenshot matches or deviates from the reference's look (composition, color, mood, missing/extra elements), not just whether the code builds. " +
+    "Approve or reject, with reasons.",
   reviewClaude: "REVIEW: Final sign-off review. Check the implementation matches the architecture spec and passed verification. Approve or reject, with reasons.",
 };
 
@@ -71,6 +95,17 @@ export async function advance(task: TaskRecord, agents: Agents, config: Pipeline
       const res = await agents.gemini.send(PROMPTS.ideation, task.context);
       task.context.ideaBrief = res.content;
       log(task, task.stage, "gemini", "Idea brief drafted.");
+
+      if (config.visual && !task.context.referenceImagePath) {
+        try {
+          await config.visual.generateImage(config.visual.referenceImagePrompt, config.visual.referenceImagePath);
+          task.context.referenceImagePath = config.visual.referenceImagePath;
+          log(task, task.stage, "gemini", `Reference style image generated at ${config.visual.referenceImagePath}.`);
+        } catch (err) {
+          log(task, task.stage, "system", `Reference image generation failed (continuing without it): ${(err as Error).message}`);
+        }
+      }
+
       task.stage = "checkpoint_idea";
       return task;
     }
@@ -119,6 +154,21 @@ export async function advance(task: TaskRecord, agents: Agents, config: Pipeline
       task.context.verificationLog = result.log;
       log(task, task.stage, "system", result.passed ? "Verification passed." : "Verification FAILED.");
       if (result.passed) {
+        if (config.visual) {
+          try {
+            await config.visual.captureScreenshot({
+              cwd: config.verify.cwd,
+              devCommand: config.visual.devCommand,
+              url: config.visual.devUrl,
+              outPath: config.visual.screenshotPath,
+              waitMs: config.visual.screenshotWaitMs,
+            });
+            task.context.implementationScreenshotPath = config.visual.screenshotPath;
+            log(task, task.stage, "system", `Screenshot of the running implementation captured at ${config.visual.screenshotPath}.`);
+          } catch (err) {
+            log(task, task.stage, "system", `Screenshot capture failed (review will be text-only): ${(err as Error).message}`);
+          }
+        }
         task.stage = "review_gemini";
       } else if (task.implementationAttempts < config.maxImplementationAttempts) {
         task.context.reviewFeedback = [`Verification failed:\n${result.log}`];

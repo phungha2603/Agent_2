@@ -100,8 +100,30 @@ in and the commands that prove it works (e.g.
 `npm install,npm run build,npm test`). This is what actually gates
 `done` — not any agent's say-so.
 
+### Visual review loop (optional, for UI/visual projects)
+
+For projects where "matches the spec" is partly a visual judgment (a
+3D scene, a UI), set `REFERENCE_IMAGE_PROMPT` in `.env`. This turns on:
+
+1. At ideation time, Gemini generates a reference image from that prompt
+   (saved to `data/visual/reference.png`) — write the prompt yourself to
+   describe exactly the look you want; it isn't derived automatically from
+   the idea brief.
+2. After each verification pass, the orchestrator starts `DEV_SERVER_COMMAND`
+   (default `npm run dev`) in `VERIFY_CWD`, waits for `DEV_SERVER_URL`
+   (default `http://localhost:5173`) to respond, and takes a real headless
+   screenshot (`data/visual/screenshot.png`) with Playwright.
+3. Gemini's review is then given both images and asked to compare them
+   directly — composition, color, mood, missing/extra elements — not just
+   whether the build succeeded.
+
+Both steps fail soft: if image generation or the dev server/screenshot
+fails, it's logged and the pipeline continues with a text-only review
+rather than blocking. Needs `npm install` (pulls in `playwright`) and,
+once, `npx playwright install chromium` on this machine.
+
 ## What's next
 
-This covers the orchestration ("company") model only. The 3D/WebGL
-"office" interface is a later layer on top of this task store — the CLI
-and `data/tasks/*.json` already give it everything it needs to render.
+This covers the orchestration ("company") model and an optional visual
+review loop. The CLI and `data/tasks/*.json` already give a future
+dashboard UI everything it needs to render the company's state.
