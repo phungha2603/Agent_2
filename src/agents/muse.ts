@@ -31,13 +31,22 @@ export function createMuseAgent(opts: { serverPath: string; profileDir?: string;
     role: "muse",
     async send(prompt: string, context: TaskContext): Promise<AgentResponse> {
       const c = await getClient();
-      const result = await c.callTool({
-        name: "muse_chat",
-        arguments: {
-          prompt: `${prompt}\n\n${formatContext(context)}`,
-          timeout_sec: opts.timeoutSec ?? 120,
+      const timeoutSec = opts.timeoutSec ?? 300;
+      const result = await c.callTool(
+        {
+          name: "muse_chat",
+          arguments: {
+            prompt: `${prompt}\n\n${formatContext(context)}`,
+            timeout_sec: timeoutSec,
+          },
         },
-      });
+        undefined,
+        // The MCP client's own request timeout is separate from muse_chat's
+        // timeout_sec argument above — give it extra headroom so a long
+        // reply (Muse typing a real answer in the browser) isn't cut off
+        // first by the transport layer.
+        { timeout: (timeoutSec + 60) * 1000 },
+      );
       const text = Array.isArray(result.content)
         ? result.content
             .filter((b: any) => b.type === "text")

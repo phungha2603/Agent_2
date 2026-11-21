@@ -36,6 +36,7 @@ export function buildAgents(): Agents {
       ? createMuseAgent({
           serverPath: requireEnv("MUSE_MCP_SERVER_PATH"),
           profileDir: process.env.MUSE_PROFILE_DIR,
+          timeoutSec: process.env.MUSE_TIMEOUT_SEC ? Number(process.env.MUSE_TIMEOUT_SEC) : undefined,
         })
       : createMockAgent("muse");
 
