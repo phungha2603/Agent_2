@@ -1,4 +1,11 @@
+import { setDefaultResultOrder } from "node:dns";
 import { createInterface } from "node:readline/promises";
+
+// Some networks route IPv6 to Google's hosts but the route is actually
+// dead ("No route to host"). Node tries those addresses before IPv4 by
+// default, which can burn through the whole connection timeout before it
+// ever reaches a working IPv4 address — this makes it try IPv4 first.
+setDefaultResultOrder("ipv4first");
 import {
   advance,
   createTask,
