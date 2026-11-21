@@ -1,0 +1,22 @@
+{
+  "name": "ai-company",
+  "version": "0.1.0",
+  "description": "Multi-agent 'company' orchestrator: Gemini (ideas), Claude (architecture + sign-off), Muse (implementation via MCP), with mandatory cross-checks and a human checkpoint.",
+  "type": "module",
+  "private": true,
+  "scripts": {
+    "build": "tsc -p .",
+    "cli": "tsx src/cli.ts",
+    "test": "vitest run"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.12.0",
+    "dotenv": "^16.4.5"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.0",
+    "tsx": "^4.19.2",
+    "typescript": "^5.7.2",
+    "vitest": "^2.1.8"
+  }
+}
