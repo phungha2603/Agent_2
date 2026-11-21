@@ -34,7 +34,8 @@ const PROMPTS = {
   ideation:
     "You are the ideation lead. Propose a concrete idea/feature brief for this task: goals, target users, rough scope. Keep it short.",
   architecture:
-    "You are the architecture lead. Do NOT write code. Write an implementation spec (modules, data flow, interfaces, key decisions) that an engineer will follow exactly.",
+    "You are the architecture lead. Do NOT write code. Write an implementation spec (modules, data flow, interfaces, key decisions) that an engineer will follow exactly. " +
+    "If feedback from a previous round is included below, this is a revision: write a full updated spec that actually changes to address that feedback — don't repeat the previous design unchanged.",
   implementation:
     "You are the engineer. Implement the following architecture spec in code.\n" +
     "For every file you create or change, write a line starting with exactly:\n" +
@@ -172,8 +173,20 @@ export function resolveCheckpoint(task: TaskRecord, approved: boolean, feedback?
     log(task, task.stage, "ceo", approved ? "Idea approved." : "Idea sent back.");
     task.stage = approved ? "architecture" : "ideation";
   } else if (task.stage === "checkpoint_final") {
-    log(task, task.stage, "ceo", approved ? "Shipped." : "Sent back for more work.");
-    task.stage = approved ? "done" : "implementation";
+    log(task, task.stage, "ceo", approved ? "Shipped." : "Sent back for a redesign.");
+    if (approved) {
+      task.stage = "done";
+    } else {
+      // Route back through architecture, not straight to implementation:
+      // a human rejecting at the final checkpoint after both agents already
+      // signed off is usually asking for a direction change, not a small
+      // code fix — and the engineer is bound by architectureSpec, so if it
+      // doesn't change to reflect the feedback, the next attempt just gets
+      // re-approved against the same unchanged spec.
+      task.stage = "architecture";
+      task.implementationAttempts = 0;
+      task.reviewRejections = 0;
+    }
   }
   if (!approved && feedback) {
     task.context.reviewFeedback = [feedback];

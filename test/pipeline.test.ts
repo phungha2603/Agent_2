@@ -133,6 +133,21 @@ describe("pipeline", () => {
     expect(task.context.reviewFeedback?.[0]).toMatch(/Too risky/);
   });
 
+  it("sends a CEO rejection at the final checkpoint back through architecture, not straight to implementation", () => {
+    const task = createTask("Wrong direction entirely");
+    task.stage = "checkpoint_final";
+    task.context.architectureSpec = "old spec";
+    task.implementationAttempts = 2;
+    task.reviewRejections = 1;
+
+    resolveCheckpoint(task, false, "This needs a completely different layout.");
+
+    expect(task.stage).toBe("architecture");
+    expect(task.implementationAttempts).toBe(0);
+    expect(task.reviewRejections).toBe(0);
+    expect(task.context.reviewFeedback?.[0]).toMatch(/completely different layout/);
+  });
+
   it("retry keeps the last reviewer's feedback by default (that's what the engineer needs next)", () => {
     const task = createTask("Something that failed");
     task.context.ideaBrief = "kept";
