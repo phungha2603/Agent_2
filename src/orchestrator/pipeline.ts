@@ -75,6 +75,18 @@ function log(task: TaskRecord, stage: Stage, by: RoleName, summary: string): voi
   task.history.push(entry);
 }
 
+/** Generates the reference image once (if visual review is on and it hasn't been made yet). */
+async function ensureReferenceImage(task: TaskRecord, config: PipelineConfig): Promise<void> {
+  if (!config.visual || task.context.referenceImagePath) return;
+  try {
+    await config.visual.generateImage(config.visual.referenceImagePrompt, config.visual.referenceImagePath);
+    task.context.referenceImagePath = config.visual.referenceImagePath;
+    log(task, task.stage, "gemini", `Reference style image generated at ${config.visual.referenceImagePath}.`);
+  } catch (err) {
+    log(task, task.stage, "system", `Reference image generation failed (continuing without it): ${(err as Error).message}`);
+  }
+}
+
 /** Terminal stages, or stages that need a human decision before they can proceed. */
 export function isWaitingForHuman(task: TaskRecord): boolean {
   return task.stage === "checkpoint_idea" || task.stage === "checkpoint_final";
@@ -95,17 +107,7 @@ export async function advance(task: TaskRecord, agents: Agents, config: Pipeline
       const res = await agents.gemini.send(PROMPTS.ideation, task.context);
       task.context.ideaBrief = res.content;
       log(task, task.stage, "gemini", "Idea brief drafted.");
-
-      if (config.visual && !task.context.referenceImagePath) {
-        try {
-          await config.visual.generateImage(config.visual.referenceImagePrompt, config.visual.referenceImagePath);
-          task.context.referenceImagePath = config.visual.referenceImagePath;
-          log(task, task.stage, "gemini", `Reference style image generated at ${config.visual.referenceImagePath}.`);
-        } catch (err) {
-          log(task, task.stage, "system", `Reference image generation failed (continuing without it): ${(err as Error).message}`);
-        }
-      }
-
+      await ensureReferenceImage(task, config);
       task.stage = "checkpoint_idea";
       return task;
     }
@@ -114,6 +116,12 @@ export async function advance(task: TaskRecord, agents: Agents, config: Pipeline
       const res = await agents.claude.send(PROMPTS.architecture, task.context);
       task.context.architectureSpec = res.content;
       log(task, task.stage, "claude", "Architecture spec written.");
+      // Also checked here, not just in ideation: a task can reach
+      // architecture for the first time well after ideation (e.g. the
+      // visual loop was turned on partway through, or this is a
+      // checkpoint_final redesign), and this is still the right moment to
+      // have a reference image before implementation starts.
+      await ensureReferenceImage(task, config);
       task.stage = "implementation";
       return task;
     }

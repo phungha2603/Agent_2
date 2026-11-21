@@ -78,6 +78,27 @@ describe("visual review hooks", () => {
     expect(task.history.some((h) => /Reference image generation failed/.test(h.summary))).toBe(true);
   });
 
+  it("also generates the reference image at architecture time if it wasn't made during ideation", async () => {
+    const generateImage = vi.fn().mockResolvedValue("/tmp/ref.png");
+    const config = baseConfig({
+      referenceImagePrompt: "a cyberpunk street",
+      referenceImagePath: "/tmp/ref.png",
+      screenshotPath: "/tmp/shot.png",
+      devCommand: "npm run dev",
+      devUrl: "http://localhost:5173",
+      generateImage,
+      captureScreenshot: vi.fn(),
+    });
+    const task = createTask("Build a scene");
+    task.stage = "architecture"; // e.g. visual review turned on after ideation already ran
+
+    await advance(task, agents(), config);
+
+    expect(generateImage).toHaveBeenCalledWith("a cyberpunk street", "/tmp/ref.png");
+    expect(task.context.referenceImagePath).toBe("/tmp/ref.png");
+    expect(task.stage).toBe("implementation");
+  });
+
   it("captures a screenshot after verification passes when configured", async () => {
     const captureScreenshot = vi.fn().mockResolvedValue("/tmp/shot.png");
     const config = baseConfig({
