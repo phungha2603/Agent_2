@@ -51,6 +51,25 @@ export interface VerificationResult {
   log: string;
 }
 
+/**
+ * The project-specific settings a task was created with — snapshotted at
+ * creation time so that later changes to .env (switching to a different
+ * project, a different REFERENCE_IMAGE_PROMPT, etc.) don't silently affect
+ * a task that's already in flight. Absent on tasks created before this
+ * existed, which fall back to reading the live config (the old behavior).
+ */
+export interface ProjectConfig {
+  verifyCwd: string;
+  verifyCommands: string[];
+  /** Unset means this task was never configured for the visual review loop. */
+  referenceImagePrompt?: string;
+  referenceImagePath?: string;
+  screenshotPath?: string;
+  devCommand?: string;
+  devUrl?: string;
+  screenshotWaitMs?: number;
+}
+
 export interface TaskRecord {
   id: string;
   createdAt: string;
@@ -60,4 +79,5 @@ export interface TaskRecord {
   history: HistoryEntry[];
   implementationAttempts: number;
   reviewRejections: number;
+  projectConfig?: ProjectConfig;
 }

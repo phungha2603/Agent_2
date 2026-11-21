@@ -1,5 +1,6 @@
 import "dotenv/config";
 import path from "node:path";
+import type { ProjectConfig } from "./types.js";
 import type { Agents } from "./orchestrator/pipeline.js";
 import type { PipelineConfig, VisualConfig } from "./orchestrator/pipeline.js";
 import { createMockAgent } from "./agents/mock.js";
@@ -22,6 +23,33 @@ function claudeProvider(): "api" | "cli" | "mock" {
 
 function verifyCwd(): string {
   return process.env.VERIFY_CWD ?? process.cwd();
+}
+
+function verifyCommands(): string[] {
+  return (process.env.VERIFY_COMMANDS ?? "echo 'no verification command configured'").split(",").map((s) => s.trim());
+}
+
+const VISUAL_DATA_DIR = path.resolve(process.cwd(), "data/visual");
+
+/**
+ * What a new task should remember about "how to build/review it", read
+ * from .env at the moment it's created. Pass this to createTask() so a
+ * later unrelated change to .env (a different project, a different
+ * REFERENCE_IMAGE_PROMPT) doesn't retroactively change this task's rules —
+ * see ProjectConfig's doc comment.
+ */
+export function buildProjectConfigSnapshot(): ProjectConfig {
+  const referenceImagePrompt = process.env.REFERENCE_IMAGE_PROMPT;
+  return {
+    verifyCwd: verifyCwd(),
+    verifyCommands: verifyCommands(),
+    referenceImagePrompt,
+    referenceImagePath: referenceImagePrompt ? path.join(VISUAL_DATA_DIR, "reference.png") : undefined,
+    screenshotPath: referenceImagePrompt ? path.join(VISUAL_DATA_DIR, "screenshot.png") : undefined,
+    devCommand: process.env.DEV_SERVER_COMMAND,
+    devUrl: process.env.DEV_SERVER_URL,
+    screenshotWaitMs: process.env.SCREENSHOT_WAIT_MS ? Number(process.env.SCREENSHOT_WAIT_MS) : undefined,
+  };
 }
 
 export function buildAgents(): Agents {
@@ -54,7 +82,7 @@ export function buildPipelineConfig(): PipelineConfig {
   return {
     verify: {
       cwd: verifyCwd(),
-      commands: (process.env.VERIFY_COMMANDS ?? "echo 'no verification command configured'").split(",").map((s) => s.trim()),
+      commands: verifyCommands(),
     },
     maxImplementationAttempts: Number(process.env.MAX_IMPLEMENTATION_ATTEMPTS ?? 3),
     maxReviewRejections: Number(process.env.MAX_REVIEW_REJECTIONS ?? 3),
@@ -65,7 +93,10 @@ export function buildPipelineConfig(): PipelineConfig {
 /**
  * Enabled by setting REFERENCE_IMAGE_PROMPT — everything else has a
  * sensible default. Needs GEMINI_API_KEY regardless of GEMINI_PROVIDER,
- * since image generation is a separate use of the Gemini API.
+ * since image generation is a separate use of the Gemini API. This is the
+ * live/default config; which task actually uses which parts of it goes
+ * through resolveVisual() in the pipeline against each task's own
+ * ProjectConfig snapshot (see buildProjectConfigSnapshot above).
  */
 function buildVisualConfig(): VisualConfig | undefined {
   const referenceImagePrompt = process.env.REFERENCE_IMAGE_PROMPT;
@@ -75,12 +106,11 @@ function buildVisualConfig(): VisualConfig | undefined {
     apiKey: requireEnv("GEMINI_API_KEY"),
     model: process.env.GEMINI_IMAGE_MODEL,
   });
-  const visualDataDir = path.resolve(process.cwd(), "data/visual");
 
   return {
     referenceImagePrompt,
-    referenceImagePath: path.join(visualDataDir, "reference.png"),
-    screenshotPath: path.join(visualDataDir, "screenshot.png"),
+    referenceImagePath: path.join(VISUAL_DATA_DIR, "reference.png"),
+    screenshotPath: path.join(VISUAL_DATA_DIR, "screenshot.png"),
     devCommand: process.env.DEV_SERVER_COMMAND ?? "npm run dev",
     devUrl: process.env.DEV_SERVER_URL ?? "http://localhost:5173",
     screenshotWaitMs: process.env.SCREENSHOT_WAIT_MS ? Number(process.env.SCREENSHOT_WAIT_MS) : undefined,

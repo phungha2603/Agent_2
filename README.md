@@ -103,7 +103,16 @@ in and the commands that prove it works (e.g.
 ### Visual review loop (optional, for UI/visual projects)
 
 For projects where "matches the spec" is partly a visual judgment (a
-3D scene, a UI), set `REFERENCE_IMAGE_PROMPT` in `.env`. This turns on:
+3D scene, a UI), set `REFERENCE_IMAGE_PROMPT` in `.env`. Each task
+**snapshots** `VERIFY_CWD`, `VERIFY_COMMANDS`, `REFERENCE_IMAGE_PROMPT` and
+the dev-server settings from `.env` at the moment it's created (`new`) —
+so switching `.env` to a different project afterwards doesn't retroactively
+change an in-flight task's rules, and a task created without an image
+prompt never picks one up from a later, unrelated task's `.env` change.
+(Tasks from before this existed have no snapshot and fall back to
+whatever `.env` currently says, same as before.)
+
+Setting `REFERENCE_IMAGE_PROMPT` turns on:
 
 1. At ideation time, Gemini generates a reference image from that prompt
    (saved to `data/visual/reference.png`) — write the prompt yourself to

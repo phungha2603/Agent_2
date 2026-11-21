@@ -19,6 +19,58 @@ function baseConfig(visual: PipelineConfig["visual"]): PipelineConfig {
   };
 }
 
+describe("per-task project config isolation", () => {
+  it("does not run the visual loop for a task whose own snapshot never set a reference image prompt, even if the live config currently has one (a later, unrelated project)", async () => {
+    const generateImage = vi.fn().mockResolvedValue("/tmp/ref.png");
+    const liveConfigForADifferentProject = baseConfig({
+      referenceImagePrompt: "totally unrelated project's style",
+      referenceImagePath: "/tmp/ref.png",
+      screenshotPath: "/tmp/shot.png",
+      devCommand: "npm run dev",
+      devUrl: "http://localhost:5173",
+      generateImage,
+      captureScreenshot: vi.fn(),
+    });
+
+    // This task was created (snapshotted) back when REFERENCE_IMAGE_PROMPT
+    // was unset — it has its own projectConfig, just with no image prompt.
+    const task = createTask("An unrelated backend task", {
+      verifyCwd: liveConfigForADifferentProject.verify.cwd,
+      verifyCommands: liveConfigForADifferentProject.verify.commands,
+    });
+
+    await advance(task, agents(), liveConfigForADifferentProject);
+
+    expect(generateImage).not.toHaveBeenCalled();
+    expect(task.context.referenceImagePath).toBeUndefined();
+  });
+
+  it("uses a task's own snapshotted prompt even if the live config's prompt has since changed", async () => {
+    const generateImage = vi.fn().mockResolvedValue("/tmp/ref.png");
+    const config = baseConfig({
+      referenceImagePrompt: "a NEW project's style (set after this task was created)",
+      referenceImagePath: "/tmp/new-ref.png",
+      screenshotPath: "/tmp/new-shot.png",
+      devCommand: "npm run dev",
+      devUrl: "http://localhost:5173",
+      generateImage,
+      captureScreenshot: vi.fn(),
+    });
+
+    const task = createTask("The original UI task", {
+      verifyCwd: config.verify.cwd,
+      verifyCommands: config.verify.commands,
+      referenceImagePrompt: "the original cyberpunk street prompt",
+      referenceImagePath: "/tmp/original-ref.png",
+    });
+
+    await advance(task, agents(), config);
+
+    expect(generateImage).toHaveBeenCalledWith("the original cyberpunk street prompt", "/tmp/original-ref.png");
+    expect(task.context.referenceImagePath).toBe("/tmp/original-ref.png");
+  });
+});
+
 describe("visual review hooks", () => {
   it("generates a reference image during ideation when configured", async () => {
     const generateImage = vi.fn().mockResolvedValue("/tmp/ref.png");

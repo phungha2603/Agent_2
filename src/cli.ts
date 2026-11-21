@@ -8,7 +8,7 @@ import {
   retryFromRejected,
 } from "./orchestrator/pipeline.js";
 import { loadTask, saveTask } from "./store/taskStore.js";
-import { buildAgents, buildPipelineConfig } from "./config.js";
+import { buildAgents, buildPipelineConfig, buildProjectConfigSnapshot } from "./config.js";
 import type { TaskRecord } from "./types.js";
 
 const STAGE_LABEL: Record<string, string> = {
@@ -45,7 +45,7 @@ async function runUntilCheckpoint(task: TaskRecord): Promise<void> {
 }
 
 async function cmdNew(title: string): Promise<void> {
-  const task = createTask(title);
+  const task = createTask(title, buildProjectConfigSnapshot());
   await saveTask(task);
   console.log(`Created task ${task.id}`);
   await runUntilCheckpoint(task);

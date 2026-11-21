@@ -1,10 +1,10 @@
-import type { Agent, HistoryEntry, RoleName, Stage, TaskRecord } from "../types.js";
+import type { Agent, HistoryEntry, ProjectConfig, RoleName, Stage, TaskRecord } from "../types.js";
 import type { VerifyConfig } from "../verify/runner.js";
 import { runVerification } from "../verify/runner.js";
 import { newTaskId } from "../store/taskStore.js";
 import { parseFileBlocks, writeFiles } from "../apply/applyFiles.js";
 
-export function createTask(title: string): TaskRecord {
+export function createTask(title: string, projectConfig?: ProjectConfig): TaskRecord {
   const now = new Date().toISOString();
   return {
     id: newTaskId(title),
@@ -15,6 +15,7 @@ export function createTask(title: string): TaskRecord {
     history: [],
     implementationAttempts: 0,
     reviewRejections: 0,
+    projectConfig,
   };
 }
 
@@ -70,18 +71,50 @@ const PROMPTS = {
   reviewClaude: "REVIEW: Final sign-off review. Check the implementation matches the architecture spec and passed verification. Approve or reject, with reasons.",
 };
 
+/** The verify settings this task actually runs with — its own snapshot if it has one, else the live config (old tasks). */
+function resolveVerify(task: TaskRecord, config: PipelineConfig): VerifyConfig {
+  const pc = task.projectConfig;
+  if (!pc) return config.verify;
+  return { cwd: pc.verifyCwd, commands: pc.verifyCommands };
+}
+
+/**
+ * The visual-review settings this task actually runs with, or undefined if
+ * it shouldn't run the visual loop at all. A task's own snapshot decides
+ * this, not whatever REFERENCE_IMAGE_PROMPT happens to be set to right
+ * now — a task snapshotted without one stays text-only even if a later,
+ * unrelated task turns the loop on. Only tasks with no snapshot at all
+ * (created before this existed) fall back to the live config.
+ */
+function resolveVisual(task: TaskRecord, config: PipelineConfig): VisualConfig | undefined {
+  if (!config.visual) return undefined;
+  const pc = task.projectConfig;
+  if (!pc) return config.visual;
+  if (!pc.referenceImagePrompt) return undefined;
+  return {
+    ...config.visual,
+    referenceImagePrompt: pc.referenceImagePrompt,
+    referenceImagePath: pc.referenceImagePath ?? config.visual.referenceImagePath,
+    screenshotPath: pc.screenshotPath ?? config.visual.screenshotPath,
+    devCommand: pc.devCommand ?? config.visual.devCommand,
+    devUrl: pc.devUrl ?? config.visual.devUrl,
+    screenshotWaitMs: pc.screenshotWaitMs ?? config.visual.screenshotWaitMs,
+  };
+}
+
 function log(task: TaskRecord, stage: Stage, by: RoleName, summary: string): void {
   const entry: HistoryEntry = { stage, at: new Date().toISOString(), by, summary };
   task.history.push(entry);
 }
 
-/** Generates the reference image once (if visual review is on and it hasn't been made yet). */
+/** Generates the reference image once (if this task's visual review is on and it hasn't been made yet). */
 async function ensureReferenceImage(task: TaskRecord, config: PipelineConfig): Promise<void> {
-  if (!config.visual || task.context.referenceImagePath) return;
+  const visual = resolveVisual(task, config);
+  if (!visual || task.context.referenceImagePath) return;
   try {
-    await config.visual.generateImage(config.visual.referenceImagePrompt, config.visual.referenceImagePath);
-    task.context.referenceImagePath = config.visual.referenceImagePath;
-    log(task, task.stage, "gemini", `Reference style image generated at ${config.visual.referenceImagePath}.`);
+    await visual.generateImage(visual.referenceImagePrompt, visual.referenceImagePath);
+    task.context.referenceImagePath = visual.referenceImagePath;
+    log(task, task.stage, "gemini", `Reference style image generated at ${visual.referenceImagePath}.`);
   } catch (err) {
     log(task, task.stage, "system", `Reference image generation failed (continuing without it): ${(err as Error).message}`);
   }
@@ -144,7 +177,7 @@ export async function advance(task: TaskRecord, agents: Agents, config: Pipeline
           `Implementation attempt #${task.implementationAttempts}: reply had no "FILE:" blocks — nothing was written to disk.`,
         );
       } else {
-        const written = await writeFiles(config.verify.cwd, files);
+        const written = await writeFiles(resolveVerify(task, config).cwd, files);
         task.context.implementationFiles = written;
         log(
           task,
@@ -158,21 +191,23 @@ export async function advance(task: TaskRecord, agents: Agents, config: Pipeline
     }
 
     case "verification": {
-      const result = await runVerification(config.verify);
+      const verify = resolveVerify(task, config);
+      const result = await runVerification(verify);
       task.context.verificationLog = result.log;
       log(task, task.stage, "system", result.passed ? "Verification passed." : "Verification FAILED.");
       if (result.passed) {
-        if (config.visual) {
+        const visual = resolveVisual(task, config);
+        if (visual) {
           try {
-            await config.visual.captureScreenshot({
-              cwd: config.verify.cwd,
-              devCommand: config.visual.devCommand,
-              url: config.visual.devUrl,
-              outPath: config.visual.screenshotPath,
-              waitMs: config.visual.screenshotWaitMs,
+            await visual.captureScreenshot({
+              cwd: verify.cwd,
+              devCommand: visual.devCommand,
+              url: visual.devUrl,
+              outPath: visual.screenshotPath,
+              waitMs: visual.screenshotWaitMs,
             });
-            task.context.implementationScreenshotPath = config.visual.screenshotPath;
-            log(task, task.stage, "system", `Screenshot of the running implementation captured at ${config.visual.screenshotPath}.`);
+            task.context.implementationScreenshotPath = visual.screenshotPath;
+            log(task, task.stage, "system", `Screenshot of the running implementation captured at ${visual.screenshotPath}.`);
           } catch (err) {
             log(task, task.stage, "system", `Screenshot capture failed (review will be text-only): ${(err as Error).message}`);
           }
