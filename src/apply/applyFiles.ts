@@ -7,26 +7,38 @@ export interface ParsedFile {
 }
 
 /**
- * Matches blocks of the form:
- *   FILE: relative/path.ext
- *   ```lang
- *   ...full file content...
- *   ```
- * This is the only format the implementation stage understands — anything
- * else in the agent's reply (prose, explanations) is ignored for the
- * purpose of writing files, but kept in context.implementationDiff for
- * reviewers to read.
+ * Splits the reply on "FILE: relative/path.ext" marker lines — each
+ * marker's content is everything up to the next marker (or end of text).
+ * Agents don't reliably wrap that content in a ```fenced``` code block
+ * despite being asked to, so a wrapping fence is stripped if present but
+ * not required. Anything before the first marker (prose, explanations) is
+ * ignored for writing files, but the whole reply is still kept in
+ * context.implementationDiff for reviewers to read.
  */
-const FILE_BLOCK_RE = /^FILE:\s*(.+?)\s*\r?\n```[a-zA-Z0-9_+-]*\r?\n([\s\S]*?)\r?\n```/gm;
+const FILE_MARKER_RE = /^FILE:[ \t]*(.+?)[ \t]*\r?$/gm;
 
 export function parseFileBlocks(text: string): ParsedFile[] {
-  const files: ParsedFile[] = [];
-  FILE_BLOCK_RE.lastIndex = 0;
+  const markers: { path: string; index: number; contentStart: number }[] = [];
+  FILE_MARKER_RE.lastIndex = 0;
   let match: RegExpExecArray | null;
-  while ((match = FILE_BLOCK_RE.exec(text))) {
-    files.push({ path: match[1].trim(), content: match[2] });
+  while ((match = FILE_MARKER_RE.exec(text))) {
+    markers.push({ path: match[1].trim(), index: match.index, contentStart: match.index + match[0].length });
+  }
+
+  const files: ParsedFile[] = [];
+  for (let i = 0; i < markers.length; i++) {
+    const end = i + 1 < markers.length ? markers[i + 1].index : text.length;
+    const content = stripCodeFence(text.slice(markers[i].contentStart, end).trim());
+    if (content.length > 0) {
+      files.push({ path: markers[i].path, content });
+    }
   }
   return files;
+}
+
+function stripCodeFence(content: string): string {
+  const fenced = content.match(/^```[a-zA-Z0-9_+-]*\r?\n([\s\S]*?)\r?\n?```$/);
+  return fenced ? fenced[1] : content;
 }
 
 /** Writes parsed files under `cwd`, refusing to write outside it. */

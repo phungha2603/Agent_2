@@ -81,17 +81,13 @@ in `.env` as you wire each one up, with these keys:
 
 ### How code actually lands on disk
 
-The `implementation` stage expects the engineer's reply in exactly this
-shape, one block per file:
+The `implementation` stage looks for lines starting with exactly
+`FILE: relative/path/to/file.ext`; everything up to the next such line (or
+the end of the reply) becomes that file's full contents. A wrapping
+```fenced``` code block is stripped if present, but isn't required —
+agents don't reliably add one even when asked to.
 
-```
-FILE: relative/path/to/file.ext
-```
-<full contents of the file>
-```
-```
-
-Anything outside `FILE:` blocks is kept for the record but not written.
+Anything before the first `FILE:` marker is kept for the record but not written.
 Each file is written under `VERIFY_CWD` (paths escaping that directory are
 rejected) — this is what `verification` then actually builds/tests. If a
 reply has no `FILE:` blocks, nothing is written and that's logged, instead

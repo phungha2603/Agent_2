@@ -37,9 +37,10 @@ const PROMPTS = {
     "You are the architecture lead. Do NOT write code. Write an implementation spec (modules, data flow, interfaces, key decisions) that an engineer will follow exactly.",
   implementation:
     "You are the engineer. Implement the following architecture spec in code.\n" +
-    "Output ONLY file blocks, one per file, in exactly this format (no other text outside them):\n" +
-    "FILE: relative/path/to/file.ext\n```\n<full contents of the file>\n```\n" +
-    "Always give the FULL contents of each file you create or change, not a diff.",
+    "For every file you create or change, write a line starting with exactly:\n" +
+    "FILE: relative/path/to/file.ext\n" +
+    "followed by the FULL contents of that file (not a diff), then the next FILE: line for the next file. " +
+    "Do not skip writing a file's contents, and do not just describe what a file would contain.",
   reviewGemini: "REVIEW: Review this implementation against the idea brief and verification log. Approve or reject, with reasons.",
   reviewClaude: "REVIEW: Final sign-off review. Check the implementation matches the architecture spec and passed verification. Approve or reject, with reasons.",
 };
