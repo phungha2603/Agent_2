@@ -17,6 +17,10 @@ function claudeProvider(): "api" | "cli" | "mock" {
   return v === "api" || v === "cli" ? v : "mock";
 }
 
+function verifyCwd(): string {
+  return process.env.VERIFY_CWD ?? process.cwd();
+}
+
 export function buildAgents(): Agents {
   const gemini =
     provider("GEMINI_PROVIDER") === "real"
@@ -28,7 +32,7 @@ export function buildAgents(): Agents {
     claudeMode === "api"
       ? createClaudeAgent({ apiKey: requireEnv("ANTHROPIC_API_KEY"), model: process.env.CLAUDE_MODEL })
       : claudeMode === "cli"
-        ? createClaudeCliAgent({ command: process.env.CLAUDE_CLI_COMMAND, model: process.env.CLAUDE_MODEL })
+        ? createClaudeCliAgent({ command: process.env.CLAUDE_CLI_COMMAND, model: process.env.CLAUDE_MODEL, cwd: verifyCwd() })
         : createMockAgent("claude");
 
   const muse =
@@ -46,7 +50,7 @@ export function buildAgents(): Agents {
 export function buildPipelineConfig(): PipelineConfig {
   return {
     verify: {
-      cwd: process.env.VERIFY_CWD ?? process.cwd(),
+      cwd: verifyCwd(),
       commands: (process.env.VERIFY_COMMANDS ?? "echo 'no verification command configured'").split(",").map((s) => s.trim()),
     },
     maxImplementationAttempts: Number(process.env.MAX_IMPLEMENTATION_ATTEMPTS ?? 3),
