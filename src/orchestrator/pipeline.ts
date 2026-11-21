@@ -2,6 +2,7 @@ import type { Agent, HistoryEntry, RoleName, Stage, TaskRecord } from "../types.
 import type { VerifyConfig } from "../verify/runner.js";
 import { runVerification } from "../verify/runner.js";
 import { newTaskId } from "../store/taskStore.js";
+import { parseFileBlocks, writeFiles } from "../apply/applyFiles.js";
 
 export function createTask(title: string): TaskRecord {
   const now = new Date().toISOString();
@@ -35,7 +36,10 @@ const PROMPTS = {
   architecture:
     "You are the architecture lead. Do NOT write code. Write an implementation spec (modules, data flow, interfaces, key decisions) that an engineer will follow exactly.",
   implementation:
-    "You are the engineer. Implement the following architecture spec in code. Return the change as a diff or full file contents.",
+    "You are the engineer. Implement the following architecture spec in code.\n" +
+    "Output ONLY file blocks, one per file, in exactly this format (no other text outside them):\n" +
+    "FILE: relative/path/to/file.ext\n```\n<full contents of the file>\n```\n" +
+    "Always give the FULL contents of each file you create or change, not a diff.",
   reviewGemini: "REVIEW: Review this implementation against the idea brief and verification log. Approve or reject, with reasons.",
   reviewClaude: "REVIEW: Final sign-off review. Check the implementation matches the architecture spec and passed verification. Approve or reject, with reasons.",
 };
@@ -84,7 +88,26 @@ export async function advance(task: TaskRecord, agents: Agents, config: Pipeline
       const res = await agents.muse.send(PROMPTS.implementation + feedback, task.context);
       task.context.implementationDiff = res.content;
       task.implementationAttempts += 1;
-      log(task, task.stage, "muse", `Implementation attempt #${task.implementationAttempts}.`);
+
+      const files = parseFileBlocks(res.content);
+      if (files.length === 0) {
+        task.context.implementationFiles = [];
+        log(
+          task,
+          task.stage,
+          "system",
+          `Implementation attempt #${task.implementationAttempts}: reply had no "FILE:" blocks — nothing was written to disk.`,
+        );
+      } else {
+        const written = await writeFiles(config.verify.cwd, files);
+        task.context.implementationFiles = written;
+        log(
+          task,
+          task.stage,
+          "muse",
+          `Implementation attempt #${task.implementationAttempts}: wrote ${written.length} file(s): ${written.join(", ")}.`,
+        );
+      }
       task.stage = "verification";
       return task;
     }

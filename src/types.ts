@@ -30,6 +30,7 @@ export interface TaskContext {
   ideaBrief?: string;
   architectureSpec?: string;
   implementationDiff?: string;
+  implementationFiles?: string[];
   verificationLog?: string;
   reviewFeedback?: string[];
 }

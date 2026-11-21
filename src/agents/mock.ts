@@ -29,7 +29,7 @@ export function createMockAgent(role: RoleName): Agent {
         case "muse":
           return {
             role,
-            content: `diff --git a/mock.patch\n+// implementation for: ${context.title}\n`,
+            content: `FILE: NOTES.md\n\`\`\`md\n# ${context.title}\n\nMock implementation note.\n\`\`\`\n`,
           };
         default:
           return { role, content: "" };

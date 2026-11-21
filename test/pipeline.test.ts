@@ -1,3 +1,6 @@
+import { mkdtempSync, readFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import path from "node:path";
 import { describe, expect, it } from "vitest";
 import { advance, createTask, isTerminal, isWaitingForHuman, resolveCheckpoint } from "../src/orchestrator/pipeline.js";
 import { createMockAgent } from "../src/agents/mock.js";
@@ -12,9 +15,14 @@ function agents(overrides: Partial<{ gemini: Agent; claude: Agent; muse: Agent }
   };
 }
 
+/** Never run the pipeline's file-writing step against the real repo. */
+function sandboxDir(): string {
+  return mkdtempSync(path.join(tmpdir(), "ai-company-test-"));
+}
+
 function passingConfig(): PipelineConfig {
   return {
-    verify: { cwd: process.cwd(), commands: ["true"] },
+    verify: { cwd: sandboxDir(), commands: ["true"] },
     maxImplementationAttempts: 3,
     maxReviewRejections: 3,
   };
@@ -22,7 +30,7 @@ function passingConfig(): PipelineConfig {
 
 function failingConfig(): PipelineConfig {
   return {
-    verify: { cwd: process.cwd(), commands: ["false"] },
+    verify: { cwd: sandboxDir(), commands: ["false"] },
     maxImplementationAttempts: 2,
     maxReviewRejections: 3,
   };
@@ -50,6 +58,8 @@ describe("pipeline", () => {
     await advance(task, a, cfg);
     expect(task.stage).toBe("verification");
     expect(task.implementationAttempts).toBe(1);
+    expect(task.context.implementationFiles).toEqual(["NOTES.md"]);
+    expect(readFileSync(path.join(cfg.verify.cwd, "NOTES.md"), "utf8")).toContain("Add dark mode toggle");
 
     await advance(task, a, cfg);
     expect(task.stage).toBe("review_gemini");

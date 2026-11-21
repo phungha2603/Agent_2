@@ -79,6 +79,24 @@ in `.env` as you wire each one up, with these keys:
      `Muse-Chat-MCP/muse-server.mjs`, and `MUSE_PROFILE_DIR` to its
      `.muse-profile` folder.
 
+### How code actually lands on disk
+
+The `implementation` stage expects the engineer's reply in exactly this
+shape, one block per file:
+
+```
+FILE: relative/path/to/file.ext
+```
+<full contents of the file>
+```
+```
+
+Anything outside `FILE:` blocks is kept for the record but not written.
+Each file is written under `VERIFY_CWD` (paths escaping that directory are
+rejected) — this is what `verification` then actually builds/tests. If a
+reply has no `FILE:` blocks, nothing is written and that's logged, instead
+of silently treating the reply as a no-op success.
+
 ### The verification gate
 
 `VERIFY_CWD` + `VERIFY_COMMANDS` point at the real project Muse is coding
