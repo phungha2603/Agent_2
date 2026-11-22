@@ -10,7 +10,7 @@ actually passed.
 | Role | Agent | Does | Does NOT do |
 |---|---|---|---|
 | Idea lead | Gemini | Drafts the idea brief, later reviews the implementation | Write code, approve its own idea |
-| Architecture lead / final sign-off | Claude | Writes the implementation spec (no code), gives the final go/no-go | Write code |
+| Architecture lead / final sign-off | Claude | Mentors the engineer with a precise, step-by-step implementation guide (no code); on rejection, gives exact fix-it instructions; gives the final go/no-go | Write code |
 | Engineer | Muse (via MCP, browser-driven) | Implements the spec in code | Review or approve its own work |
 | CEO | You | Approves the idea, approves the final ship | Everything else |
 

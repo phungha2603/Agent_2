@@ -58,8 +58,10 @@ const PROMPTS = {
     "You are the ideation lead. Propose a concrete idea/feature brief for this task: goals, target users, rough scope. Keep it short. " +
     "If feedback from a previous round is included below, this is a revision of the brief itself — rewrite it to actually reflect the new direction the feedback describes, replacing anything in the old brief that now contradicts it, not just appending a note.",
   architecture:
-    "You are the architecture lead. Do NOT write code. Write an implementation spec (modules, data flow, interfaces, key decisions) that an engineer will follow exactly. " +
-    "If feedback from a previous round is included below, this is a revision: write a full updated spec that actually changes to address that feedback — don't repeat the previous design unchanged.",
+    "You are the architecture lead and mentor to the engineer (Muse), who writes all the code — you do NOT write code yourself. " +
+    "Write a precise, step-by-step implementation guide, not just a high-level spec: exact file list with what each one is responsible for, exact function/method signatures, the order to build things in, plain pseudocode for any non-trivial logic, and common mistakes to avoid. " +
+    "Write it the way you'd personally walk a capable but unfamiliar engineer through building this, so there's as little left to guess as possible. " +
+    "If feedback from a previous round is included below, this is a revision: write a full updated guide that actually changes to address that feedback — don't repeat the previous design unchanged.",
   implementation:
     "You are the engineer. Implement the following architecture spec in code.\n" +
     "For every file you create or change, write a line starting with exactly:\n" +
@@ -71,7 +73,10 @@ const PROMPTS = {
     "If a reference style image and a screenshot of the running implementation are attached, compare them directly — " +
     "say concretely where the screenshot matches or deviates from the reference's look (composition, color, mood, missing/extra elements), not just whether the code builds. " +
     "Approve or reject, with reasons.",
-  reviewClaude: "REVIEW: Final sign-off review. Check the implementation matches the architecture spec and passed verification. Approve or reject, with reasons.",
+  reviewClaude:
+    "REVIEW: Final sign-off review, as the mentor who wrote the architecture guide. Check the implementation matches that guide and passed verification. " +
+    "If you reject, don't just say what's wrong — give precise, step-by-step instructions for exactly how to fix it (which file, which function, what the corrected logic should look like), as if correcting a student's work directly, so the engineer can act on it without guessing. " +
+    "Approve or reject, with reasons.",
   reviewGeminiFallback:
     "REVIEW: Gemini, the usual independent reviewer for this round, is temporarily unavailable, so you are standing in to give that independent review before this reaches your own final sign-off later. " +
     "Review this implementation against the idea brief and verification log as a separate check from your eventual sign-off — focus on whether it actually does what was asked, not just whether it compiles. " +
