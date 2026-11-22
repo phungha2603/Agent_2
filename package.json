@@ -8,6 +8,7 @@
     "build": "tsc -p .",
     "cli": "tsx src/cli.ts",
     "dashboard": "tsx src/dashboard/server.ts",
+    "muse:login": "tsx src/scripts/museLogin.ts",
     "test": "vitest run"
   },
   "dependencies": {

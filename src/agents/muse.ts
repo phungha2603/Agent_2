@@ -6,8 +6,11 @@ import { formatContext } from "./context.js";
 /**
  * Drives the Muse-Chat-MCP server (github.com/duclm1x1/Muse-Chat-MCP) over
  * stdio. That server automates a locally logged-in Chrome session, so this
- * only works on a machine that has already run `npm run selftest` once
- * against that server to create its .muse-profile login.
+ * only works on a machine that has already logged in once to create its
+ * .muse-profile session — via `npm run muse:login` here, not that repo's
+ * own `npm run selftest` (which, despite what its README claims, never
+ * actually waits for login: it launches, checks status once, and closes
+ * immediately).
  */
 export function createMuseAgent(opts: { serverPath: string; profileDir?: string; timeoutSec?: number }): Agent {
   let client: Client | null = null;

@@ -111,12 +111,18 @@ in `.env` as you wire each one up, with these keys:
   not in a throwaway container:
   1. `git clone https://github.com/duclm1x1/Muse-Chat-MCP.git` next to this
      repo, then `cd Muse-Chat-MCP && npm install`.
-  2. `npm run selftest` — a Chrome window opens, log in with your Meta
-     account. The session is saved under `.muse-profile/` and reused after
-     that.
-  3. In `.env` here, set `MUSE_MCP_SERVER_PATH` to the absolute path of
-     `Muse-Chat-MCP/muse-server.mjs`, and `MUSE_PROFILE_DIR` to its
-     `.muse-profile` folder.
+  2. In `.env` here, set `MUSE_MCP_SERVER_PATH` to the absolute path of
+     `Muse-Chat-MCP/muse-server.mjs`, and (optionally) `MUSE_PROFILE_DIR` to
+     where you want its session saved.
+  3. `npm run muse:login` — **not** that repo's own `npm run selftest`,
+     which despite its README never actually waits for login (it launches
+     Chrome, checks status once, and closes immediately — that's a bug in
+     that repo, not a timeout you can tune). This script instead connects
+     as an MCP client and calls its `muse_login` tool directly, which does
+     wait (up to 15 minutes, `MUSE_LOGIN_TIMEOUT_SEC` to change that) — a
+     Chrome window opens, sign in with your Meta account. The session is
+     saved under `.muse-profile/` (or `MUSE_PROFILE_DIR`, if set) and
+     reused after that; re-run `muse:login` only if that session expires.
 
 ### How code actually lands on disk
 
