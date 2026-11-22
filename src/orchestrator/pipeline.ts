@@ -55,7 +55,8 @@ export interface PipelineConfig {
 
 const PROMPTS = {
   ideation:
-    "You are the ideation lead. Propose a concrete idea/feature brief for this task: goals, target users, rough scope. Keep it short.",
+    "You are the ideation lead. Propose a concrete idea/feature brief for this task: goals, target users, rough scope. Keep it short. " +
+    "If feedback from a previous round is included below, this is a revision of the brief itself — rewrite it to actually reflect the new direction the feedback describes, replacing anything in the old brief that now contradicts it, not just appending a note.",
   architecture:
     "You are the architecture lead. Do NOT write code. Write an implementation spec (modules, data flow, interfaces, key decisions) that an engineer will follow exactly. " +
     "If feedback from a previous round is included below, this is a revision: write a full updated spec that actually changes to address that feedback — don't repeat the previous design unchanged.",
@@ -270,13 +271,19 @@ export function resolveCheckpoint(task: TaskRecord, approved: boolean, feedback?
     if (approved) {
       task.stage = "done";
     } else {
-      // Route back through architecture, not straight to implementation:
-      // a human rejecting at the final checkpoint after both agents already
-      // signed off is usually asking for a direction change, not a small
-      // code fix — and the engineer is bound by architectureSpec, so if it
-      // doesn't change to reflect the feedback, the next attempt just gets
-      // re-approved against the same unchanged spec.
-      task.stage = "architecture";
+      // Route all the way back through ideation, not just architecture: a
+      // human rejecting at the final checkpoint after both agents already
+      // signed off is usually asking for a direction change — and the
+      // original ideaBrief stays in every later prompt unchanged unless
+      // something rewrites it. Leaving it stale while only the
+      // architecture spec moves on creates a standing contradiction
+      // ("the brief says outdoor cyberpunk street, the implementation is
+      // an indoor office") that a careful reviewer will correctly refuse
+      // to approve forever, no matter how many times the code changes.
+      // Re-running ideation updates the brief itself, and the CEO
+      // re-approves it at checkpoint_idea before architecture/implementation
+      // continue from a consistent set of documents.
+      task.stage = "ideation";
       task.implementationAttempts = 0;
       task.reviewRejections = 0;
     }

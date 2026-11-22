@@ -133,16 +133,20 @@ describe("pipeline", () => {
     expect(task.context.reviewFeedback?.[0]).toMatch(/Too risky/);
   });
 
-  it("sends a CEO rejection at the final checkpoint back through architecture, not straight to implementation", () => {
+  it("sends a CEO rejection at the final checkpoint all the way back through ideation, not just architecture", () => {
     const task = createTask("Wrong direction entirely");
     task.stage = "checkpoint_final";
+    task.context.ideaBrief = "old, now-contradicted idea brief";
     task.context.architectureSpec = "old spec";
     task.implementationAttempts = 2;
     task.reviewRejections = 1;
 
     resolveCheckpoint(task, false, "This needs a completely different layout.");
 
-    expect(task.stage).toBe("architecture");
+    // Not "architecture": leaving ideaBrief stale and unrevised would keep
+    // contradicting whatever architecture writes next, which a careful
+    // reviewer should (and did, in practice) refuse to approve forever.
+    expect(task.stage).toBe("ideation");
     expect(task.implementationAttempts).toBe(0);
     expect(task.reviewRejections).toBe(0);
     expect(task.context.reviewFeedback?.[0]).toMatch(/completely different layout/);
