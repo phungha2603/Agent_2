@@ -155,8 +155,28 @@ logged and the pipeline continues with a text-only review rather than
 blocking. Needs `npm install` (pulls in `playwright`) and, once,
 `npx playwright install chromium` on this machine.
 
+## Dashboard (10 parallel department slots)
+
+```bash
+npm run dashboard
+```
+then open http://localhost:4000. Ten fixed "department" slots (AG-01
+Product Lead … AG-10 Release Manager) each map to one real task — typing a
+goal and clicking a slot's own button creates/continues *that department's*
+task through the exact same pipeline as the CLI; "Chạy luồng cả công ty"
+queues all ten. A slot showing "Waiting" is parked at a checkpoint and
+shows Duyệt/Từ chối buttons right there instead of needing the CLI.
+
+All ten actions share **one queue, processed strictly one at a time** —
+"run the whole company" does not fire ten simultaneous bursts of
+Gemini/Claude/Muse calls, which would multiply exactly the kind of
+free-tier rate-limit burst this project has already had to work around.
+`Reset` un-assigns tasks from all slots (it doesn't delete the underlying
+task files in `data/tasks/`).
+
 ## What's next
 
-This covers the orchestration ("company") model and an optional visual
-review loop. The CLI and `data/tasks/*.json` already give a future
-dashboard UI everything it needs to render the company's state.
+This covers the orchestration ("company") model, an optional visual
+review loop, and a dashboard for running several departments against the
+same pipeline. `data/tasks/*.json` remains the source of truth either way
+— the dashboard is just another reader/writer of it, like the CLI.

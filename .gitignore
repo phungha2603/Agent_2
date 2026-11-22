@@ -3,3 +3,4 @@ dist/
 .env
 data/tasks/*.json
 data/visual/*.png
+data/dashboard.json
