@@ -1,7 +1,8 @@
-import { mkdir, readFile, writeFile } from "node:fs/promises";
+import { mkdir, readFile } from "node:fs/promises";
 import { existsSync } from "node:fs";
 import path from "node:path";
 import type { Stage } from "../types.js";
+import { writeFileAtomic } from "../store/atomicWrite.js";
 
 export interface SlotDef {
   id: string; // "AG-01"
@@ -44,20 +45,33 @@ export type DashboardState = Record<string, string | null>; // slotId -> taskId 
 
 const STATE_PATH = path.resolve(process.cwd(), "data/dashboard.json");
 
+function emptyState(): DashboardState {
+  return Object.fromEntries(SLOTS.map((s) => [s.id, null]));
+}
+
 export async function loadDashboardState(): Promise<DashboardState> {
   if (!existsSync(STATE_PATH)) {
-    const empty: DashboardState = Object.fromEntries(SLOTS.map((s) => [s.id, null]));
-    return empty;
+    return emptyState();
   }
   const raw = await readFile(STATE_PATH, "utf8");
-  const parsed = JSON.parse(raw) as DashboardState;
+  let parsed: DashboardState;
+  try {
+    parsed = JSON.parse(raw) as DashboardState;
+  } catch (err) {
+    // A corrupted or empty file (e.g. the process was killed mid-write
+    // before writes went through writeFileAtomic) should degrade to "no
+    // slots assigned" rather than crash the whole dashboard server on
+    // every single request. The next save overwrites it with valid JSON.
+    console.error(`data/dashboard.json is corrupted (${(err as Error).message}) — treating it as empty.`);
+    return emptyState();
+  }
   for (const s of SLOTS) if (!(s.id in parsed)) parsed[s.id] = null;
   return parsed;
 }
 
 export async function saveDashboardState(state: DashboardState): Promise<void> {
   await mkdir(path.dirname(STATE_PATH), { recursive: true });
-  await writeFile(STATE_PATH, JSON.stringify(state, null, 2), "utf8");
+  await writeFileAtomic(STATE_PATH, JSON.stringify(state, null, 2));
 }
 
 const STAGE_ORDER: Stage[] = [

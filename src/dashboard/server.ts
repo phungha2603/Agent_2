@@ -13,6 +13,16 @@ const app = express();
 app.use(express.json());
 app.use(express.static(path.join(__dirname, "public")));
 
+/** A corrupted task file shouldn't take down the status of all 10 slots — show that one as idle instead. */
+async function safeLoadTask(id: string): Promise<TaskRecord | undefined> {
+  try {
+    return await loadTask(id);
+  } catch (err) {
+    console.error(`Could not load task ${id} (${(err as Error).message}) — showing this slot as idle.`);
+    return undefined;
+  }
+}
+
 function miniLogs(task: TaskRecord | undefined): { at: string; text: string }[] {
   if (!task) return [];
   return task.history
@@ -25,7 +35,7 @@ app.get("/api/status", async (_req, res) => {
   const slots = await Promise.all(
     SLOTS.map(async (slot) => {
       const taskId = state[slot.id];
-      const task = taskId && taskExists(taskId) ? await loadTask(taskId) : undefined;
+      const task = taskId && taskExists(taskId) ? await safeLoadTask(taskId) : undefined;
       const status = deriveStatus(task?.stage);
       return {
         id: slot.id,

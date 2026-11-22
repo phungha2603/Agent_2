@@ -1,7 +1,8 @@
-import { mkdir, readFile, writeFile } from "node:fs/promises";
+import { mkdir, readFile } from "node:fs/promises";
 import { existsSync } from "node:fs";
 import path from "node:path";
 import type { TaskRecord } from "../types.js";
+import { writeFileAtomic } from "./atomicWrite.js";
 
 const DATA_DIR = path.resolve(process.cwd(), "data/tasks");
 
@@ -17,7 +18,7 @@ export function newTaskId(title: string): string {
 export async function saveTask(task: TaskRecord): Promise<void> {
   await mkdir(DATA_DIR, { recursive: true });
   task.updatedAt = new Date().toISOString();
-  await writeFile(path.join(DATA_DIR, `${task.id}.json`), JSON.stringify(task, null, 2), "utf8");
+  await writeFileAtomic(path.join(DATA_DIR, `${task.id}.json`), JSON.stringify(task, null, 2));
 }
 
 export async function loadTask(id: string): Promise<TaskRecord> {
