@@ -124,6 +124,64 @@ describe("pipeline", () => {
     expect(task.context.reviewFeedback?.[0]).toMatch(/Gemini review feedback/);
   });
 
+  it("falls back to Claude for the review_gemini round when Gemini's own retries are exhausted", async () => {
+    const task = createTask("Needs rework");
+    task.stage = "review_gemini";
+    task.context.implementationDiff = "diff";
+    task.context.verificationLog = "ok";
+
+    const unavailableGemini: Agent = {
+      role: "gemini",
+      async send(): Promise<AgentResponse> {
+        throw new Error("Gemini API error 503: overloaded");
+      },
+    };
+    let claudePrompt = "";
+    const standInClaude: Agent = {
+      role: "claude",
+      async send(prompt: string): Promise<AgentResponse> {
+        claudePrompt = prompt;
+        return { role: "claude", verdict: "approve", content: "Looks fine, standing in for Gemini." };
+      },
+    };
+
+    const a = agents({ gemini: unavailableGemini, claude: standInClaude });
+    const cfg = passingConfig();
+
+    await advance(task, a, cfg);
+
+    expect(claudePrompt).toMatch(/standing in/i);
+    expect(task.stage).toBe("review_claude");
+    expect(task.history.some((h) => /Claude is standing in/.test(h.summary))).toBe(true);
+  });
+
+  it("labels a fallback rejection as Claude standing in, not Gemini", async () => {
+    const task = createTask("Needs rework");
+    task.stage = "review_gemini";
+
+    const unavailableGemini: Agent = {
+      role: "gemini",
+      async send(): Promise<AgentResponse> {
+        throw new Error("Gemini API error 429: rate limited");
+      },
+    };
+    const rejectingStandIn: Agent = {
+      role: "claude",
+      async send(): Promise<AgentResponse> {
+        return { role: "claude", verdict: "reject", content: "Doesn't match the brief." };
+      },
+    };
+
+    const a = agents({ gemini: unavailableGemini, claude: rejectingStandIn });
+    const cfg = passingConfig();
+
+    await advance(task, a, cfg);
+
+    expect(task.stage).toBe("implementation");
+    expect(task.reviewRejections).toBe(1);
+    expect(task.context.reviewFeedback?.[0]).toMatch(/Claude \(standing in for Gemini\) review feedback/);
+  });
+
   it("sends a rejected idea back to ideation instead of forward", () => {
     const task = createTask("Risky idea");
     task.stage = "checkpoint_idea";

@@ -24,9 +24,15 @@ ideation (Gemini)
   -> verification (real commands: build/tests)   -- failure loops back to implementation
   -> review_gemini                                -- reject loops back to implementation
   -> review_claude                                -- reject loops back to implementation
-  -> checkpoint_final (YOU)        -- reject sends it back to implementation
+  -> checkpoint_final (YOU)        -- reject sends it back through ideation (a redesign, not a quick fix)
   -> done
 ```
+
+If Gemini's own retry budget is exhausted (its free tier is down for a
+stretch — rate limited or overloaded), Claude stands in for just that
+round's `review_gemini` rather than leaving the task stuck: logged clearly
+as a stand-in, not a permanent reassignment. The next round tries Gemini
+again.
 
 `done` is reachable from exactly one place in the code
 (`resolveCheckpoint` at `checkpoint_final`), and only after verification has

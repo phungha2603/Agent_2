@@ -1,4 +1,4 @@
-import type { Agent, HistoryEntry, ProjectConfig, RoleName, Stage, TaskRecord } from "../types.js";
+import type { Agent, AgentResponse, HistoryEntry, ProjectConfig, RoleName, Stage, TaskRecord } from "../types.js";
 import type { VerifyConfig } from "../verify/runner.js";
 import { runVerification } from "../verify/runner.js";
 import { newTaskId } from "../store/taskStore.js";
@@ -72,6 +72,10 @@ const PROMPTS = {
     "say concretely where the screenshot matches or deviates from the reference's look (composition, color, mood, missing/extra elements), not just whether the code builds. " +
     "Approve or reject, with reasons.",
   reviewClaude: "REVIEW: Final sign-off review. Check the implementation matches the architecture spec and passed verification. Approve or reject, with reasons.",
+  reviewGeminiFallback:
+    "REVIEW: Gemini, the usual independent reviewer for this round, is temporarily unavailable, so you are standing in to give that independent review before this reaches your own final sign-off later. " +
+    "Review this implementation against the idea brief and verification log as a separate check from your eventual sign-off — focus on whether it actually does what was asked, not just whether it compiles. " +
+    "Approve or reject, with reasons.",
 };
 
 /** The verify settings this task actually runs with — its own snapshot if it has one, else the live config (old tasks). */
@@ -224,14 +228,37 @@ export async function advance(task: TaskRecord, agents: Agents, config: Pipeline
     }
 
     case "review_gemini": {
-      const res = await agents.gemini.send(PROMPTS.reviewGemini, task.context);
-      log(task, task.stage, "gemini", `Verdict: ${res.verdict ?? "unknown"}.`);
+      // Gemini is the independent reviewer for this stage, but its free
+      // tier can go down for stretches (rate limits, server overload) —
+      // when it's genuinely exhausted its own retry budget (not just a
+      // single blip), Claude stands in for this one round rather than
+      // leaving the task stuck waiting on a service that may not come
+      // back soon. This is a stand-in for a round, not a permanent
+      // reassignment: the next task (or even a later round of this one,
+      // after a loop back through implementation) tries Gemini again.
+      let res: AgentResponse;
+      let reviewer: RoleName;
+      try {
+        res = await agents.gemini.send(PROMPTS.reviewGemini, task.context);
+        reviewer = "gemini";
+      } catch (err) {
+        log(
+          task,
+          task.stage,
+          "system",
+          `Gemini review unavailable (${(err as Error).message}) — Claude is standing in for this round's independent review.`,
+        );
+        res = await agents.claude.send(PROMPTS.reviewGeminiFallback, task.context);
+        reviewer = "claude";
+      }
+      log(task, task.stage, reviewer, `Verdict: ${res.verdict ?? "unknown"}.`);
       if (res.verdict === "approve") {
         task.context.reviewFeedback = [];
         task.stage = "review_claude";
       } else {
         task.reviewRejections += 1;
-        task.context.reviewFeedback = [`Gemini review feedback:\n${res.content}`];
+        const reviewerLabel = reviewer === "gemini" ? "Gemini" : "Claude (standing in for Gemini)";
+        task.context.reviewFeedback = [`${reviewerLabel} review feedback:\n${res.content}`];
         task.stage = task.reviewRejections < config.maxReviewRejections ? "implementation" : "rejected";
       }
       return task;
