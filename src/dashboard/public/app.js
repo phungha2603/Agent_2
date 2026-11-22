@@ -64,13 +64,23 @@ function renderCard(slot) {
         <button class="btn btn-reject" onclick="decide('${slot.id}', false, document.getElementById('fb-${slot.id}').value)">Từ chối</button>
       </div>`;
   } else {
-    actionHtml = `<button class="btn btn-small" onclick="runSlot('${slot.id}')">Chạy riêng khung này</button>`;
+    // Not at a checkpoint — but it can still be sitting on real feedback: an
+    // automatic-stage error (runner.ts's "Lỗi khi chạy tự động: ..."), or a
+    // reviewer's rejection mid-retry-loop. Either way, this is exactly the
+    // information that was previously invisible unless you dug into
+    // data/tasks/*.json by hand, so show it instead of just the button.
+    const isError = (slot.lastFeedback ?? "").startsWith("Lỗi khi chạy tự động");
+    const feedbackBox = slot.lastFeedback
+      ? `<div class="feedback-box${isError ? " is-error" : ""}">${isError ? "⚠ " : ""}${escapeHtml(slot.lastFeedback).slice(0, 600)}</div>`
+      : "";
+    actionHtml = `${feedbackBox}<button class="btn btn-small" onclick="runSlot('${slot.id}')">Chạy riêng khung này</button>`;
   }
 
   return `
     <div class="card${slot.isBoss ? " card-boss" : ""}">
       <div class="card-header"><span class="card-icon">${slot.icon}</span><span>${slot.id}: ${escapeHtml(slot.name)}</span></div>
       <div class="badge ${slot.colorClass}">${slot.label}</div>
+      ${slot.stage ? `<div class="stage-raw">${escapeHtml(slot.stage)}</div>` : ""}
       <div class="task-title">${slot.title ? escapeHtml(slot.title) : "Chưa gán task."}</div>
       <div class="progress-track"><div class="progress-fill ${slot.colorClass}" style="width:${slot.progress}%"></div></div>
       <div class="logs">${logsHtml}</div>

@@ -148,6 +148,31 @@ body {
 .badge.red { background: rgba(239,68,68,.15); color: var(--red); }
 .badge.gray { background: rgba(107,114,128,.15); color: var(--gray); }
 
+.stage-raw {
+  font-size: 10px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  color: var(--text-dim);
+  opacity: 0.7;
+  margin: -4px 0 6px;
+}
+
+.feedback-box {
+  margin: 6px 0;
+  padding: 8px;
+  background: #1c2029;
+  border: 1px solid var(--card-border);
+  border-radius: 6px;
+  font-size: 11px;
+  color: var(--text-dim);
+  max-height: 90px;
+  overflow-y: auto;
+  white-space: pre-wrap;
+}
+.feedback-box.is-error {
+  border-color: var(--red);
+  color: #ffb4b4;
+}
+
 .task-title {
   font-size: 11px;
   color: var(--text-dim);
