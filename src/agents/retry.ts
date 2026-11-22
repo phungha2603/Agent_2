@@ -26,7 +26,7 @@ export async function withRetry<T>(
   fn: () => Promise<T>,
   opts: { retries?: number; shouldRetry?: (err: unknown) => boolean; baseDelayMs?: number } = {},
 ): Promise<T> {
-  const retries = opts.retries ?? 4;
+  const retries = opts.retries ?? 8;
   const shouldRetry = opts.shouldRetry ?? isTransientApiError;
   const baseDelayMs = opts.baseDelayMs ?? 2000;
   let lastErr: unknown;
@@ -40,8 +40,11 @@ export async function withRetry<T>(
       // (e.g. Gemini's RetryInfo.retryDelay) — that's authoritative and
       // can be longer than our own backoff schedule, so honor it instead
       // of retrying too early into the same still-closed window.
-      const hinted = (err as { retryAfterMs?: number } | undefined)?.retryAfterMs ?? 0;
-      const delayMs = Math.max(baseDelayMs * 2 ** attempt, hinted);
+      // +3s buffer: a rate-limit window reported as clear at exactly T
+      // can still reject a request that lands right at T, since the
+      // server's clock and ours aren't perfectly in sync.
+      const hinted = (err as { retryAfterMs?: number } | undefined)?.retryAfterMs;
+      const delayMs = hinted ? hinted + 3000 : baseDelayMs * 2 ** attempt;
       await new Promise((resolve) => setTimeout(resolve, delayMs));
     }
   }
