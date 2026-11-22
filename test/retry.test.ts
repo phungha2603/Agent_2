@@ -44,6 +44,25 @@ describe("withRetry", () => {
     expect(calls).toBe(3); // initial attempt + 2 retries
   });
 
+  it("waits at least as long as a server-hinted retryAfterMs, not just the exponential backoff", async () => {
+    let calls = 0;
+    const timestamps: number[] = [];
+    const result = await withRetry(
+      async () => {
+        timestamps.push(Date.now());
+        calls += 1;
+        if (calls < 2) {
+          throw new HttpStatusError(429, "rate limited", 50);
+        }
+        return "ok";
+      },
+      { baseDelayMs: 1 }, // exponential backoff alone would be ~1ms — far less than the 50ms hint
+    );
+    expect(result).toBe("ok");
+    expect(calls).toBe(2);
+    expect(timestamps[1] - timestamps[0]).toBeGreaterThanOrEqual(50);
+  });
+
   it("retries a network-level fetch failure (connection timeout, not an HTTP response)", async () => {
     let calls = 0;
     const fetchFailed = Object.assign(new TypeError("fetch failed"), {
