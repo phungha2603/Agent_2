@@ -49,6 +49,19 @@ npx tsx src/cli.ts continue <taskId> --approve   # ships it (stage: done)
 npx tsx src/cli.ts status <taskId>
 ```
 
+To ask for more work on something already shipped, without losing its
+history (idea brief, architecture spec, prior implementation) or starting
+a new task from nothing:
+
+```bash
+npx tsx src/cli.ts amend <taskId> "Also add a settings page for notification preferences."
+```
+
+This reopens the task at `architecture` (so the spec gets updated to
+match the new request, same reasoning as a checkpoint_final rejection)
+and runs the full implementation → verification → review cycle again,
+ending at a new `checkpoint_final` for you to approve.
+
 ### Turning on real agents
 
 Set `GEMINI_PROVIDER=real` / `CLAUDE_PROVIDER=api|cli` / `MUSE_PROVIDER=real`

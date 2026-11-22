@@ -4,6 +4,7 @@ import path from "node:path";
 import { describe, expect, it } from "vitest";
 import {
   advance,
+  amendShippedTask,
   createTask,
   isTerminal,
   isWaitingForHuman,
@@ -184,6 +185,29 @@ describe("pipeline", () => {
   it("refuses to retry a task that isn't rejected", () => {
     const task = createTask("Still in progress");
     expect(() => retryFromRejected(task)).toThrow(/not rejected/);
+  });
+
+  it("amend reopens a shipped task through architecture, keeping its history", () => {
+    const task = createTask("Shipped feature");
+    task.context.ideaBrief = "original idea, kept";
+    task.context.architectureSpec = "original spec, kept";
+    task.stage = "done";
+    task.implementationAttempts = 2;
+    task.reviewRejections = 1;
+
+    amendShippedTask(task, "Also add a dark mode toggle.");
+
+    expect(task.stage).toBe("architecture");
+    expect(task.implementationAttempts).toBe(0);
+    expect(task.reviewRejections).toBe(0);
+    expect(task.context.reviewFeedback).toEqual(["Also add a dark mode toggle."]);
+    expect(task.context.ideaBrief).toBe("original idea, kept");
+    expect(task.context.architectureSpec).toBe("original spec, kept");
+  });
+
+  it("refuses to amend a task that isn't done", () => {
+    const task = createTask("Still in progress");
+    expect(() => amendShippedTask(task, "change")).toThrow(/not done/);
   });
 
   it("refuses to advance a stage that needs a human decision", async () => {

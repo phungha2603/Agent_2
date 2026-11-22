@@ -12,6 +12,7 @@ setDefaultResultOrder("ipv4first");
 setDefaultAutoSelectFamily(false);
 import {
   advance,
+  amendShippedTask,
   createTask,
   isTerminal,
   isWaitingForHuman,
@@ -87,6 +88,13 @@ async function cmdRetry(id: string, clearFeedback: boolean): Promise<void> {
   await runUntilCheckpoint(task);
 }
 
+async function cmdAmend(id: string, change: string): Promise<void> {
+  const task = await loadTask(id);
+  amendShippedTask(task, change);
+  await saveTask(task);
+  await runUntilCheckpoint(task);
+}
+
 async function cmdStatus(id: string): Promise<void> {
   const task = await loadTask(id);
   console.log(JSON.stringify(task, null, 2));
@@ -110,6 +118,11 @@ async function main() {
     case "retry":
       await cmdRetry(rest[0], rest.includes("--clear-feedback"));
       break;
+    case "amend": {
+      const [id, ...change] = rest;
+      await cmdAmend(id, change.join(" "));
+      break;
+    }
     default:
       console.log(
         [
@@ -118,6 +131,7 @@ async function main() {
           "  tsx src/cli.ts continue <taskId> [--approve|--reject \"feedback\"]",
           "  tsx src/cli.ts status <taskId>",
           "  tsx src/cli.ts retry <taskId> [--clear-feedback]   (fresh implementation attempt; keeps the last reviewer's feedback unless --clear-feedback)",
+          '  tsx src/cli.ts amend <taskId> "<change>"   (reopen an already-shipped task for more work, keeping its history)',
         ].join("\n"),
       );
   }

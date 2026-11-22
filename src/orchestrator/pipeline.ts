@@ -315,3 +315,23 @@ export function retryFromRejected(task: TaskRecord, opts: { note?: string; clear
   log(task, task.stage, "ceo", opts.note ?? "Retrying implementation with a fresh budget.");
   return task;
 }
+
+/**
+ * Reopens an already-shipped ("done") task for a further change, keeping
+ * its full history (ideaBrief, architectureSpec, prior implementation) —
+ * the CEO asking for more work on something already released, not a new
+ * task starting from nothing. Routes through architecture (not straight to
+ * implementation) for the same reason checkpoint_final rejections do: the
+ * spec should actually reflect the new request, not just the code.
+ */
+export function amendShippedTask(task: TaskRecord, change: string): TaskRecord {
+  if (task.stage !== "done") {
+    throw new Error(`Task is not done (stage: ${task.stage}) — nothing to amend.`);
+  }
+  task.implementationAttempts = 0;
+  task.reviewRejections = 0;
+  task.context.reviewFeedback = [change];
+  task.stage = "architecture";
+  log(task, task.stage, "ceo", `Amending shipped task: ${change}`);
+  return task;
+}
