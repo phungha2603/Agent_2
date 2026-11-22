@@ -1,4 +1,5 @@
 import { advance, createTask, isTerminal, isWaitingForHuman, resolveCheckpoint } from "../orchestrator/pipeline.js";
+import { decomposeGoalForDepartments } from "../orchestrator/delegate.js";
 import { loadTask, saveTask, taskExists } from "../store/taskStore.js";
 import { buildAgents, buildPipelineConfig, buildProjectConfigSnapshot } from "../config.js";
 import type { TaskRecord } from "../types.js";
@@ -27,9 +28,34 @@ export function enqueueDecision(slotId: string, approved: boolean, feedback?: st
   void processQueue();
 }
 
-export function enqueueRunAll(goal: string): void {
+/**
+ * "Run the whole company": the company-wide goal goes to the boss (the
+ * tier-1 slot, AG-01), who writes a specific sub-goal for every other
+ * department instead of everyone getting the same text appended to their
+ * name. If the boss's reply doesn't cover a department (bad formatting, or
+ * decomposition failing entirely — e.g. no real Claude key configured),
+ * that department falls back to the old plain "<name>: <goal>" text rather
+ * than being left idle.
+ */
+export async function enqueueRunAll(goal: string): Promise<void> {
+  const agents = buildAgents();
+  let goals: Record<string, string> = {};
+  try {
+    const result = await decomposeGoalForDepartments(
+      agents.claude,
+      goal,
+      SLOTS.map((s) => ({ id: s.id, name: s.name })),
+    );
+    goals = result.goals;
+  } catch {
+    // Decomposition is a best-effort head start, not a gate — every slot
+    // below has its own fallback goal, so a failure here just means none
+    // of them get the tailored version this round.
+  }
+
   for (const slot of SLOTS) {
-    queue.push({ kind: "run", slotId: slot.id, goal: `${slot.name}: ${goal}` });
+    const slotGoal = goals[slot.id] ?? `${slot.name}: ${goal}`;
+    queue.push({ kind: "run", slotId: slot.id, goal: slotGoal });
   }
   void processQueue();
 }

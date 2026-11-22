@@ -2,6 +2,7 @@ export type Stage =
   | "ideation"
   | "checkpoint_idea"
   | "architecture"
+  | "architecture_review"
   | "implementation"
   | "verification"
   | "review_gemini"
@@ -79,5 +80,7 @@ export interface TaskRecord {
   history: HistoryEntry[];
   implementationAttempts: number;
   reviewRejections: number;
+  /** Rounds of the Claude/Gemini architecture discussion so far. Optional for tasks created before this existed. */
+  architectureRounds?: number;
   projectConfig?: ProjectConfig;
 }

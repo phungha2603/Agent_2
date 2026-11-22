@@ -68,7 +68,7 @@ function renderCard(slot) {
   }
 
   return `
-    <div class="card">
+    <div class="card${slot.isBoss ? " card-boss" : ""}">
       <div class="card-header"><span class="card-icon">${slot.icon}</span><span>${slot.id}: ${escapeHtml(slot.name)}</span></div>
       <div class="badge ${slot.colorClass}">${slot.label}</div>
       <div class="task-title">${slot.title ? escapeHtml(slot.title) : "Chưa gán task."}</div>
@@ -78,10 +78,23 @@ function renderCard(slot) {
     </div>`;
 }
 
+function renderTierSection(tier, tierLabel, slots) {
+  if (slots.length === 0) return "";
+  return `
+    <section class="tier-section">
+      <h2 class="tier-heading tier-heading-${tier}">${tierLabel}</h2>
+      <div class="tier-grid">${slots.map(renderCard).join("")}</div>
+    </section>`;
+}
+
 async function refresh() {
   const res = await fetch("/api/status");
   const data = await res.json();
-  grid.innerHTML = data.slots.map(renderCard).join("");
+  const byTier = { 1: [], 2: [], 3: [] };
+  for (const slot of data.slots) (byTier[slot.tier] ?? byTier[3]).push(slot);
+  grid.innerHTML = [1, 2, 3]
+    .map((tier) => renderTierSection(tier, byTier[tier][0]?.tierLabel ?? "", byTier[tier]))
+    .join("");
 }
 
 // Expose for inline onclick handlers.

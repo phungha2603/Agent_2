@@ -15,6 +15,7 @@ export function createTask(title: string, projectConfig?: ProjectConfig): TaskRe
     history: [],
     implementationAttempts: 0,
     reviewRejections: 0,
+    architectureRounds: 0,
     projectConfig,
   };
 }
@@ -50,6 +51,8 @@ export interface PipelineConfig {
   verify: VerifyConfig;
   maxImplementationAttempts: number;
   maxReviewRejections: number;
+  /** Safety ceiling on Claude/Gemini architecture discussion rounds (default 20 — meant to never be hit in practice). */
+  maxArchitectureRounds?: number;
   visual?: VisualConfig;
 }
 
@@ -62,6 +65,10 @@ const PROMPTS = {
     "Write a precise, step-by-step implementation guide, not just a high-level spec: exact file list with what each one is responsible for, exact function/method signatures, the order to build things in, plain pseudocode for any non-trivial logic, and common mistakes to avoid. " +
     "Write it the way you'd personally walk a capable but unfamiliar engineer through building this, so there's as little left to guess as possible. " +
     "If feedback from a previous round is included below, this is a revision: write a full updated guide that actually changes to address that feedback — don't repeat the previous design unchanged.",
+  architectureReview:
+    "REVIEW: You are discussing this architecture spec with Claude before any code gets written — Muse hasn't started yet. " +
+    "Read it against the idea brief. If it's solid, approve it. If something is missing, ambiguous, risky, or could be designed better, reject and say exactly what to add or change — name the specific section, file, or interface and what you'd write instead, since Claude will revise the spec and you'll read the new version next round. " +
+    "There is no limit on how many rounds this can take — only approve once you'd actually be comfortable seeing this built exactly as written.",
   implementation:
     "You are the engineer. Implement the following architecture spec in code.\n" +
     "For every file you create or change, write a line starting with exactly:\n" +
@@ -75,8 +82,9 @@ const PROMPTS = {
     "Approve or reject, with reasons.",
   reviewClaude:
     "REVIEW: Final sign-off review, as the mentor who wrote the architecture guide. Check the implementation matches that guide and passed verification. " +
-    "If you reject, don't just say what's wrong — give precise, step-by-step instructions for exactly how to fix it (which file, which function, what the corrected logic should look like), as if correcting a student's work directly, so the engineer can act on it without guessing. " +
-    "Approve or reject, with reasons.",
+    "If feedback from the independent reviewer is included above, you decide for yourself whether it's actually correct before ruling — don't just rubber-stamp it: you may agree with it, or overrule it and approve anyway (say briefly why). " +
+    "If you reject — whether because you agree with that feedback or found your own issue — don't just say what's wrong: give precise, step-by-step instructions for exactly how to fix it (which file, which function, what the corrected logic should look like), as if correcting a student's work directly, so the engineer can act on it without guessing. " +
+    "You are always the one who makes this call, not the independent reviewer. Approve or reject, with reasons.",
   reviewGeminiFallback:
     "REVIEW: Gemini, the usual independent reviewer for this round, is temporarily unavailable, so you are standing in to give that independent review before this reaches your own final sign-off later. " +
     "Review this implementation against the idea brief and verification log as a separate check from your eventual sign-off — focus on whether it actually does what was asked, not just whether it compiles. " +
@@ -166,7 +174,23 @@ export async function advance(task: TaskRecord, agents: Agents, config: Pipeline
       // checkpoint_final redesign), and this is still the right moment to
       // have a reference image before implementation starts.
       await ensureReferenceImage(task, config);
-      task.stage = "implementation";
+      task.context.reviewFeedback = [];
+      task.stage = "architecture_review";
+      return task;
+    }
+
+    case "architecture_review": {
+      const res = await agents.gemini.send(PROMPTS.architectureReview, task.context);
+      log(task, task.stage, "gemini", `Verdict: ${res.verdict ?? "unknown"}.`);
+      if (res.verdict === "approve") {
+        task.context.reviewFeedback = [];
+        task.stage = "implementation";
+      } else {
+        task.architectureRounds = (task.architectureRounds ?? 0) + 1;
+        const maxRounds = config.maxArchitectureRounds ?? 20;
+        task.context.reviewFeedback = [`Gemini's architecture feedback (round ${task.architectureRounds}):\n${res.content}`];
+        task.stage = task.architectureRounds < maxRounds ? "architecture" : "rejected";
+      }
       return task;
     }
 
@@ -257,15 +281,14 @@ export async function advance(task: TaskRecord, agents: Agents, config: Pipeline
         reviewer = "claude";
       }
       log(task, task.stage, reviewer, `Verdict: ${res.verdict ?? "unknown"}.`);
-      if (res.verdict === "approve") {
-        task.context.reviewFeedback = [];
-        task.stage = "review_claude";
-      } else {
-        task.reviewRejections += 1;
-        const reviewerLabel = reviewer === "gemini" ? "Gemini" : "Claude (standing in for Gemini)";
-        task.context.reviewFeedback = [`${reviewerLabel} review feedback:\n${res.content}`];
-        task.stage = task.reviewRejections < config.maxReviewRejections ? "implementation" : "rejected";
-      }
+      // Whatever this independent review's verdict, it goes to Claude next —
+      // nothing here loops back to implementation directly. Claude (the
+      // mentor who wrote the architecture guide) decides for itself whether
+      // the feedback holds up, and is the only one who can actually send the
+      // task back to implementation (see review_claude below).
+      const reviewerLabel = reviewer === "gemini" ? "Gemini" : "Claude (standing in for Gemini)";
+      task.context.reviewFeedback = res.verdict === "reject" ? [`${reviewerLabel} review feedback:\n${res.content}`] : [];
+      task.stage = "review_claude";
       return task;
     }
 
@@ -318,6 +341,7 @@ export function resolveCheckpoint(task: TaskRecord, approved: boolean, feedback?
       task.stage = "ideation";
       task.implementationAttempts = 0;
       task.reviewRejections = 0;
+      task.architectureRounds = 0;
     }
   }
   if (!approved && feedback) {
@@ -362,6 +386,7 @@ export function amendShippedTask(task: TaskRecord, change: string): TaskRecord {
   }
   task.implementationAttempts = 0;
   task.reviewRejections = 0;
+  task.architectureRounds = 0;
   task.context.reviewFeedback = [change];
   task.stage = "architecture";
   log(task, task.stage, "ceo", `Amending shipped task: ${change}`);

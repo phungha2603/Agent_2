@@ -85,6 +85,7 @@ export function buildPipelineConfig(): PipelineConfig {
     },
     maxImplementationAttempts: Number(process.env.MAX_IMPLEMENTATION_ATTEMPTS ?? 3),
     maxReviewRejections: Number(process.env.MAX_REVIEW_REJECTIONS ?? 3),
+    maxArchitectureRounds: Number(process.env.MAX_ARCHITECTURE_ROUNDS ?? 20),
     visual: buildVisualConfig(),
   };
 }

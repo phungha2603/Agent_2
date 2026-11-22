@@ -142,7 +142,7 @@ describe("visual review hooks", () => {
 
     expect(generateImage).toHaveBeenCalledWith("a cyberpunk street", "/tmp/ref.png");
     expect(task.context.referenceImagePath).toBe("/tmp/ref.png");
-    expect(task.stage).toBe("implementation");
+    expect(task.stage).toBe("architecture_review");
   });
 
   it("captures a screenshot after verification passes when configured", async () => {

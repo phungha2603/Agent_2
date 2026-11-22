@@ -1,7 +1,7 @@
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import express from "express";
-import { SLOTS, deriveStatus, loadDashboardState } from "./slots.js";
+import { SLOTS, TIER_LABELS, deriveStatus, loadDashboardState } from "./slots.js";
 import { enqueueDecision, enqueueRun, enqueueRunAll, queueLength, resetAllSlots } from "./runner.js";
 import { loadTask, taskExists } from "../store/taskStore.js";
 import type { HistoryEntry, TaskRecord } from "../types.js";
@@ -31,6 +31,9 @@ app.get("/api/status", async (_req, res) => {
         id: slot.id,
         name: slot.name,
         icon: slot.icon,
+        tier: slot.tier,
+        tierLabel: TIER_LABELS[slot.tier],
+        isBoss: slot.tier === 1,
         taskId: taskId ?? null,
         title: task?.context.title ?? null,
         stage: task?.stage ?? null,
@@ -61,10 +64,10 @@ app.post("/api/slots/:id/decision", (req, res) => {
   res.json({ ok: true });
 });
 
-app.post("/api/run-all", (req, res) => {
+app.post("/api/run-all", async (req, res) => {
   const goal = typeof req.body?.goal === "string" ? req.body.goal.trim() : "";
   if (!goal) return res.status(400).json({ error: "missing goal" });
-  enqueueRunAll(goal);
+  await enqueueRunAll(goal);
   res.json({ ok: true });
 });
 

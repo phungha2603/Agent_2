@@ -60,8 +60,11 @@ describe("pipeline", () => {
     expect(task.stage).toBe("architecture");
 
     await advance(task, a, cfg);
-    expect(task.stage).toBe("implementation");
+    expect(task.stage).toBe("architecture_review");
     expect(task.context.architectureSpec).toBeTruthy();
+
+    await advance(task, a, cfg); // Gemini signs off on the architecture (mock always approves)
+    expect(task.stage).toBe("implementation");
 
     await advance(task, a, cfg);
     expect(task.stage).toBe("verification");
@@ -102,7 +105,7 @@ describe("pipeline", () => {
     expect(isTerminal(task)).toBe(true);
   });
 
-  it("loops implementation back when a reviewer rejects, and never lets an agent set done", async () => {
+  it("routes a reviewer's rejection through Claude before looping back to implementation — Gemini alone can't send it back", async () => {
     const task = createTask("Needs rework");
     task.stage = "review_gemini";
     task.context.implementationDiff = "diff";
@@ -114,14 +117,51 @@ describe("pipeline", () => {
         return { role: "gemini", verdict: "reject", content: "Not aligned with the brief." };
       },
     };
+    const agreeingClaude: Agent = {
+      role: "claude",
+      async send(): Promise<AgentResponse> {
+        return { role: "claude", verdict: "reject", content: "Agreed with Gemini — fix the validation logic in step 2." };
+      },
+    };
 
-    const a = agents({ gemini: rejectingGemini });
+    const a = agents({ gemini: rejectingGemini, claude: agreeingClaude });
     const cfg = passingConfig();
+
+    await advance(task, a, cfg);
+    expect(task.stage).toBe("review_claude");
+    expect(task.reviewRejections).toBe(0); // not yet — Claude hasn't ruled
+    expect(task.context.reviewFeedback?.[0]).toMatch(/Gemini review feedback/);
 
     await advance(task, a, cfg);
     expect(task.stage).toBe("implementation");
     expect(task.reviewRejections).toBe(1);
-    expect(task.context.reviewFeedback?.[0]).toMatch(/Gemini review feedback/);
+    expect(task.context.reviewFeedback?.[0]).toMatch(/Claude review feedback/);
+  });
+
+  it("lets Claude overrule a Gemini rejection and approve anyway", async () => {
+    const task = createTask("Needs rework");
+    task.stage = "review_gemini";
+
+    const rejectingGemini: Agent = {
+      role: "gemini",
+      async send(): Promise<AgentResponse> {
+        return { role: "gemini", verdict: "reject", content: "Nit: naming could be clearer." };
+      },
+    };
+    const overrulingClaude: Agent = {
+      role: "claude",
+      async send(): Promise<AgentResponse> {
+        return { role: "claude", verdict: "approve", content: "Overruling Gemini — naming matches the spec's own terms." };
+      },
+    };
+
+    const a = agents({ gemini: rejectingGemini, claude: overrulingClaude });
+    const cfg = passingConfig();
+
+    await advance(task, a, cfg); // review_gemini -> review_claude
+    await advance(task, a, cfg); // review_claude approves despite Gemini's reject
+    expect(task.stage).toBe("checkpoint_final");
+    expect(task.reviewRejections).toBe(0);
   });
 
   it("falls back to Claude for the review_gemini round when Gemini's own retries are exhausted", async () => {
@@ -155,7 +195,7 @@ describe("pipeline", () => {
     expect(task.history.some((h) => /Claude is standing in/.test(h.summary))).toBe(true);
   });
 
-  it("labels a fallback rejection as Claude standing in, not Gemini", async () => {
+  it("labels a fallback rejection as Claude standing in, not Gemini, before Claude's own final ruling takes over", async () => {
     const task = createTask("Needs rework");
     task.stage = "review_gemini";
 
@@ -175,11 +215,61 @@ describe("pipeline", () => {
     const a = agents({ gemini: unavailableGemini, claude: rejectingStandIn });
     const cfg = passingConfig();
 
-    await advance(task, a, cfg);
+    await advance(task, a, cfg); // review_gemini (Claude standing in) -> review_claude
+    expect(task.stage).toBe("review_claude");
+    expect(task.reviewRejections).toBe(0);
+    expect(task.context.reviewFeedback?.[0]).toMatch(/Claude \(standing in for Gemini\) review feedback/);
 
+    await advance(task, a, cfg); // review_claude: same mock agent rejects again -> implementation
     expect(task.stage).toBe("implementation");
     expect(task.reviewRejections).toBe(1);
-    expect(task.context.reviewFeedback?.[0]).toMatch(/Claude \(standing in for Gemini\) review feedback/);
+    expect(task.context.reviewFeedback?.[0]).toMatch(/Claude review feedback/);
+  });
+
+  it("loops the architecture spec back to Claude when Gemini has concerns, with no cap on normal rounds", async () => {
+    const task = createTask("New feature");
+    task.stage = "architecture_review";
+    task.context.architectureSpec = "v1 draft";
+
+    const nitpickyGemini: Agent = {
+      role: "gemini",
+      async send(): Promise<AgentResponse> {
+        return { role: "gemini", verdict: "reject", content: "Missing error handling for the empty-input case." };
+      },
+    };
+    const a = agents({ gemini: nitpickyGemini });
+    const cfg = passingConfig();
+
+    await advance(task, a, cfg);
+    expect(task.stage).toBe("architecture");
+    expect(task.architectureRounds).toBe(1);
+    expect(task.context.reviewFeedback?.[0]).toMatch(/Missing error handling/);
+
+    await advance(task, a, cfg); // Claude revises -> architecture_review again
+    expect(task.stage).toBe("architecture_review");
+
+    await advance(task, a, cfg); // Gemini still has concerns -> back to architecture, round 2
+    expect(task.stage).toBe("architecture");
+    expect(task.architectureRounds).toBe(2);
+  });
+
+  it("gives up the architecture discussion once it hits the safety ceiling", async () => {
+    const task = createTask("New feature");
+    task.stage = "architecture_review";
+    task.architectureRounds = 19;
+
+    const nitpickyGemini: Agent = {
+      role: "gemini",
+      async send(): Promise<AgentResponse> {
+        return { role: "gemini", verdict: "reject", content: "Still missing something." };
+      },
+    };
+    const a = agents({ gemini: nitpickyGemini });
+    const cfg: PipelineConfig = { ...passingConfig(), maxArchitectureRounds: 20 };
+
+    await advance(task, a, cfg);
+    expect(task.architectureRounds).toBe(20);
+    expect(task.stage).toBe("rejected");
   });
 
   it("sends a rejected idea back to ideation instead of forward", () => {
@@ -199,6 +289,7 @@ describe("pipeline", () => {
     task.context.architectureSpec = "old spec";
     task.implementationAttempts = 2;
     task.reviewRejections = 1;
+    task.architectureRounds = 4;
 
     resolveCheckpoint(task, false, "This needs a completely different layout.");
 
@@ -208,6 +299,7 @@ describe("pipeline", () => {
     expect(task.stage).toBe("ideation");
     expect(task.implementationAttempts).toBe(0);
     expect(task.reviewRejections).toBe(0);
+    expect(task.architectureRounds).toBe(0);
     expect(task.context.reviewFeedback?.[0]).toMatch(/completely different layout/);
   });
 
@@ -252,12 +344,14 @@ describe("pipeline", () => {
     task.stage = "done";
     task.implementationAttempts = 2;
     task.reviewRejections = 1;
+    task.architectureRounds = 3;
 
     amendShippedTask(task, "Also add a dark mode toggle.");
 
     expect(task.stage).toBe("architecture");
     expect(task.implementationAttempts).toBe(0);
     expect(task.reviewRejections).toBe(0);
+    expect(task.architectureRounds).toBe(0);
     expect(task.context.reviewFeedback).toEqual(["Also add a dark mode toggle."]);
     expect(task.context.ideaBrief).toBe("original idea, kept");
     expect(task.context.architectureSpec).toBe("original spec, kept");

@@ -9,8 +9,8 @@ actually passed.
 
 | Role | Agent | Does | Does NOT do |
 |---|---|---|---|
-| Idea lead | Gemini | Drafts the idea brief, later reviews the implementation | Write code, approve its own idea |
-| Architecture lead / final sign-off | Claude | Mentors the engineer with a precise, step-by-step implementation guide (no code); on rejection, gives exact fix-it instructions; gives the final go/no-go | Write code |
+| Idea lead | Gemini | Drafts the idea brief; discusses the architecture spec with Claude before any code is written; later reviews the implementation | Write code, approve its own idea |
+| Architecture lead / final sign-off | Claude | Writes the spec, revises it based on Gemini's feedback (no limit on rounds), mentors the engineer with a precise step-by-step guide (no code); after any review, decides for itself whether the feedback holds up and gives exact fix-it instructions when it rejects; gives the final go/no-go | Write code |
 | Engineer | Muse (via MCP, browser-driven) | Implements the spec in code | Review or approve its own work |
 | CEO | You | Approves the idea, approves the final ship | Everything else |
 
@@ -19,24 +19,44 @@ actually passed.
 ```
 ideation (Gemini)
   -> checkpoint_idea (YOU)         -- reject sends it back to ideation
-  -> architecture (Claude, spec only)
+  -> architecture (Claude writes/revises the spec)
+  -> architecture_review (Gemini discusses it)    -- reject loops back to architecture, no round limit in practice
   -> implementation (Muse)
-  -> verification (real commands: build/tests)   -- failure loops back to implementation
-  -> review_gemini                                -- reject loops back to implementation
-  -> review_claude                                -- reject loops back to implementation
+  -> verification (real commands: build/tests)    -- failure loops back to implementation
+  -> review_gemini (independent review)           -- verdict always goes to review_claude next, never loops back by itself
+  -> review_claude (Claude's own ruling, always final)  -- reject loops back to implementation
   -> checkpoint_final (YOU)        -- reject sends it back through ideation (a redesign, not a quick fix)
   -> done
 ```
 
+**Architecture is a discussion, not a one-shot spec.** After Claude writes
+it, Gemini reads it against the idea brief and either signs off or rejects
+with specifics (what's missing, ambiguous, or risky). A rejection sends it
+back to Claude for a real revision — not just the previous draft again —
+and Gemini reads the new version next round. This can go on indefinitely
+(`MAX_ARCHITECTURE_ROUNDS`, default 20, is a safety ceiling meant to never
+actually trigger, not a real limit); if it ever does trigger, the task is
+marked `rejected` rather than silently shipping an unreviewed design.
+
+**Claude always makes the real call on a code review, never Gemini alone.**
+`review_gemini`'s verdict — approve or reject — always flows into
+`review_claude` next; nothing at `review_gemini` loops back to
+`implementation` by itself. Claude then decides independently whether
+Gemini's objection (if any) is actually correct: it can agree (and must
+then give exact, step-by-step fix instructions — which file, which
+function, what the corrected logic should look like) or overrule Gemini and
+approve anyway, explaining why. Only Claude's own verdict here can send the
+task back to `implementation` or forward to `checkpoint_final`.
+
 If Gemini's own retry budget is exhausted (its free tier is down for a
 stretch — rate limited or overloaded), Claude stands in for just that
 round's `review_gemini` rather than leaving the task stuck: logged clearly
-as a stand-in, not a permanent reassignment. The next round tries Gemini
-again.
+as a stand-in, not a permanent reassignment, and still followed by Claude's
+own `review_claude` ruling. The next round tries Gemini again.
 
 `done` is reachable from exactly one place in the code
 (`resolveCheckpoint` at `checkpoint_final`), and only after verification has
-actually passed and both reviewers approved. See `src/orchestrator/pipeline.ts`.
+actually passed and Claude has signed off. See `src/orchestrator/pipeline.ts`.
 
 ## Setup
 
@@ -155,17 +175,35 @@ logged and the pipeline continues with a text-only review rather than
 blocking. Needs `npm install` (pulls in `playwright`) and, once,
 `npx playwright install chromium` on this machine.
 
-## Dashboard (10 parallel department slots)
+## Dashboard (10 department slots, ranked into 3 tiers)
 
 ```bash
 npm run dashboard
 ```
-then open http://localhost:4000. Ten fixed "department" slots (AG-01
-Product Lead … AG-10 Release Manager) each map to one real task — typing a
-goal and clicking a slot's own button creates/continues *that department's*
-task through the exact same pipeline as the CLI; "Chạy luồng cả công ty"
-queues all ten. A slot showing "Waiting" is parked at a checkpoint and
-shows Duyệt/Từ chối buttons right there instead of needing the CLI.
+then open http://localhost:4000. Ten fixed department slots each map to
+one real task and run through the exact same pipeline as the CLI. They're
+ranked into 3 tiers (`src/dashboard/slots.ts`):
+
+- **Tier 1 — Sếp (1 slot):** AG-01 AI Product Lead.
+- **Tier 2 — Trưởng nhóm (3 slots):** AG-02 Market Researcher, AG-05
+  Backend Architect, AG-08 QA & Security.
+- **Tier 3 — Nhân viên (6 slots):** AG-03, AG-04, AG-06, AG-07, AG-09, AG-10.
+
+Clicking a slot's own "Chạy riêng khung này" button creates/continues
+*that department's* task with whatever goal is typed into the shared
+input, same as always — tier doesn't change that.
+
+**"Chạy luồng cả công ty" delegates instead of copy-pasting the same goal
+ten times.** The company-wide goal is handed to the boss (AG-01, via
+Claude — `decomposeGoalForDepartments` in `src/orchestrator/delegate.ts`),
+who writes one specific, non-overlapping sub-goal per department. Each
+slot then runs its sub-goal through the normal pipeline. If the boss's
+reply doesn't cover some department (bad formatting, or no real agent
+configured), that department falls back to the old plain
+`"<department name>: <goal>"` text rather than sitting idle.
+
+A slot showing "Waiting" is parked at a checkpoint and shows Duyệt/Từ chối
+buttons right there instead of needing the CLI.
 
 All ten actions share **one queue, processed strictly one at a time** —
 "run the whole company" does not fire ten simultaneous bursts of
