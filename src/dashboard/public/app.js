@@ -72,6 +72,7 @@ const state = {
   drawer: { taskId: null, tab: "overview", detail: null, sig: "" },
   artifacts: { list: [], selected: null, agent: "", q: "" },
   timeline: null,
+  rebalance: null,
 };
 
 // ---------- utils ----------
@@ -229,6 +230,7 @@ function cardSkeleton(slot) {
         <button class="btn btn-small" data-action="run" data-slot="${slot.id}">Chạy riêng khung này</button>
         <button class="btn btn-icon" data-action="steer-open" data-slot="${slot.id}" title="Gửi chỉ thị riêng cho ${slot.id}">✎ Chỉ thị</button>
       </div>
+      ${slot.isBoss ? `<button class="btn btn-small rebalance-btn" data-action="rebalance" title="Claude (Sếp) xem tải của từng người và đề xuất gán lại / đổi thứ tự — bạn chọn áp dụng">⚖ Sếp đề xuất cân tải</button>` : ""}
     </div>`;
 }
 
@@ -491,9 +493,22 @@ function renderPlanPanel() {
   if (liveEl) liveEl.scrollTop = liveEl.scrollHeight;
 }
 
+function ensureFlowPanel() {
+  const panel = $("#flow-panel");
+  if (!panel.querySelector("#flow-insights")) {
+    panel.innerHTML = `
+      <div class="panel-title">Luồng bàn giao & điểm nghẽn
+        <button class="btn btn-small-inline rebalance-btn" data-action="rebalance" title="Claude (Sếp) xem tải của từng người và đề xuất gán lại / đổi thứ tự — bạn chọn áp dụng">⚖ Sếp đề xuất cân tải</button>
+      </div>
+      <div id="rebalance-box"></div>
+      <div id="flow-insights"></div>`;
+  }
+}
+
 function renderFlowPanel() {
   const ins = state.insights;
-  const panel = $("#flow-panel");
+  ensureFlowPanel();
+  const panel = $("#flow-insights");
   if (!ins) return;
   const alerts = ins.alerts.length
     ? ins.alerts.map((a) => `<li class="alert ${a.level}">${a.level === "error" ? "⛔" : a.level === "warn" ? "⚠" : "ℹ"} ${esc(a.text)}</li>`).join("")
@@ -507,10 +522,57 @@ function renderFlowPanel() {
     ? ins.waits.map((w) => `<li><b data-hover-slot="${w.slotId}">${w.slotId}</b> chờ ${w.waitingOn.map((s) => `<b data-hover-slot="${s}">${s}</b>`).join(", ")} · ${fmtDur(w.sinceMs)}<div class="flow-title">${esc(w.title)}</div></li>`).join("")
     : `<li class="muted">Không ai đang chờ đầu vào.</li>`;
   panel.innerHTML = `
-    <div class="panel-title">Luồng bàn giao & điểm nghẽn</div>
     <div class="panel-sub">Cảnh báo</div><ul class="flow-list">${alerts}</ul>
     <div class="panel-sub">Bàn giao gần đây</div><ul class="flow-list">${handoffs}</ul>
     <div class="panel-sub">Đang chờ đầu vào</div><ul class="flow-list">${waits}</ul>`;
+}
+
+// ---------- boss rebalance proposal ----------
+function renderRebalance() {
+  ensureFlowPanel();
+  const box = $("#rebalance-box");
+  const p = state.rebalance;
+  $$(".rebalance-btn").forEach((b) => (b.disabled = p?.status === "drafting"));
+  if (!p) {
+    box.innerHTML = "";
+    box.dataset.sig = "";
+    return;
+  }
+  // Rebuilt only when the proposal itself changes, so ticked boxes survive live updates.
+  const sig = `${p.id}|${p.status}|${p.moves.length}|${p.notes.length}|${p.activity?.state ?? ""}`;
+  if (box.dataset.sig === sig) return;
+  box.dataset.sig = sig;
+  const notes = p.notes.length ? details(`rbn:${p.id}`, `Đã loại ${p.notes.length} đề xuất không hợp lệ / không áp dụng được`, `<ul class="ac">${p.notes.map((n) => `<li>${esc(n)}</li>`).join("")}</ul>`) : "";
+  const close = `<button class="btn btn-small-inline" data-action="rebalance-dismiss">Đóng</button>`;
+  let inner = "";
+  if (p.status === "drafting") {
+    const live = liveText("rebalance", "", p.liveTail, p.liveTotal);
+    inner = `<div class="activity running">${p.activity ? `⏱ <span class="elapsed" data-since="${esc(p.activity.since)}">${elapsed(p.activity.since)}</span> · Claude ${p.activity.state === "waiting" ? "đang chờ lượt" : "đang phân tích tải"}` : "Đang chuẩn bị…"}</div><pre class="live" data-live="rebalance">${esc(live || "…")}</pre>`;
+  } else if (p.status === "failed") {
+    inner = `<div class="feedback-box is-error">⚠ ${esc(p.error)}</div><div class="row-inline"><button class="btn btn-small-inline" data-action="rebalance">↻ Đề xuất lại</button>${close}</div>`;
+  } else if (p.status === "applied") {
+    inner = `<div class="rb-done">✓ Đã áp dụng ${p.applied}/${p.moves.length} đề xuất.</div>${notes}<div class="row-inline">${close}</div>`;
+  } else if (!p.moves.length) {
+    inner = `<div class="why">${esc(p.summary || "Sếp thấy phân bổ hiện tại ổn, không cần thay đổi.")}</div>${notes}<div class="row-inline">${close}</div>`;
+  } else {
+    inner = `
+      ${p.summary ? `<div class="why">${esc(p.summary)}</div>` : ""}
+      <div class="rb-moves">${p.moves
+        .map(
+          (m, i) => `<label class="rb-move">
+            <input type="checkbox" data-rb-idx="${i}" checked />
+            <span class="rb-main">
+              <span class="rb-route">${m.kind === "priority" ? `↑ Ưu tiên lên đầu trong <b data-hover-slot="${m.to}">${m.to}</b>` : `<b data-hover-slot="${m.from}">${m.from}</b> → <b data-hover-slot="${m.to}">${m.to}</b>`}</span>
+              <span class="rb-title">${esc(m.title)}</span>
+              <span class="why">💡 ${esc(m.reason)}</span>
+            </span>
+          </label>`,
+        )
+        .join("")}</div>
+      ${notes}
+      <div class="decision-row"><button class="btn btn-approve" data-action="rebalance-apply" data-id="${esc(p.id)}">Áp dụng đề xuất đã chọn</button><button class="btn btn-ghost" data-action="rebalance-dismiss">Bỏ qua</button></div>`;
+  }
+  box.innerHTML = `<div class="rb"><div class="panel-sub">⚖ Đề xuất cân tải của Sếp</div>${inner}</div>`;
 }
 
 // ---------- edges (dependency / handoff arrows) ----------
@@ -1061,6 +1123,19 @@ document.addEventListener("click", async (e) => {
       await post(`/api/plan/${encodeURIComponent(ds.plan)}/decision`, { approved: action === "plan-approve", feedback: fb });
     }
     if (action === "plan-retry") await post(`/api/plan/${encodeURIComponent(ds.plan)}/retry`);
+    if (action === "rebalance") {
+      if (await post("/api/rebalance")) {
+        toast("Sếp đang xem tải của từng người — đề xuất sẽ hiện ở khung bên phải hàng Trưởng nhóm.");
+        if (state.view !== "org") setView("org");
+      }
+    }
+    if (action === "rebalance-apply") {
+      const indexes = $$("#rebalance-box [data-rb-idx]").filter((c) => c.checked).map((c) => Number(c.dataset.rbIdx));
+      if (!indexes.length) return toast("Chưa chọn đề xuất nào.");
+      const res = await post(`/api/rebalance/${encodeURIComponent(ds.id)}/apply`, { indexes });
+      if (res) toast(`Đã áp dụng ${res.applied} đề xuất${res.skipped ? `, bỏ qua ${res.skipped} (xem ghi chú)` : ""}.`);
+    }
+    if (action === "rebalance-dismiss") await post("/api/rebalance/dismiss");
   } finally {
     btn.disabled = false;
   }
@@ -1183,11 +1258,13 @@ function applyStatus(data) {
   state.telemetry = data.telemetry;
   state.insights = data.insights;
   state.control = data.control;
+  state.rebalance = data.rebalance;
   renderTelemetry();
   renderCompanyDirectives();
   renderOrg();
   renderPlanPanel();
   renderFlowPanel();
+  renderRebalance();
   renderApproveAll();
   if (state.view === "flow") renderFlowView();
 }
@@ -1241,6 +1318,15 @@ function connect() {
   es.addEventListener("insights", (e) => {
     state.insights = JSON.parse(e.data);
     renderFlowPanel();
+  });
+  es.addEventListener("rebalance", (e) => {
+    const next = JSON.parse(e.data);
+    const was = state.rebalance?.status;
+    state.rebalance = next;
+    renderRebalance();
+    if (was === "drafting" && next?.status === "ready") {
+      toast(next.moves.length ? `Sếp đề xuất ${next.moves.length} thay đổi — chọn và bấm Áp dụng.` : "Sếp thấy phân bổ hiện tại ổn.");
+    }
   });
   es.addEventListener("control", (e) => {
     state.control = JSON.parse(e.data);

@@ -82,6 +82,7 @@ company.on("slot", (slotId: string) => {
 company.on("plan", debounced(SLOT_DEBOUNCE_MS, async () => broadcast("plan", await company.planSnapshot())));
 company.on("engines", debounced(SLOT_DEBOUNCE_MS, () => broadcast("engines", company.engineSnapshot())));
 company.on("control", pushSummary);
+company.on("rebalance", debounced(SLOT_DEBOUNCE_MS, () => broadcast("rebalance", company.rebalanceSnapshot())));
 company.on("live", (chunk) => broadcast("live", chunk));
 
 app.get("/api/events", (req, res) => {
@@ -128,6 +129,13 @@ app.post("/api/artifacts/send", route(async (req, res) => {
   );
   ok(res, result);
 }));
+
+app.post("/api/rebalance", route(async (_req, res) => ok(res, { proposal: await company.proposeRebalance() })));
+app.post("/api/rebalance/:id/apply", route(async (req, res) => {
+  const indexes = Array.isArray(req.body?.indexes) ? req.body.indexes.map(Number) : undefined;
+  ok(res, await company.applyRebalance(req.params.id, indexes));
+}));
+app.post("/api/rebalance/dismiss", route(async (_req, res) => ok(res, company.dismissRebalance())));
 
 app.post("/api/control/pause", route(async (_req, res) => ok(res, await company.pause())));
 app.post("/api/control/resume", route(async (_req, res) => ok(res, await company.resume())));

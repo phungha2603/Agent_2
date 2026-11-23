@@ -18,6 +18,7 @@ import {
 import { buildHandoff, reachedHandoffPoint, type HandoffPoint } from "./handoff.js";
 import { draftAndReviewPlan, materializePlan, newPlanId, type Department, type PlanLimits, type WorkPlan, type WorkPlanRecord } from "./planner.js";
 import { parseFileBlocks } from "../apply/applyFiles.js";
+import { buildRebalancePrompt, parseRebalance, type LoadSlot, type RebalanceProposal } from "./rebalance.js";
 import { loadTask, saveTask, taskExists } from "../store/taskStore.js";
 import { loadPlan, savePlan } from "../store/planStore.js";
 import { appendCall, readCalls } from "../store/callLogStore.js";
@@ -213,6 +214,8 @@ export class Company extends EventEmitter {
   private readonly currentRun = new Map<string, StageRun>();
   private readonly controllers = new Map<string, AbortController>();
   private planController: AbortController | null = null;
+  private rebalanceController: AbortController | null = null;
+  private rebalance: RebalanceProposal | null = null;
   private readonly planUsage = new Map<string, { input: number; output: number; costUsd: number }>();
   private pauseWaiters: (() => void)[] = [];
   private readonly liveTail = new Map<string, string>();
@@ -303,6 +306,7 @@ export class Company extends EventEmitter {
     await this.mutateState((s) => (s.paused = true));
     for (const c of this.controllers.values()) c.abort();
     this.planController?.abort();
+    this.rebalanceController?.abort();
     this.emitControl();
   }
 
@@ -449,7 +453,7 @@ export class Company extends EventEmitter {
   }
 
   /** Reassign a task to another slot and/or move it to the top or bottom of that slot's queue. */
-  async moveTask(taskId: string, toSlot: string, position: "top" | "bottom" = "bottom"): Promise<void> {
+  async moveTask(taskId: string, toSlot: string, position: "top" | "bottom" = "bottom", decided?: { by: string; reason: string }): Promise<void> {
     this.requireSlot(toSlot);
     if (this.workers.has(taskId)) throw new UserError("Task đang chạy — chờ xong bước hiện tại (hoặc bấm Pause) rồi gán lại.");
     const task = await this.load(taskId);
@@ -466,9 +470,9 @@ export class Company extends EventEmitter {
     });
     task.slotId = toSlot;
     if (from === toSlot) {
-      trace(task, "CEO", "priority", position === "top" ? "Moved to the front of the queue." : "Moved to the back of the queue.");
+      trace(task, decided?.by ?? "CEO", "priority", `${position === "top" ? "Moved to the front of the queue." : "Moved to the back of the queue."}${decided ? ` Reason: ${decided.reason}` : ""}`);
     } else {
-      trace(task, "CEO", "reassign", `Reassigned from ${from ?? "?"} to ${toSlot}.`);
+      trace(task, decided?.by ?? "CEO", "reassign", `Reassigned from ${from ?? "?"} to ${toSlot}.${decided ? ` Reason: ${decided.reason}` : ""}`);
       log(task, task.stage, "ceo", `Reassigned from ${from ?? "?"} to ${toSlot}.`);
       await this.updatePlanOwner(task, toSlot);
     }
@@ -554,6 +558,119 @@ export class Company extends EventEmitter {
     await savePlan(plan);
     this.emitPlan();
     void this.generatePlan(plan, plan.revisionFeedback ? { feedback: plan.revisionFeedback } : undefined);
+  }
+
+  /**
+   * The boss (Claude) looks at every slot's load and unfinished tasks and
+   * proposes reassignments / reprioritizations, each with a reason. Nothing
+   * moves until the CEO applies (some of) them.
+   */
+  async proposeRebalance(): Promise<RebalanceProposal> {
+    if (this.rebalance?.status === "drafting") throw new UserError("Sếp đang soạn đề xuất cân tải — chờ xong đã.");
+    const load = await this.loadSnapshot();
+    const proposal: RebalanceProposal = { id: `rb-${Date.now()}`, status: "drafting", createdAt: nowIso(), summary: "", moves: [], notes: [] };
+    this.rebalance = proposal;
+    if (!load.some((s) => s.tasks.some((t) => t.movable))) {
+      Object.assign(proposal, { status: "ready", summary: "Không có task nào đang chờ trong hàng đợi để gán lại." });
+      this.emitRebalance();
+      return proposal;
+    }
+    this.emitRebalance();
+    void this.draftRebalance(proposal, load);
+    return proposal;
+  }
+
+  private async draftRebalance(proposal: RebalanceProposal, load: LoadSlot[]): Promise<void> {
+    const key = "rebalance";
+    this.resetLive(key);
+    this.rebalanceController = new AbortController();
+    try {
+      const res = await this.agents.claude.send(buildRebalancePrompt(load), { title: "Cân tải công việc giữa các nhân sự" }, {
+        taskId: key,
+        onChunk: (t) => this.onChunk(key, t),
+        signal: this.rebalanceController.signal,
+      });
+      const parsed = parseRebalance(res.content, load);
+      Object.assign(proposal, { status: "ready", summary: parsed.summary, moves: parsed.moves, notes: parsed.notes });
+    } catch (err) {
+      Object.assign(proposal, {
+        status: "failed",
+        error: this.rebalanceController.signal.aborted ? "Đã dừng theo lệnh Stop." : (err as Error).message,
+      });
+    }
+    this.rebalanceController = null;
+    this.resetLive(key);
+    this.emitRebalance();
+  }
+
+  /** Applies the chosen moves (indexes into the proposal); a move that no longer applies is skipped and noted. */
+  async applyRebalance(proposalId: string, indexes?: number[]): Promise<{ applied: number; skipped: number }> {
+    const p = this.rebalance;
+    if (!p || p.id !== proposalId || p.status !== "ready") throw new UserError("Đề xuất này không còn hiệu lực.");
+    const chosen = (indexes ?? p.moves.map((_, i) => i)).filter((i) => Number.isInteger(i) && p.moves[i]);
+    let applied = 0;
+    for (const i of chosen) {
+      const m = p.moves[i];
+      try {
+        await this.moveTask(m.taskId, m.to, m.position, { by: "AG-01 (Claude) · CEO duyệt", reason: m.reason });
+        applied++;
+      } catch (err) {
+        p.notes.push(`Không áp dụng được "${m.title}": ${(err as Error).message}`);
+      }
+    }
+    Object.assign(p, { status: "applied", applied });
+    this.emitRebalance();
+    return { applied, skipped: chosen.length - applied };
+  }
+
+  dismissRebalance(): void {
+    if (this.rebalance) this.rebalance.status = "dismissed";
+    this.emitRebalance();
+  }
+
+  rebalanceSnapshot() {
+    const p = this.rebalance;
+    if (!p || p.status === "dismissed") return null;
+    return { ...p, activity: this.currentActivity("rebalance"), liveTail: this.liveTail.get("rebalance") ?? "", liveTotal: this.liveTotal.get("rebalance") ?? 0 };
+  }
+
+  /** Every slot's load and unfinished tasks, as the boss sees them when rebalancing. */
+  private async loadSnapshot(): Promise<LoadSlot[]> {
+    const idx = await this.index();
+    const dependents = this.dependentsIndex(idx);
+    const out: LoadSlot[] = [];
+    for (const slot of SLOTS) {
+      const snap = await this.slotSnapshot(slot.id, idx);
+      out.push({
+        id: slot.id,
+        name: slot.name,
+        tier: slot.tier,
+        parallel: snap.parallel,
+        running: snap.counts.running,
+        queued: snap.counts.queued,
+        waitingYou: snap.counts.waitingYou,
+        tasks: snap.tasks
+          .filter((t) => t.queueState !== "done")
+          .map((t) => {
+            const task = idx.get(t.id);
+            return {
+              id: t.id,
+              title: t.title,
+              stage: t.stage,
+              queueState: t.queueState,
+              brief: (task?.context.ideaBrief ?? "").slice(0, 400),
+              waitingOn: t.inputsFrom.filter((i) => !i.handedOff).map((i) => i.slotId),
+              unblocks: [...new Set((dependents.get(t.id) ?? []).map((d) => d.slotId ?? "?"))],
+              movable: t.queueState !== "running" && t.queueState !== "waiting_you",
+            };
+          }),
+      });
+    }
+    return out;
+  }
+
+  private emitRebalance(): void {
+    this.emit("rebalance");
   }
 
   /** Un-assigns every task (task files stay in data/tasks) and stops running workers after their current stage. */
@@ -682,7 +799,7 @@ export class Company extends EventEmitter {
       for (const run of task.runs ?? []) this.addUsage(t, run);
     }
     for (const [id, u] of this.planUsage) {
-      if (!plan || `plan:${plan.id}` !== id) continue;
+      if (id !== "rebalance" && (!plan || `plan:${plan.id}` !== id)) continue;
       this.addEngineUsage(t, "claude", u.input, u.output, u.costUsd);
     }
     if (plan?.usage && !this.planUsage.has(`plan:${plan.id}`)) this.addEngineUsage(t, "claude", plan.usage.input, plan.usage.output, plan.usage.costUsd);
@@ -859,6 +976,7 @@ export class Company extends EventEmitter {
       telemetry: await this.telemetry(idx),
       insights: await this.insights(idx),
       control: this.control(),
+      rebalance: this.rebalanceSnapshot(),
       settings: { handoffOn: this.settings.handoffOn, stageErrorRetries: this.settings.stageErrorRetries, maxAutoRecoveries: this.pipeline.maxAutoRecoveries ?? 0 },
     };
   }
@@ -1225,7 +1343,7 @@ export class Company extends EventEmitter {
   private recordCall(rec: CallRecord): void {
     void appendCall(rec).catch((err) => console.error(`Could not log call for ${rec.taskId}: ${err.message}`));
     const cost = rec.usage.costUsd ?? 0;
-    if (rec.taskId.startsWith("plan:")) {
+    if (rec.taskId.startsWith("plan:") || rec.taskId === "rebalance") {
       const u = this.planUsage.get(rec.taskId) ?? { input: 0, output: 0, costUsd: 0 };
       u.input += rec.usage.inputTokens;
       u.output += rec.usage.outputTokens;
@@ -1359,6 +1477,7 @@ export class Company extends EventEmitter {
   private emitActivity(id: string): void {
     this.emit("engines");
     if (id.startsWith("plan:")) this.emitPlan();
+    else if (id === "rebalance") this.emitRebalance();
     else {
       const slotId = this.slotOf(id);
       if (slotId) this.emit("slot", slotId);

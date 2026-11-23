@@ -41,6 +41,23 @@ export const MOCK_PLAN = {
   ],
 };
 
+/** Moves the last movable task of the busiest same-tier queue to the least busy colleague. */
+function mockRebalance(prompt: string): { summary: string; moves: unknown[] } {
+  const at = prompt.indexOf("LOAD_JSON:");
+  const slots: any[] = at === -1 ? [] : JSON.parse(prompt.slice(at + "LOAD_JSON:".length));
+  const load = (s: any) => s.running + s.queued;
+  const candidates = slots.filter((s) => s.tier !== 1 && s.tasks.some((t: any) => t.movable));
+  const busiest = candidates.sort((a, b) => load(b) - load(a))[0];
+  if (!busiest || load(busiest) < 2) return { summary: "Phân bổ hiện tại ổn, không cần thay đổi.", moves: [] };
+  const target = slots.filter((s) => s.tier === busiest.tier && s.id !== busiest.id).sort((a, b) => load(a) - load(b))[0];
+  if (!target || load(target) >= load(busiest) - 1) return { summary: "Phân bổ hiện tại ổn, không cần thay đổi.", moves: [] };
+  const task = [...busiest.tasks].reverse().find((t: any) => t.movable);
+  return {
+    summary: `${busiest.id} đang ôm ${load(busiest)} task trong khi ${target.id} chỉ có ${load(target)}.`,
+    moves: [{ taskId: task.id, to: target.id, position: "bottom", reason: `${busiest.id} quá tải (${load(busiest)} task), ${target.id} đang rảnh hơn (${load(target)}).` }],
+  };
+}
+
 /**
  * Deterministic stand-in agents, used so the orchestrator's state machine
  * (stages, gates, retry/reject loops, planning, scheduling) can be exercised
@@ -57,6 +74,9 @@ export function createMockAgent(role: RoleName): Agent {
       case "claude":
         if (prompt.startsWith("PLAN:")) {
           return { role, content: JSON.stringify(MOCK_PLAN) };
+        }
+        if (prompt.startsWith("REBALANCE:")) {
+          return { role, content: JSON.stringify(mockRebalance(prompt)) };
         }
         if (prompt.startsWith("REVIEW:")) {
           return { role, verdict: "approve", content: "Claude sign-off: architecture followed, no blocking concerns." };

@@ -281,6 +281,16 @@ The dashboard runs on `src/orchestrator/scheduler.ts` (`Company`).
 - **Reassign / reprioritize**: drag a queued task row onto another card,
   click ↑ to put it first in its own queue, or use the drawer. Running tasks
   can't be moved (pause first); plan owners update to match.
+- **⚖ Sếp đề xuất cân tải** (on the boss's card and the handoff panel):
+  Claude, as the boss, gets every slot's load and unfinished tasks (what
+  each is waiting on, what it unblocks) and proposes up to 6 reassignments
+  or move-to-front changes, each with a reason — specialty fit first, not
+  just the shortest queue (`src/orchestrator/rebalance.ts`). Moves that
+  can't apply (a running task, a target that isn't a staff slot, a no-op)
+  are dropped and listed. Nothing moves until you tick the ones you want
+  and press *Áp dụng*; each applied move is traced on the task as decided
+  by AG-01 and approved by the CEO, with the reason. A task that started
+  running between the proposal and your click is skipped and noted.
 
 ### Visibility
 
