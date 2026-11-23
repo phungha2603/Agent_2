@@ -21,13 +21,19 @@ async function freshSlotsModule(cwd: string) {
   return import("../src/dashboard/slots.js");
 }
 
+function writeState(dir: string, content: string) {
+  mkdirSync(path.join(dir, "data"), { recursive: true });
+  writeFileSync(path.join(dir, "data/dashboard.json"), content);
+}
+
 describe("loadDashboardState", () => {
-  it("starts every slot unassigned when there's no file yet", async () => {
+  it("starts every slot with an empty queue when there's no file yet", async () => {
     const dir = mkdtempSync(path.join(tmpdir(), "slots-test-"));
     const { SLOTS, loadDashboardState } = await freshSlotsModule(dir);
 
     const state = await loadDashboardState();
-    for (const slot of SLOTS) expect(state[slot.id]).toBeNull();
+    for (const slot of SLOTS) expect(state.slots[slot.id]).toEqual([]);
+    expect(state.activePlanId).toBeNull();
   });
 
   it("round-trips a save through to a fresh load", async () => {
@@ -35,20 +41,32 @@ describe("loadDashboardState", () => {
     const { SLOTS, loadDashboardState, saveDashboardState } = await freshSlotsModule(dir);
 
     const state = await loadDashboardState();
-    state[SLOTS[0].id] = "some-task-id";
+    state.slots[SLOTS[0].id].push("task-a", "task-b");
+    state.activePlanId = "plan-1";
     await saveDashboardState(state);
 
     const reloaded = await loadDashboardState();
-    expect(reloaded[SLOTS[0].id]).toBe("some-task-id");
+    expect(reloaded.slots[SLOTS[0].id]).toEqual(["task-a", "task-b"]);
+    expect(reloaded.activePlanId).toBe("plan-1");
+  });
+
+  it("migrates the old one-task-per-slot file instead of dropping its assignments", async () => {
+    const dir = mkdtempSync(path.join(tmpdir(), "slots-test-"));
+    writeState(dir, JSON.stringify({ "AG-03": "old-task", "AG-04": null }));
+    const { loadDashboardState } = await freshSlotsModule(dir);
+
+    const state = await loadDashboardState();
+    expect(state.slots["AG-03"]).toEqual(["old-task"]);
+    expect(state.slots["AG-04"]).toEqual([]);
+    expect(state.activePlanId).toBeNull();
   });
 
   it("degrades to an empty state instead of crashing when the file is corrupted", async () => {
     const dir = mkdtempSync(path.join(tmpdir(), "slots-test-"));
-    mkdirSync(path.join(dir, "data"), { recursive: true });
-    writeFileSync(path.join(dir, "data/dashboard.json"), ""); // e.g. a non-atomic write cut off mid-save
+    writeState(dir, ""); // e.g. a non-atomic write cut off mid-save
     const { SLOTS, loadDashboardState } = await freshSlotsModule(dir);
 
     const state = await loadDashboardState();
-    for (const slot of SLOTS) expect(state[slot.id]).toBeNull();
+    for (const slot of SLOTS) expect(state.slots[slot.id]).toEqual([]);
   });
 });

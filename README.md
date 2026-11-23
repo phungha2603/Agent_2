@@ -181,46 +181,107 @@ logged and the pipeline continues with a text-only review rather than
 blocking. Needs `npm install` (pulls in `playwright`) and, once,
 `npx playwright install chromium` on this machine.
 
-## Dashboard (10 department slots, ranked into 3 tiers)
+## Dashboard (the company: 10 staff, 3 tiers, one scheduler)
 
 ```bash
 npm run dashboard
 ```
-then open http://localhost:4000. Ten fixed department slots each map to
-one real task and run through the exact same pipeline as the CLI. They're
-ranked into 3 tiers (`src/dashboard/slots.ts`):
+then open http://localhost:4000. Ten fixed staff slots, ranked into 3 tiers
+(`src/dashboard/slots.ts`):
 
-- **Tier 1 — Sếp (1 slot):** AG-01 AI Product Lead.
+- **Tier 1 — Sếp (1 slot):** AG-01 AI Product Lead — plans the work.
 - **Tier 2 — Trưởng nhóm (3 slots):** AG-02 Market Researcher, AG-05
-  Backend Architect, AG-08 QA & Security.
-- **Tier 3 — Nhân viên (6 slots):** AG-03, AG-04, AG-06, AG-07, AG-09, AG-10.
+  Backend Architect, AG-08 QA & Security — each owns an epic and its
+  integration/acceptance task.
+- **Tier 3 — Nhân viên (6 slots):** AG-03, AG-04, AG-06, AG-07, AG-09, AG-10
+  — own the subtasks.
 
-Clicking a slot's own "Chạy riêng khung này" button creates/continues
-*that department's* task with whatever goal is typed into the shared
-input, same as always — tier doesn't change that.
+Every task, whoever owns it, runs through the same pipeline as the CLI.
+The dashboard runs on `src/orchestrator/scheduler.ts` (`Company`).
 
-**"Chạy luồng cả công ty" delegates instead of copy-pasting the same goal
-ten times.** The company-wide goal is handed to the boss (AG-01, via
-Claude — `decomposeGoalForDepartments` in `src/orchestrator/delegate.ts`),
-who writes one specific, non-overlapping sub-goal per department. Each
-slot then runs its sub-goal through the normal pipeline. If the boss's
-reply doesn't cover some department (bad formatting, or no real agent
-configured), that department falls back to the old plain
-`"<department name>: <goal>"` text rather than sitting idle.
+### "Chạy luồng cả công ty": Goal → Epic → Subtask + acceptance criteria
 
-A slot showing "Waiting" is parked at a checkpoint and shows Duyệt/Từ chối
-buttons right there instead of needing the CLI.
+1. The goal goes to the boss. Claude drafts a **work tree** as JSON:
+   1–3 epics (each owned by a team lead) with 1–4 subtasks each (owned by
+   staff), every one with 2–5 **testable acceptance criteria**, and
+   `dependsOn` links between subtasks (`src/orchestrator/planner.ts`).
+2. Gemini reviews the plan (goal coverage, owners, testable criteria,
+   dependencies that don't needlessly serialize work); Claude revises —
+   up to `PLAN_MAX_REVIEW_ROUNDS`. Owners from the wrong tier and unknown
+   dependencies are fixed automatically and listed; cycles, bad JSON or
+   missing criteria go back to Claude to fix.
+3. **You approve the plan once** (or reject with feedback → redrafted).
+   That approval replaces each task's idea checkpoint, so planned tasks
+   start straight at architecture.
+4. Each subtask becomes a task for its owner; each epic gets an
+   integration task for its lead that depends on all the epic's subtasks.
+   Every task carries its acceptance criteria (shown to the architect,
+   the architecture reviewer, the engineer and both code reviewers) and a
+   shared brief listing the goal, its epic, and what teammates are doing
+   — so work stays on-goal and nobody duplicates anyone else.
 
-All ten actions share **one queue, processed strictly one at a time** —
-"run the whole company" does not fire ten simultaneous bursts of
-Gemini/Claude/Muse calls, which would multiply exactly the kind of
-free-tier rate-limit burst this project has already had to work around.
-`Reset` un-assigns tasks from all slots (it doesn't delete the underlying
-task files in `data/tasks/`).
+### Capacity: queues, parallelism and engine limits
 
-## What's next
+- Each slot holds a **queue of tasks** (shown in its card: running /
+  waiting / waiting for you / errors / done) and runs at most
+  `SLOT_MAX_PARALLEL` of them at once (`SLOT_PARALLEL_OVERRIDES` per slot).
+- The real limits are per **engine**, enforced on every call whatever
+  stage makes it (`src/agents/limited.ts`): `CLAUDE_CONCURRENCY`,
+  `GEMINI_CONCURRENCY`, and Muse = 1, always (one logged-in browser).
+- Implementation + verification is one task at a time across the whole
+  company, under a lock on `VERIFY_CWD`: every task writes into and builds
+  the same project, so another task's files landing between one task's
+  write and its build would make that build meaningless.
+- So in practice: Claude architects and reviews several tasks while Gemini
+  reviews others and Muse codes one — the top bar shows each engine's
+  `running/limit · waiting`.
 
-This covers the orchestration ("company") model, an optional visual
-review loop, and a dashboard for running several departments against the
-same pipeline. `data/tasks/*.json` remains the source of truth either way
-— the dashboard is just another reader/writer of it, like the CLI.
+### Handoff and automatic retries
+
+- When a task reaches `HANDOFF_ON` (default `checkpoint_final`: verified
+  and signed off by Claude — dependents can start while you review; or
+  `done`: only after you approve), it publishes a **handoff**: its files,
+  criteria and a design excerpt, computed once (`src/orchestrator/handoff.ts`).
+  Tasks depending on it start automatically and receive every upstream
+  handoff in their context. If you later reject an upstream task that had
+  already handed off, its dependents get a warning in their log.
+- A stage that **crashes** (network drop, CLI error, timeout) is retried
+  automatically (`STAGE_ERROR_RETRIES`, with backoff); if it still fails,
+  the task pauses with the error shown in red on its card and a
+  "Thử lại" button — the error is never fed to the next agent as if it
+  were review feedback.
+- A task that **runs out of attempts** (verification keeps failing, or
+  reviews keep rejecting) goes back to Claude to revise the architecture
+  with all the accumulated feedback (`MAX_AUTO_RECOVERIES`) before it's
+  marked rejected — repeated failure usually means the guide was the
+  problem, not just the code.
+- On restart, the dashboard resumes any task that was mid-stage.
+
+### Context pruning
+
+Each stage sends its agent only what that stage acts on
+(`src/orchestrator/contextPruning.ts`): the architect gets no code or build
+logs on a first pass, the engineer gets the spec, criteria and handoffs
+(plus its previous attempt only on a fix round), reviewers get the code
+and only the tail of the verification log, where failures are. Each
+task's context was already isolated from the other nine staff's work —
+the pruning cuts what accumulates within a task over many rounds.
+
+### Live updates
+
+The page receives **Server-Sent Events** (`/api/events`) and patches one
+card at a time — no more re-rendering the whole grid every 3 seconds
+(which also used to wipe out text typed into a feedback box). Claude (CLI
+`--output-format stream-json`, or the API) and Gemini (`streamGenerateContent`)
+stream their replies token by token into the running card. Muse-Chat-MCP
+can't stream over MCP, so Muse's card shows elapsed time instead.
+
+### Dry run
+
+`MOCK_DELAY_MS=1500 npm run dashboard` (with all providers on `mock`) makes
+each mock call take 1.5s and stream its reply, so you can watch the plan,
+queues, parallelism and handoffs without spending any quota.
+
+`Reset` un-assigns every task (task files in `data/tasks/` stay) and stops
+running tasks after their current stage. "Duyệt tất cả đang chờ" approves
+every task waiting at a checkpoint in one go, after a confirmation.

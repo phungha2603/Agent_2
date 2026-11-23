@@ -1,8 +1,19 @@
-import type { Agent, AgentResponse, HistoryEntry, ProjectConfig, RoleName, Stage, TaskRecord } from "../types.js";
+import type {
+  Agent,
+  AgentResponse,
+  HistoryEntry,
+  ProjectConfig,
+  RoleName,
+  SendOptions,
+  Stage,
+  TaskContext,
+  TaskRecord,
+} from "../types.js";
 import type { VerifyConfig } from "../verify/runner.js";
 import { runVerification } from "../verify/runner.js";
 import { newTaskId } from "../store/taskStore.js";
 import { parseFileBlocks, writeFiles } from "../apply/applyFiles.js";
+import { pruneContext } from "./contextPruning.js";
 
 export function createTask(title: string, projectConfig?: ProjectConfig): TaskRecord {
   const now = new Date().toISOString();
@@ -16,8 +27,36 @@ export function createTask(title: string, projectConfig?: ProjectConfig): TaskRe
     implementationAttempts: 0,
     reviewRejections: 0,
     architectureRounds: 0,
+    autoRecoveries: 0,
     projectConfig,
   };
+}
+
+export interface PlannedTaskInput {
+  title: string;
+  slotId: string;
+  ideaBrief: string;
+  acceptanceCriteria: string[];
+  sharedBrief: string;
+  planRef: { planId: string; epicId: string; subtaskId?: string };
+}
+
+/**
+ * A task created from a plan the CEO already approved. That approval stands
+ * in for checkpoint_idea, so it starts at architecture with the plan's
+ * description as its brief — not at ideation, which would have Gemini
+ * re-invent a brief the human already signed off on.
+ */
+export function createPlannedTask(input: PlannedTaskInput, projectConfig?: ProjectConfig): TaskRecord {
+  const task = createTask(input.title, projectConfig);
+  task.stage = "architecture";
+  task.slotId = input.slotId;
+  task.planRef = input.planRef;
+  task.context.ideaBrief = input.ideaBrief;
+  task.context.acceptanceCriteria = input.acceptanceCriteria;
+  task.context.sharedBrief = input.sharedBrief;
+  log(task, "architecture", "ceo", `Created from approved plan ${input.planRef.planId} — starts at architecture (the plan approval covers the idea checkpoint).`);
+  return task;
 }
 
 export interface Agents {
@@ -53,43 +92,58 @@ export interface PipelineConfig {
   maxReviewRejections: number;
   /** Safety ceiling on Claude/Gemini architecture discussion rounds (default 20 — meant to never be hit in practice). */
   maxArchitectureRounds?: number;
+  /**
+   * When implementation/review budgets run out, send the task back to
+   * architecture (with all the accumulated feedback) this many times before
+   * giving up as "rejected". Default 0.
+   */
+  maxAutoRecoveries?: number;
   visual?: VisualConfig;
+}
+
+export interface AdvanceHooks {
+  onChunk?: (text: string) => void;
 }
 
 const PROMPTS = {
   ideation:
     "You are the ideation lead. Propose a concrete idea/feature brief for this task: goals, target users, rough scope. Keep it short. " +
+    "If shared plan context or acceptance criteria are included below, the brief must stay inside them. " +
     "If feedback from a previous round is included below, this is a revision of the brief itself — rewrite it to actually reflect the new direction the feedback describes, replacing anything in the old brief that now contradicts it, not just appending a note.",
   architecture:
     "You are the architecture lead and mentor to the engineer (Muse), who writes all the code — you do NOT write code yourself. " +
     "Write a precise, step-by-step implementation guide, not just a high-level spec: exact file list with what each one is responsible for, exact function/method signatures, the order to build things in, plain pseudocode for any non-trivial logic, and common mistakes to avoid. " +
     "Write it the way you'd personally walk a capable but unfamiliar engineer through building this, so there's as little left to guess as possible. " +
+    "If acceptance criteria are listed, show how each one will be met and which test proves it. If upstream handoffs are listed, build on those files and interfaces instead of recreating them. " +
     "If feedback from a previous round is included below, this is a revision: write a full updated guide that actually changes to address that feedback — don't repeat the previous design unchanged.",
   architectureReview:
     "REVIEW: You are discussing this architecture spec with Claude before any code gets written — Muse hasn't started yet. " +
-    "Read it against the idea brief. If it's solid, approve it. If something is missing, ambiguous, risky, or could be designed better, reject and say exactly what to add or change — name the specific section, file, or interface and what you'd write instead, since Claude will revise the spec and you'll read the new version next round. " +
+    "Read it against the idea brief and the acceptance criteria (every criterion must have a clear way to be met and tested). If it's solid, approve it. If something is missing, ambiguous, risky, or could be designed better, reject and say exactly what to add or change — name the specific section, file, or interface and what you'd write instead, since Claude will revise the spec and you'll read the new version next round. " +
     "There is no limit on how many rounds this can take — only approve once you'd actually be comfortable seeing this built exactly as written.",
   implementation:
-    "You are the engineer. Implement the following architecture spec in code.\n" +
+    "You are the engineer. Implement the following architecture spec in code, making sure every acceptance criterion listed is met (with a test where possible).\n" +
     "For every file you create or change, write a line starting with exactly:\n" +
     "FILE: relative/path/to/file.ext\n" +
     "followed by the FULL contents of that file (not a diff), then the next FILE: line for the next file. " +
     "Do not skip writing a file's contents, and do not just describe what a file would contain.",
   reviewGemini:
-    "REVIEW: Review this implementation against the idea brief and verification log. " +
+    "REVIEW: Review this implementation against the idea brief, the acceptance criteria (each listed criterion must be demonstrably met — name any that isn't), and the verification log. " +
     "If a reference style image and a screenshot of the running implementation are attached, compare them directly — " +
     "say concretely where the screenshot matches or deviates from the reference's look (composition, color, mood, missing/extra elements), not just whether the code builds. " +
     "Approve or reject, with reasons.",
   reviewClaude:
-    "REVIEW: Final sign-off review, as the mentor who wrote the architecture guide. Check the implementation matches that guide and passed verification. " +
+    "REVIEW: Final sign-off review, as the mentor who wrote the architecture guide. Check the implementation matches that guide, meets every listed acceptance criterion, and passed verification. " +
     "If feedback from the independent reviewer is included above, you decide for yourself whether it's actually correct before ruling — don't just rubber-stamp it: you may agree with it, or overrule it and approve anyway (say briefly why). " +
     "If you reject — whether because you agree with that feedback or found your own issue — don't just say what's wrong: give precise, step-by-step instructions for exactly how to fix it (which file, which function, what the corrected logic should look like), as if correcting a student's work directly, so the engineer can act on it without guessing. " +
     "You are always the one who makes this call, not the independent reviewer. Approve or reject, with reasons.",
   reviewGeminiFallback:
     "REVIEW: Gemini, the usual independent reviewer for this round, is temporarily unavailable, so you are standing in to give that independent review before this reaches your own final sign-off later. " +
-    "Review this implementation against the idea brief and verification log as a separate check from your eventual sign-off — focus on whether it actually does what was asked, not just whether it compiles. " +
+    "Review this implementation against the idea brief, the acceptance criteria and the verification log as a separate check from your eventual sign-off — focus on whether it actually does what was asked, not just whether it compiles. " +
     "Approve or reject, with reasons.",
 };
+
+/** Longest slice of earlier feedback carried into an automatic-recovery note. */
+const RECOVERY_FEEDBACK_CHARS = 6000;
 
 /** The verify settings this task actually runs with — its own snapshot if it has one, else the live config (old tasks). */
 function resolveVerify(task: TaskRecord, config: PipelineConfig): VerifyConfig {
@@ -121,7 +175,7 @@ function resolveVisual(task: TaskRecord, config: PipelineConfig): VisualConfig |
   };
 }
 
-function log(task: TaskRecord, stage: Stage, by: RoleName, summary: string): void {
+export function log(task: TaskRecord, stage: Stage, by: RoleName, summary: string): void {
   const entry: HistoryEntry = { stage, at: new Date().toISOString(), by, summary };
   task.history.push(entry);
 }
@@ -139,6 +193,34 @@ async function ensureReferenceImage(task: TaskRecord, config: PipelineConfig): P
   }
 }
 
+/**
+ * Out of implementation/review budget. Repeated failure to build or pass
+ * review usually means the guide itself is the problem, so before giving
+ * up, send it back to Claude with everything the attempts learned — a
+ * revised architecture, not just another identical retry.
+ */
+function exhaustBudget(task: TaskRecord, config: PipelineConfig, reason: string): void {
+  const used = task.autoRecoveries ?? 0;
+  const max = config.maxAutoRecoveries ?? 0;
+  if (used >= max) {
+    task.stage = "rejected";
+    return;
+  }
+  task.autoRecoveries = used + 1;
+  const previous = (task.context.reviewFeedback ?? []).join("\n").slice(-RECOVERY_FEEDBACK_CHARS);
+  task.context.reviewFeedback = [
+    `Automatic recovery ${used + 1}/${max}: the engineer could not get this to pass (${reason}) after ` +
+      `${task.implementationAttempts} implementation attempt(s) and ${task.reviewRejections} review rejection(s). ` +
+      `Most recent feedback:\n${previous}\n\n` +
+      "Revise the implementation guide so the next attempt succeeds: be far more explicit exactly where it kept failing, and simplify where you can.",
+  ];
+  task.implementationAttempts = 0;
+  task.reviewRejections = 0;
+  task.architectureRounds = 0;
+  log(task, task.stage, "system", `Budget exhausted (${reason}) — automatic recovery ${used + 1}/${max}: back to architecture with all accumulated feedback.`);
+  task.stage = "architecture";
+}
+
 /** Terminal stages, or stages that need a human decision before they can proceed. */
 export function isWaitingForHuman(task: TaskRecord): boolean {
   return task.stage === "checkpoint_idea" || task.stage === "checkpoint_final";
@@ -153,10 +235,13 @@ export function isTerminal(task: TaskRecord): boolean {
  * Must not be called while isWaitingForHuman(task) or isTerminal(task) — use
  * resolveCheckpoint for the former.
  */
-export async function advance(task: TaskRecord, agents: Agents, config: PipelineConfig): Promise<TaskRecord> {
+export async function advance(task: TaskRecord, agents: Agents, config: PipelineConfig, hooks: AdvanceHooks = {}): Promise<TaskRecord> {
+  const opts: SendOptions = { onChunk: hooks.onChunk, taskId: task.id };
+  const ctx = (stage: Stage): TaskContext => pruneContext(stage, task.context);
+
   switch (task.stage) {
     case "ideation": {
-      const res = await agents.gemini.send(PROMPTS.ideation, task.context);
+      const res = await agents.gemini.send(PROMPTS.ideation, ctx("ideation"), opts);
       task.context.ideaBrief = res.content;
       log(task, task.stage, "gemini", "Idea brief drafted.");
       await ensureReferenceImage(task, config);
@@ -165,14 +250,14 @@ export async function advance(task: TaskRecord, agents: Agents, config: Pipeline
     }
 
     case "architecture": {
-      const res = await agents.claude.send(PROMPTS.architecture, task.context);
+      const res = await agents.claude.send(PROMPTS.architecture, ctx("architecture"), opts);
       task.context.architectureSpec = res.content;
       log(task, task.stage, "claude", "Architecture spec written.");
       // Also checked here, not just in ideation: a task can reach
       // architecture for the first time well after ideation (e.g. the
-      // visual loop was turned on partway through, or this is a
-      // checkpoint_final redesign), and this is still the right moment to
-      // have a reference image before implementation starts.
+      // visual loop was turned on partway through, it was created from a
+      // plan, or this is a checkpoint_final redesign), and this is still
+      // the right moment to have a reference image before implementation.
       await ensureReferenceImage(task, config);
       task.context.reviewFeedback = [];
       task.stage = "architecture_review";
@@ -180,7 +265,7 @@ export async function advance(task: TaskRecord, agents: Agents, config: Pipeline
     }
 
     case "architecture_review": {
-      const res = await agents.gemini.send(PROMPTS.architectureReview, task.context);
+      const res = await agents.gemini.send(PROMPTS.architectureReview, ctx("architecture_review"), opts);
       log(task, task.stage, "gemini", `Verdict: ${res.verdict ?? "unknown"}.`);
       if (res.verdict === "approve") {
         task.context.reviewFeedback = [];
@@ -198,7 +283,7 @@ export async function advance(task: TaskRecord, agents: Agents, config: Pipeline
       const feedback = task.context.reviewFeedback?.length
         ? `\n\nAddress this feedback from the previous attempt:\n${task.context.reviewFeedback.join("\n")}`
         : "";
-      const res = await agents.muse.send(PROMPTS.implementation + feedback, task.context);
+      const res = await agents.muse.send(PROMPTS.implementation + feedback, ctx("implementation"), opts);
       task.context.implementationDiff = res.content;
       task.implementationAttempts += 1;
 
@@ -251,7 +336,8 @@ export async function advance(task: TaskRecord, agents: Agents, config: Pipeline
         task.context.reviewFeedback = [`Verification failed:\n${result.log}`];
         task.stage = "implementation";
       } else {
-        task.stage = "rejected";
+        task.context.reviewFeedback = [`Verification failed:\n${result.log}`];
+        exhaustBudget(task, config, "verification kept failing");
       }
       return task;
     }
@@ -268,7 +354,7 @@ export async function advance(task: TaskRecord, agents: Agents, config: Pipeline
       let res: AgentResponse;
       let reviewer: RoleName;
       try {
-        res = await agents.gemini.send(PROMPTS.reviewGemini, task.context);
+        res = await agents.gemini.send(PROMPTS.reviewGemini, ctx("review_gemini"), opts);
         reviewer = "gemini";
       } catch (err) {
         log(
@@ -277,7 +363,7 @@ export async function advance(task: TaskRecord, agents: Agents, config: Pipeline
           "system",
           `Gemini review unavailable (${(err as Error).message}) — Claude is standing in for this round's independent review.`,
         );
-        res = await agents.claude.send(PROMPTS.reviewGeminiFallback, task.context);
+        res = await agents.claude.send(PROMPTS.reviewGeminiFallback, ctx("review_gemini"), opts);
         reviewer = "claude";
       }
       log(task, task.stage, reviewer, `Verdict: ${res.verdict ?? "unknown"}.`);
@@ -293,14 +379,18 @@ export async function advance(task: TaskRecord, agents: Agents, config: Pipeline
     }
 
     case "review_claude": {
-      const res = await agents.claude.send(PROMPTS.reviewClaude, task.context);
+      const res = await agents.claude.send(PROMPTS.reviewClaude, ctx("review_claude"), opts);
       log(task, task.stage, "claude", `Verdict: ${res.verdict ?? "unknown"}.`);
       if (res.verdict === "approve") {
         task.stage = "checkpoint_final";
       } else {
         task.reviewRejections += 1;
         task.context.reviewFeedback = [`Claude review feedback:\n${res.content}`];
-        task.stage = task.reviewRejections < config.maxReviewRejections ? "implementation" : "rejected";
+        if (task.reviewRejections < config.maxReviewRejections) {
+          task.stage = "implementation";
+        } else {
+          exhaustBudget(task, config, "review kept rejecting");
+        }
       }
       return task;
     }
@@ -342,6 +432,7 @@ export function resolveCheckpoint(task: TaskRecord, approved: boolean, feedback?
       task.implementationAttempts = 0;
       task.reviewRejections = 0;
       task.architectureRounds = 0;
+      task.autoRecoveries = 0;
     }
   }
   if (!approved && feedback) {
@@ -364,6 +455,7 @@ export function retryFromRejected(task: TaskRecord, opts: { note?: string; clear
   }
   task.implementationAttempts = 0;
   task.reviewRejections = 0;
+  task.autoRecoveries = 0;
   if (opts.clearFeedback) {
     task.context.reviewFeedback = [];
   }
@@ -387,6 +479,7 @@ export function amendShippedTask(task: TaskRecord, change: string): TaskRecord {
   task.implementationAttempts = 0;
   task.reviewRejections = 0;
   task.architectureRounds = 0;
+  task.autoRecoveries = 0;
   task.context.reviewFeedback = [change];
   task.stage = "architecture";
   log(task, task.stage, "ceo", `Amending shipped task: ${change}`);

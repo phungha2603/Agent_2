@@ -5,6 +5,7 @@ import { describe, expect, it } from "vitest";
 import {
   advance,
   amendShippedTask,
+  createPlannedTask,
   createTask,
   isTerminal,
   isWaitingForHuman,
@@ -103,6 +104,75 @@ describe("pipeline", () => {
     await advance(task, a, cfg); // verification fails again, attempts (2) >= max (2) -> rejected
     expect(task.stage).toBe("rejected");
     expect(isTerminal(task)).toBe(true);
+  });
+
+  it("auto-recovers an exhausted task by sending it back to architecture with the accumulated feedback, then gives up", async () => {
+    const task = createTask("Hard feature");
+    task.stage = "implementation";
+    const a = agents();
+    const cfg: PipelineConfig = { ...failingConfig(), maxAutoRecoveries: 1 };
+
+    for (let i = 0; i < 4; i++) await advance(task, a, cfg); // 2 implementation attempts, both fail verification
+    expect(task.stage).toBe("architecture");
+    expect(task.autoRecoveries).toBe(1);
+    expect(task.implementationAttempts).toBe(0);
+    expect(task.context.reviewFeedback?.[0]).toMatch(/Automatic recovery 1\/1/);
+    expect(task.context.reviewFeedback?.[0]).toMatch(/Verification failed/);
+    expect(task.history.some((h) => /automatic recovery 1\/1/.test(h.summary))).toBe(true);
+
+    await advance(task, a, cfg); // architecture (revised)
+    await advance(task, a, cfg); // architecture_review approves
+    for (let i = 0; i < 4; i++) await advance(task, a, cfg); // fails again, recovery budget spent
+    expect(task.stage).toBe("rejected");
+  });
+
+  it("uses the same recovery when the review budget runs out", async () => {
+    const task = createTask("Contested feature");
+    task.stage = "review_claude";
+    task.reviewRejections = 2;
+    const rejectingClaude: Agent = {
+      role: "claude",
+      async send(): Promise<AgentResponse> {
+        return { role: "claude", verdict: "reject", content: "Step 3 is still wrong." };
+      },
+    };
+    await advance(task, agents({ claude: rejectingClaude }), { ...passingConfig(), maxAutoRecoveries: 1 });
+    expect(task.stage).toBe("architecture");
+    expect(task.context.reviewFeedback?.[0]).toMatch(/Step 3 is still wrong/);
+  });
+
+  it("starts a planned task at architecture with its brief and criteria, skipping the idea checkpoint", () => {
+    const task = createPlannedTask({
+      title: "E1.S1 · Pipeline",
+      slotId: "AG-03",
+      ideaBrief: "Build the pipeline",
+      acceptanceCriteria: ["ingests a file"],
+      sharedBrief: "Company goal: X",
+      planRef: { planId: "p", epicId: "E1", subtaskId: "E1.S1" },
+    });
+    expect(task.stage).toBe("architecture");
+    expect(task.slotId).toBe("AG-03");
+    expect(task.context.acceptanceCriteria).toEqual(["ingests a file"]);
+  });
+
+  it("sends each stage only its own slice of context", async () => {
+    const task = createTask("Pruned");
+    task.stage = "implementation";
+    task.context.architectureSpec = "spec";
+    task.context.verificationLog = "old log that the engineer doesn't need";
+    task.context.ideaBrief = "brief";
+    let seen: TaskContext | undefined;
+    const spyMuse: Agent = {
+      role: "muse",
+      async send(_p: string, ctx: TaskContext): Promise<AgentResponse> {
+        seen = ctx;
+        return { role: "muse", content: "FILE: a.txt\nx" };
+      },
+    };
+    await advance(task, agents({ muse: spyMuse }), passingConfig());
+    expect(seen?.architectureSpec).toBe("spec");
+    expect(seen?.verificationLog).toBeUndefined();
+    expect(seen?.ideaBrief).toBeUndefined();
   });
 
   it("routes a reviewer's rejection through Claude before looping back to implementation — Gemini alone can't send it back", async () => {

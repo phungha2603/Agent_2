@@ -1,91 +1,142 @@
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import express from "express";
-import { SLOTS, TIER_LABELS, deriveStatus, loadDashboardState } from "./slots.js";
-import { enqueueDecision, enqueueRun, enqueueRunAll, queueLength, resetAllSlots } from "./runner.js";
-import { loadTask, taskExists } from "../store/taskStore.js";
-import type { HistoryEntry, TaskRecord } from "../types.js";
+import express, { type NextFunction, type Request, type Response } from "express";
+import { Company } from "../orchestrator/scheduler.js";
+import { buildAgents, buildPipelineConfig, buildProjectConfigSnapshot, buildSchedulerSettings } from "../config.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const PORT = Number(process.env.DASHBOARD_PORT ?? 4000);
+const SLOT_DEBOUNCE_MS = 120;
+
+// One set of agents for the whole process: in particular one Muse MCP
+// server, so there's only ever one Chrome on the Muse profile.
+const company = new Company({
+  agents: buildAgents(),
+  pipeline: buildPipelineConfig(),
+  settings: buildSchedulerSettings(),
+  projectConfig: buildProjectConfigSnapshot,
+});
 
 const app = express();
-app.use(express.json());
+app.use(express.json({ limit: "1mb" }));
 app.use(express.static(path.join(__dirname, "public")));
 
-/** A corrupted task file shouldn't take down the status of all 10 slots — show that one as idle instead. */
-async function safeLoadTask(id: string): Promise<TaskRecord | undefined> {
-  try {
-    return await loadTask(id);
-  } catch (err) {
-    console.error(`Could not load task ${id} (${(err as Error).message}) — showing this slot as idle.`);
-    return undefined;
-  }
-}
+/** Express 4 doesn't catch rejected promises — without this, one bad request crashes the server. */
+const route = (fn: (req: Request, res: Response) => Promise<unknown>) => (req: Request, res: Response, next: NextFunction) => {
+  fn(req, res).catch(next);
+};
 
-function miniLogs(task: TaskRecord | undefined): { at: string; text: string }[] {
-  if (!task) return [];
-  return task.history
-    .slice(-3)
-    .map((h: HistoryEntry) => ({ at: new Date(h.at).toTimeString().slice(0, 5), text: h.summary }));
-}
+app.get("/api/status", route(async (_req, res) => res.json(await company.statusSnapshot())));
 
-app.get("/api/status", async (_req, res) => {
-  const state = await loadDashboardState();
-  const slots = await Promise.all(
-    SLOTS.map(async (slot) => {
-      const taskId = state[slot.id];
-      const task = taskId && taskExists(taskId) ? await safeLoadTask(taskId) : undefined;
-      const status = deriveStatus(task?.stage);
-      return {
-        id: slot.id,
-        name: slot.name,
-        icon: slot.icon,
-        tier: slot.tier,
-        tierLabel: TIER_LABELS[slot.tier],
-        isBoss: slot.tier === 1,
-        taskId: taskId ?? null,
-        title: task?.context.title ?? null,
-        stage: task?.stage ?? null,
-        ...status,
-        waitingForYou: task ? ["checkpoint_idea", "checkpoint_final"].includes(task.stage) : false,
-        checkpointBrief: task?.stage === "checkpoint_idea" ? task.context.ideaBrief : undefined,
-        lastFeedback: task?.context.reviewFeedback?.join("\n") || undefined,
-        logs: miniLogs(task),
-      };
-    }),
+// ---- Server-Sent Events: one card at a time, instead of polling the whole grid ----
+const clients = new Set<Response>();
+const broadcast = (event: string, data: unknown) => {
+  const frame = `event: ${event}\ndata: ${JSON.stringify(data)}\n\n`;
+  for (const c of clients) c.write(frame);
+};
+
+const pendingSlots = new Map<string, NodeJS.Timeout>();
+company.on("slot", (slotId: string) => {
+  if (pendingSlots.has(slotId)) return;
+  pendingSlots.set(
+    slotId,
+    setTimeout(async () => {
+      pendingSlots.delete(slotId);
+      if (clients.size) broadcast("slot", await company.slotSnapshot(slotId).catch(() => null));
+    }, SLOT_DEBOUNCE_MS),
   );
-  res.json({ slots, queueLength: queueLength() });
 });
 
-app.post("/api/slots/:id/run", (req, res) => {
-  const slot = SLOTS.find((s) => s.id === req.params.id);
-  if (!slot) return res.status(404).json({ error: "unknown slot" });
-  enqueueRun(slot.id, req.body?.goal);
+let planTimer: NodeJS.Timeout | null = null;
+company.on("plan", () => {
+  if (planTimer) return;
+  planTimer = setTimeout(async () => {
+    planTimer = null;
+    if (clients.size) broadcast("plan", await company.planSnapshot().catch(() => null));
+  }, SLOT_DEBOUNCE_MS);
+});
+
+let engineTimer: NodeJS.Timeout | null = null;
+company.on("engines", () => {
+  if (engineTimer) return;
+  engineTimer = setTimeout(() => {
+    engineTimer = null;
+    broadcast("engines", company.engineSnapshot());
+  }, SLOT_DEBOUNCE_MS);
+});
+
+company.on("live", (chunk) => broadcast("live", chunk));
+
+app.get("/api/events", (req, res) => {
+  res.writeHead(200, { "Content-Type": "text/event-stream", "Cache-Control": "no-cache", Connection: "keep-alive" });
+  res.write("retry: 3000\n\n");
+  clients.add(res);
+  const ping = setInterval(() => res.write(": ping\n\n"), 25000);
+  req.on("close", () => {
+    clearInterval(ping);
+    clients.delete(res);
+  });
+});
+
+// ---- commands ----
+const goalOf = (req: Request) => (typeof req.body?.goal === "string" ? req.body.goal : "");
+const feedbackOf = (req: Request) => (typeof req.body?.feedback === "string" ? req.body.feedback : undefined);
+
+app.post("/api/slots/:id/run", route(async (req, res) => {
+  await company.runSlot(req.params.id, goalOf(req));
   res.json({ ok: true });
-});
+}));
 
-app.post("/api/slots/:id/decision", (req, res) => {
-  const slot = SLOTS.find((s) => s.id === req.params.id);
-  if (!slot) return res.status(404).json({ error: "unknown slot" });
-  const approved = Boolean(req.body?.approved);
-  const feedback = typeof req.body?.feedback === "string" ? req.body.feedback : undefined;
-  enqueueDecision(slot.id, approved, feedback);
+app.post("/api/tasks/:id/decision", route(async (req, res) => {
+  await company.decide(req.params.id, Boolean(req.body?.approved), feedbackOf(req));
   res.json({ ok: true });
-});
+}));
 
-app.post("/api/run-all", async (req, res) => {
-  const goal = typeof req.body?.goal === "string" ? req.body.goal.trim() : "";
+app.post("/api/approve-all", route(async (_req, res) => {
+  res.json({ ok: true, approved: await company.approveAllWaiting() });
+}));
+
+app.post("/api/tasks/:id/retry", route(async (req, res) => {
+  await company.retryTask(req.params.id);
+  res.json({ ok: true });
+}));
+
+app.post("/api/run-all", route(async (req, res) => {
+  const goal = goalOf(req).trim();
   if (!goal) return res.status(400).json({ error: "missing goal" });
-  await enqueueRunAll(goal);
+  const plan = await company.startPlan(goal);
+  res.json({ ok: true, planId: plan.id });
+}));
+
+app.post("/api/plan/:id/decision", route(async (req, res) => {
+  await company.decidePlan(req.params.id, Boolean(req.body?.approved), feedbackOf(req));
   res.json({ ok: true });
+}));
+
+app.post("/api/plan/:id/retry", route(async (req, res) => {
+  await company.retryPlan(req.params.id);
+  res.json({ ok: true });
+}));
+
+app.post("/api/reset", route(async (_req, res) => {
+  await company.reset();
+  res.json({ ok: true });
+}));
+
+app.use((err: Error, _req: Request, res: Response, _next: NextFunction) => {
+  res.status(400).json({ error: err.message });
 });
 
-app.post("/api/reset", async (_req, res) => {
-  await resetAllSlots();
-  res.json({ ok: true });
-});
-
-app.listen(PORT, () => {
+await company.init();
+const server = app.listen(PORT, () => {
   console.log(`AI Company dashboard: http://localhost:${PORT}`);
 });
+
+const shutdown = async () => {
+  server.close();
+  for (const c of clients) c.end();
+  await company.close();
+  process.exit(0);
+};
+process.on("SIGINT", shutdown);
+process.on("SIGTERM", shutdown);

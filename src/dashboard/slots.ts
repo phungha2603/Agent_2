@@ -40,13 +40,36 @@ export const SLOTS: SlotDef[] = [
   { id: "AG-10", name: "AI Release Manager", icon: "🚩", tier: 3 },
 ];
 
-/** Where each slot's assigned task lives, persisted across server restarts. */
-export type DashboardState = Record<string, string | null>; // slotId -> taskId | null
+/**
+ * Which tasks each slot holds (oldest first) and which plan, if any, the
+ * boss is currently showing — persisted across server restarts.
+ */
+export interface DashboardState {
+  slots: Record<string, string[]>;
+  activePlanId: string | null;
+}
 
 const STATE_PATH = path.resolve(process.cwd(), "data/dashboard.json");
 
 function emptyState(): DashboardState {
-  return Object.fromEntries(SLOTS.map((s) => [s.id, null]));
+  return { slots: Object.fromEntries(SLOTS.map((s) => [s.id, []])), activePlanId: null };
+}
+
+/**
+ * Accepts both the current shape and the old one (a flat slotId -> taskId |
+ * null map, one task per slot), so an existing data/dashboard.json keeps its
+ * assignments after upgrading.
+ */
+function normalize(parsed: any): DashboardState {
+  const state = emptyState();
+  const isV2 = parsed && typeof parsed === "object" && parsed.slots && typeof parsed.slots === "object";
+  const source: Record<string, unknown> = isV2 ? parsed.slots : (parsed ?? {});
+  for (const s of SLOTS) {
+    const v = source[s.id];
+    state.slots[s.id] = Array.isArray(v) ? v.filter((x): x is string => typeof x === "string") : typeof v === "string" ? [v] : [];
+  }
+  state.activePlanId = isV2 && typeof parsed.activePlanId === "string" ? parsed.activePlanId : null;
+  return state;
 }
 
 export async function loadDashboardState(): Promise<DashboardState> {
@@ -54,9 +77,8 @@ export async function loadDashboardState(): Promise<DashboardState> {
     return emptyState();
   }
   const raw = await readFile(STATE_PATH, "utf8");
-  let parsed: DashboardState;
   try {
-    parsed = JSON.parse(raw) as DashboardState;
+    return normalize(JSON.parse(raw));
   } catch (err) {
     // A corrupted or empty file (e.g. the process was killed mid-write
     // before writes went through writeFileAtomic) should degrade to "no
@@ -65,8 +87,6 @@ export async function loadDashboardState(): Promise<DashboardState> {
     console.error(`data/dashboard.json is corrupted (${(err as Error).message}) — treating it as empty.`);
     return emptyState();
   }
-  for (const s of SLOTS) if (!(s.id in parsed)) parsed[s.id] = null;
-  return parsed;
 }
 
 export async function saveDashboardState(state: DashboardState): Promise<void> {

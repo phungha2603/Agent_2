@@ -10,6 +10,7 @@ import { createClaudeAgent } from "./agents/claude.js";
 import { createClaudeCliAgent } from "./agents/claude-cli.js";
 import { createMuseAgent } from "./agents/muse.js";
 import { screenshotBuildOutput } from "./verify/screenshot.js";
+import type { SchedulerSettings } from "./orchestrator/scheduler.js";
 
 function provider(name: string): "real" | "mock" {
   const v = (process.env[name] ?? "mock").toLowerCase();
@@ -62,7 +63,13 @@ export function buildAgents(): Agents {
     claudeMode === "api"
       ? createClaudeAgent({ apiKey: requireEnv("ANTHROPIC_API_KEY"), model: process.env.CLAUDE_MODEL })
       : claudeMode === "cli"
-        ? createClaudeCliAgent({ command: process.env.CLAUDE_CLI_COMMAND, model: process.env.CLAUDE_MODEL, cwd: verifyCwd() })
+        ? createClaudeCliAgent({
+            command: process.env.CLAUDE_CLI_COMMAND,
+            model: process.env.CLAUDE_MODEL,
+            cwd: verifyCwd(),
+            stream: (process.env.CLAUDE_CLI_STREAM ?? "1") !== "0",
+            timeoutSec: num("CLAUDE_CLI_TIMEOUT_SEC", 900),
+          })
         : createMockAgent("claude");
 
   const muse =
@@ -83,10 +90,42 @@ export function buildPipelineConfig(): PipelineConfig {
       cwd: verifyCwd(),
       commands: verifyCommands(),
     },
-    maxImplementationAttempts: Number(process.env.MAX_IMPLEMENTATION_ATTEMPTS ?? 3),
-    maxReviewRejections: Number(process.env.MAX_REVIEW_REJECTIONS ?? 3),
-    maxArchitectureRounds: Number(process.env.MAX_ARCHITECTURE_ROUNDS ?? 20),
+    maxImplementationAttempts: num("MAX_IMPLEMENTATION_ATTEMPTS", 3),
+    maxReviewRejections: num("MAX_REVIEW_REJECTIONS", 3),
+    maxArchitectureRounds: num("MAX_ARCHITECTURE_ROUNDS", 20),
+    maxAutoRecoveries: num("MAX_AUTO_RECOVERIES", 1),
     visual: buildVisualConfig(),
+  };
+}
+
+function num(name: string, fallback: number): number {
+  const v = Number(process.env[name]);
+  return process.env[name] !== undefined && process.env[name] !== "" && Number.isFinite(v) ? v : fallback;
+}
+
+/** "AG-05:2,AG-03:2" -> { "AG-05": 2, "AG-03": 2 } */
+function parseSlotParallel(raw: string | undefined): Record<string, number> {
+  const out: Record<string, number> = {};
+  for (const part of (raw ?? "").split(",")) {
+    const [id, n] = part.split(":").map((s) => s.trim());
+    const value = Number(n);
+    if (id && Number.isInteger(value) && value > 0) out[id] = value;
+  }
+  return out;
+}
+
+export function buildSchedulerSettings(): SchedulerSettings {
+  const handoffOn = process.env.HANDOFF_ON === "done" ? "done" : "checkpoint_final";
+  return {
+    claudeConcurrency: Math.max(1, num("CLAUDE_CONCURRENCY", 2)),
+    geminiConcurrency: Math.max(1, num("GEMINI_CONCURRENCY", 2)),
+    defaultSlotParallel: Math.max(1, num("SLOT_MAX_PARALLEL", 1)),
+    slotParallel: parseSlotParallel(process.env.SLOT_PARALLEL_OVERRIDES),
+    stageErrorRetries: Math.max(0, num("STAGE_ERROR_RETRIES", 2)),
+    stageErrorBackoffMs: [5000, 20000, 60000],
+    handoffOn,
+    planMaxRounds: Math.max(1, num("PLAN_MAX_REVIEW_ROUNDS", 3)),
+    planLimits: { maxEpics: Math.max(1, num("PLAN_MAX_EPICS", 3)), maxSubtasks: Math.max(1, num("PLAN_MAX_SUBTASKS", 8)) },
   };
 }
 

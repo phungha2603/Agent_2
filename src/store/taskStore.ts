@@ -12,7 +12,11 @@ export function newTaskId(title: string): string {
     .replace(/[^a-z0-9]+/g, "-")
     .replace(/(^-|-$)/g, "")
     .slice(0, 40);
-  return `${Date.now()}-${slug || "task"}`;
+  // The random part matters when a plan creates many tasks in the same
+  // millisecond whose titles slugify to the same thing (non-ASCII titles
+  // mostly collapse to dashes).
+  const rand = Math.random().toString(36).slice(2, 6);
+  return `${Date.now()}-${rand}-${slug || "task"}`;
 }
 
 export async function saveTask(task: TaskRecord): Promise<void> {

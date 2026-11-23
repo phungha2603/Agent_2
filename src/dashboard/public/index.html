@@ -8,18 +8,29 @@
 </head>
 <body>
   <header class="topbar">
-    <div>
+    <div class="topbar-title">
       <h1>AI Agent Company — Sơ Đồ 10 Nhân Sự</h1>
-      <p class="topbar-sub">"Chạy luồng cả công ty" giao mục tiêu cho Sếp (AG-01) — Sếp chia việc riêng cho từng nhân sự cấp dưới.</p>
+      <p class="topbar-sub">"Chạy luồng cả công ty" giao mục tiêu cho Sếp (AG-01): Sếp lập cây công việc (Epic → Subtask + tiêu chí nghiệm thu), Gemini thẩm định, bạn duyệt một lần rồi cả đội chạy.</p>
     </div>
     <div class="topbar-controls">
-      <input id="goal-input" type="text" placeholder="Xây dựng hệ thống phân tích dữ liệu &amp; dashboard theo dõi vận hành" />
+      <input id="goal-input" type="text" placeholder="Mục tiêu, ví dụ: Xây dựng hệ thống phân tích dữ liệu & dashboard theo dõi vận hành" />
       <button id="run-all-btn" class="btn btn-primary">▶ Chạy luồng cả công ty</button>
+      <button id="approve-all-btn" class="btn btn-approve" hidden></button>
       <button id="reset-btn" class="btn btn-ghost">Reset</button>
     </div>
   </header>
 
+  <div class="engines-bar">
+    <span class="engines-label">Công suất</span>
+    <div id="engines" class="engines"></div>
+    <span id="conn" class="conn"></span>
+  </div>
+
+  <section id="plan-panel" class="plan-panel" hidden></section>
+
   <main id="grid"></main>
+
+  <div id="toast" class="toast" hidden></div>
 
   <script src="app.js"></script>
 </body>
