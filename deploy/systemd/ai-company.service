@@ -1,0 +1,23 @@
+# The dashboard + scheduler. Reads its settings from /home/aicompany/Agent_2/.env.
+# Install: sudo cp deploy/systemd/ai-company.service /etc/systemd/system/
+[Unit]
+Description=AI Agent Company dashboard
+After=network-online.target xvfb.service
+Wants=network-online.target xvfb.service
+
+[Service]
+User=aicompany
+WorkingDirectory=/home/aicompany/Agent_2
+# Muse's Chrome draws on the virtual screen; claude (native installer) lives in ~/.local/bin.
+Environment=DISPLAY=:99
+Environment=NODE_ENV=production
+Environment=PATH=/home/aicompany/.local/bin:/usr/local/bin:/usr/bin:/bin
+# Run tsx directly (not via npm) so SIGTERM reaches the server and it can stop agent calls cleanly.
+ExecStart=/home/aicompany/Agent_2/node_modules/.bin/tsx src/dashboard/server.ts
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=20
+NoNewPrivileges=true
+
+[Install]
+WantedBy=multi-user.target

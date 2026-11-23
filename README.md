@@ -183,6 +183,11 @@ blocking. Needs `npm install` (pulls in `playwright`) and, once,
 
 ## Dashboard (the company: 10 staff, 3 tiers, one scheduler)
 
+> Running it on a real server with a domain: see **[DEPLOY.md](DEPLOY.md)**.
+> The dashboard listens on `127.0.0.1` by default and refuses to listen
+> anywhere else without `DASHBOARD_USER`/`DASHBOARD_PASSWORD` — whoever can
+> reach it can make the agents write and run code.
+
 ```bash
 npm run dashboard
 ```

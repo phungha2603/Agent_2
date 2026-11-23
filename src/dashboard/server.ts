@@ -3,10 +3,25 @@ import { fileURLToPath } from "node:url";
 import express, { type NextFunction, type Request, type Response } from "express";
 import { Company, isUserError } from "../orchestrator/scheduler.js";
 import { buildAgents, buildPipelineConfig, buildProjectConfigSnapshot, buildSchedulerSettings } from "../config.js";
+import { basicAuth, isLoopback } from "./auth.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const PORT = Number(process.env.DASHBOARD_PORT ?? 4000);
+// Loopback by default: reachable from this machine only (and from a tunnel
+// or reverse proxy running on it). Exposing it on a network interface is an
+// explicit choice, and then a login is required — see below.
+const HOST = process.env.DASHBOARD_HOST || "127.0.0.1";
+const AUTH_USER = process.env.DASHBOARD_USER;
+const AUTH_PASSWORD = process.env.DASHBOARD_PASSWORD;
 const SLOT_DEBOUNCE_MS = 120;
+
+if (!isLoopback(HOST) && !(AUTH_USER && AUTH_PASSWORD)) {
+  console.error(
+    `Refusing to listen on ${HOST} without a login: anyone who reaches the dashboard can make the agents write and run code. ` +
+      "Set DASHBOARD_USER and DASHBOARD_PASSWORD, or keep DASHBOARD_HOST=127.0.0.1 behind a tunnel/proxy.",
+  );
+  process.exit(1);
+}
 const SUMMARY_DEBOUNCE_MS = 400;
 
 // One set of agents for the whole process: in particular one Muse MCP
@@ -19,6 +34,10 @@ const company = new Company({
 });
 
 const app = express();
+app.disable("x-powered-by");
+// For uptime checks; says nothing about the company.
+app.get("/healthz", (_req, res) => res.json({ ok: true }));
+if (AUTH_USER && AUTH_PASSWORD) app.use(basicAuth(AUTH_USER, AUTH_PASSWORD));
 app.use(express.json({ limit: "1mb" }));
 app.use(express.static(path.join(__dirname, "public")));
 
@@ -161,8 +180,8 @@ app.use((err: Error, _req: Request, res: Response, _next: NextFunction) => {
 });
 
 await company.init();
-const server = app.listen(PORT, () => {
-  console.log(`AI Company dashboard: http://localhost:${PORT}`);
+const server = app.listen(PORT, HOST, () => {
+  console.log(`AI Company dashboard: http://${isLoopback(HOST) ? "localhost" : HOST}:${PORT}${AUTH_USER && AUTH_PASSWORD ? " (login required)" : ""}`);
 });
 
 const shutdown = async () => {
