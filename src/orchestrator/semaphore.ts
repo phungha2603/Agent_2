@@ -1,35 +1,62 @@
-/** A counting semaphore with a FIFO wait queue, so waiters are served in arrival order. */
+/**
+ * A counting semaphore with a FIFO wait queue. Each holder and waiter
+ * carries a key (a task id) so the dashboard can show who is using an
+ * engine and who is queued, in order — and the CEO can move a waiter to the
+ * front.
+ */
 export class Semaphore {
-  private active = 0;
-  private readonly waiters: (() => void)[] = [];
+  private readonly holders: string[] = [];
+  private readonly waiters: { key: string; grant: () => void }[] = [];
 
   constructor(readonly limit: number) {
     if (!Number.isInteger(limit) || limit < 1) throw new Error(`Semaphore limit must be a positive integer, got ${limit}`);
   }
 
   get running(): number {
-    return this.active;
+    return this.holders.length;
   }
 
   get waiting(): number {
     return this.waiters.length;
   }
 
-  acquire(): Promise<() => void> {
-    if (this.active < this.limit) {
-      this.active++;
-      return Promise.resolve(this.releaser());
+  /** Keys currently holding a slot. */
+  runningKeys(): string[] {
+    return [...this.holders];
+  }
+
+  /** Keys waiting for a slot, next-served first. */
+  waitingKeys(): string[] {
+    return this.waiters.map((w) => w.key);
+  }
+
+  acquire(key = "?"): Promise<() => void> {
+    if (this.holders.length < this.limit) {
+      this.holders.push(key);
+      return Promise.resolve(this.releaser(key));
     }
     return new Promise((resolve) => {
-      this.waiters.push(() => {
-        this.active++;
-        resolve(this.releaser());
+      this.waiters.push({
+        key,
+        grant: () => {
+          this.holders.push(key);
+          resolve(this.releaser(key));
+        },
       });
     });
   }
 
-  async run<T>(fn: () => Promise<T>): Promise<T> {
-    const release = await this.acquire();
+  /** Moves the first waiter with this key to the front of the queue. False if it isn't waiting. */
+  promote(key: string): boolean {
+    const i = this.waiters.findIndex((w) => w.key === key);
+    if (i === -1) return false;
+    const [w] = this.waiters.splice(i, 1);
+    this.waiters.unshift(w);
+    return true;
+  }
+
+  async run<T>(fn: () => Promise<T>, key?: string): Promise<T> {
+    const release = await this.acquire(key);
     try {
       return await fn();
     } finally {
@@ -37,13 +64,14 @@ export class Semaphore {
     }
   }
 
-  private releaser(): () => void {
+  private releaser(key: string): () => void {
     let released = false;
     return () => {
       if (released) return;
       released = true;
-      this.active--;
-      this.waiters.shift()?.();
+      const i = this.holders.indexOf(key);
+      if (i !== -1) this.holders.splice(i, 1);
+      this.waiters.shift()?.grant();
     };
   }
 }

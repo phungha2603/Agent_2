@@ -95,6 +95,12 @@ export interface TaskSnapshot {
   lastRun: RunSummary | null;
   totals: { tokens: number; costUsd: number; activeMs: number; runs: number };
   redoPending: boolean;
+  /** Where this task stands in an engine's queue right now, if it is waiting for one. */
+  engineQueue: { engine: EngineName; state: "waiting" | "running"; position: number; of: number } | null;
+  /** The latest verification result and review verdicts — what the CEO weighs at the final checkpoint. */
+  review: { verification: "passed" | "failed" | null; gemini: string | null; geminiStandIn: boolean; claude: string | null };
+  /** When the task started waiting for the CEO, if it is. */
+  waitingSince?: string;
   assignedBy?: string;
 }
 
@@ -117,7 +123,14 @@ export interface SlotSnapshot {
   tasks: TaskSnapshot[];
 }
 
-export type EngineSnapshot = Record<EngineName, { limit: number; running: number; waiting: number }>;
+export interface EngineQueueEntry {
+  id: string;
+  label: string;
+  slotId?: string;
+  since?: string;
+}
+
+export type EngineSnapshot = Record<EngineName, { limit: number; running: number; waiting: number; queue: { running: EngineQueueEntry[]; waiting: EngineQueueEntry[] } }>;
 
 export interface Telemetry {
   paused: boolean;
@@ -268,7 +281,7 @@ export class Company extends EventEmitter {
     for (const ids of Object.values(this.state.slots)) {
       for (const id of ids) {
         const t = await this.load(id);
-        const open = t?.runs?.filter((r) => !r.endedAt) ?? [];
+        const open = t?.runs?.filter((r) => !r.endedAt && !(r.human && isWaitingForHuman(t))) ?? [];
         if (t && open.length) {
           for (const r of open) Object.assign(r, { endedAt: t.updatedAt, outcome: "cancelled" });
           await saveTask(t);
@@ -358,6 +371,8 @@ export class Company extends EventEmitter {
     const hadHandoff = Boolean(task.handoff);
     const gated = this.isGated(task);
 
+    const wait = [...(task.runs ?? [])].reverse().find((r) => r.human && !r.endedAt);
+    if (wait) Object.assign(wait, { endedAt: nowIso(), outcome: "ok", decision: act });
     if (act === "revise") requestRevision(task, feedback ?? "");
     else resolveCheckpoint(task, act === "approve", feedback?.trim() || undefined);
 
@@ -697,9 +712,32 @@ export class Company extends EventEmitter {
   engineSnapshot(): EngineSnapshot {
     const snap = {} as EngineSnapshot;
     for (const [name, sem] of Object.entries(this.engines) as [EngineName, Semaphore][]) {
-      snap[name] = { limit: sem.limit, running: sem.running, waiting: sem.waiting };
+      const entry = (id: string, state: Activity["state"]): EngineQueueEntry => {
+        const act = this.activity.get(id)?.find((a) => a.engine === name && a.state === state);
+        if (id.startsWith("plan:")) return { id, label: "Kế hoạch của Sếp", slotId: BOSS_ID, since: act?.since };
+        if (id === "rebalance") return { id, label: "Đề xuất cân tải", slotId: BOSS_ID, since: act?.since };
+        const t = this.running.get(id);
+        return { id, label: t?.context.title ?? id, slotId: t?.slotId ?? this.slotOf(id), since: act?.since };
+      };
+      snap[name] = {
+        limit: sem.limit,
+        running: sem.running,
+        waiting: sem.waiting,
+        queue: { running: sem.runningKeys().map((k) => entry(k, "running")), waiting: sem.waitingKeys().map((k) => entry(k, "waiting")) },
+      };
     }
     return snap;
+  }
+
+  /** Moves a task's pending call to the front of an engine's queue. */
+  async promote(engine: EngineName, id: string): Promise<void> {
+    const sem = this.engines[engine];
+    if (!sem) throw new UserError(`Không có engine ${engine}.`);
+    if (!sem.promote(id)) throw new UserError("Lượt này không còn trong hàng đợi (có thể đã được chạy).");
+    const task = this.running.get(id);
+    if (task) trace(task, "CEO", "priority", `Moved to the front of the ${engine} queue.`);
+    this.emit("engines");
+    if (task) this.emitTask(task);
   }
 
   control() {
@@ -857,7 +895,7 @@ export class Company extends EventEmitter {
   /** Every stage attempt on a time axis, one row per slot, plus the dependency chain that determined the finish time. */
   async timeline() {
     const idx = await this.index();
-    const rows = SLOTS.map((s) => ({ slotId: s.id, name: s.name, spans: [] as any[] }));
+    const rows = SLOTS.map((s) => ({ slotId: s.id, name: s.name, tier: s.tier, tierLabel: TIER_LABELS[s.tier], spans: [] as any[] }));
     let start: string | null = null;
     const finishOf = (t: TaskRecord): number => {
       if (t.handoff) return Date.parse(t.handoff.at);
@@ -893,6 +931,11 @@ export class Company extends EventEmitter {
           outcome: run.outcome ?? null,
           waitMs: run.waitMs,
           tokens: run.inputTokens + run.outputTokens,
+          costUsd: run.costUsd,
+          engines: run.engines,
+          human: Boolean(run.human),
+          decision: run.decision ?? null,
+          status: run.human ? "review" : !run.endedAt ? "running" : run.outcome === "error" ? "error" : run.outcome === "cancelled" ? "stopped" : "done",
           critical: critical.has(task.id),
         });
       }
@@ -1163,6 +1206,19 @@ export class Company extends EventEmitter {
   }
 
   private async afterStage(task: TaskRecord): Promise<void> {
+    if (isWaitingForHuman(task) && !task.runs?.some((r) => r.human && !r.endedAt)) {
+      (task.runs ??= []).push({
+        stage: task.stage,
+        startedAt: nowIso(),
+        waitMs: 0,
+        engines: [],
+        inputTokens: 0,
+        outputTokens: 0,
+        costUsd: 0,
+        estimated: false,
+        human: true,
+      });
+    }
     if (!task.handoff && reachedHandoffPoint(task.stage, this.handoffPointFor(task))) {
       await this.publishHandoff(task);
     }
@@ -1429,7 +1485,7 @@ export class Company extends EventEmitter {
   private async withEngine<T>(engine: EngineName, id: string, fn: () => Promise<T>): Promise<T> {
     const waitStart = Date.now();
     this.pushActivity(id, engine, "waiting");
-    const release = await this.engines[engine].acquire();
+    const release = await this.engines[engine].acquire(id);
     const run = this.currentRun.get(id);
     if (run) run.waitMs += Date.now() - waitStart;
     this.markRunning(id, engine);
@@ -1559,8 +1615,20 @@ export class Company extends EventEmitter {
     const isRunning = this.workers.has(task.id);
     const deps = await this.dependencyState(task, idx);
     const queueState = this.queueStateOf(task, deps);
-    const runs = task.runs ?? [];
+    const runs = (task.runs ?? []).filter((r) => !r.human);
     const last = runs.at(-1);
+    const act = this.currentActivity(task.id);
+    let engineQueue: TaskSnapshot["engineQueue"] = null;
+    if (act) {
+      const sem = this.engines[act.engine];
+      const keys = act.state === "waiting" ? sem.waitingKeys() : sem.runningKeys();
+      engineQueue = { engine: act.engine, state: act.state, position: keys.indexOf(task.id) + 1, of: keys.length };
+    }
+    const lastEntry = (stage: Stage, by?: string) => [...task.history].reverse().find((h) => h.stage === stage && (!by || h.by === by) && /Verdict|Verification/.test(h.summary));
+    const gem = lastEntry("review_gemini");
+    const cla = lastEntry("review_claude", "claude");
+    const ver = lastEntry("verification");
+    const verdictOf = (h?: { summary: string }) => (h ? (/approve/i.test(h.summary) ? "approve" : /reject/i.test(h.summary) ? "reject" : "unknown") : null);
     const dependents = this.dependentsIndex(idx).get(task.id) ?? [];
     const assign = task.trace?.find((t) => t.kind === "assign");
 
@@ -1610,6 +1678,14 @@ export class Company extends EventEmitter {
         runs: runs.length,
       },
       redoPending: Boolean(task.redoRequested),
+      engineQueue,
+      review: {
+        verification: ver ? (/passed/i.test(ver.summary) ? "passed" : "failed") : null,
+        gemini: verdictOf(gem),
+        geminiStandIn: gem?.by === "claude",
+        claude: verdictOf(cla),
+      },
+      waitingSince: queueState === "waiting_you" ? ([...(task.runs ?? [])].reverse().find((r) => r.human && !r.endedAt)?.startedAt ?? task.updatedAt) : undefined,
       assignedBy: assign?.by,
     };
   }

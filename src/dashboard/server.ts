@@ -130,6 +130,10 @@ app.post("/api/artifacts/send", route(async (req, res) => {
   ok(res, result);
 }));
 
+app.post("/api/engines/:engine/promote", route(async (req, res) => {
+  await company.promote(req.params.engine as any, String(req.body?.id ?? ""));
+  ok(res);
+}));
 app.post("/api/rebalance", route(async (_req, res) => ok(res, { proposal: await company.proposeRebalance() })));
 app.post("/api/rebalance/:id/apply", route(async (req, res) => {
   const indexes = Array.isArray(req.body?.indexes) ? req.body.indexes.map(Number) : undefined;

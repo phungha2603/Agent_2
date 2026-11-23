@@ -130,6 +130,10 @@ export interface StageRun {
   outputTokens: number;
   costUsd: number;
   estimated: boolean;
+  /** A span spent waiting at a checkpoint for the CEO, not an agent run (no engines, no tokens). */
+  human?: boolean;
+  /** How the CEO resolved that checkpoint. */
+  decision?: "approve" | "reject" | "revise";
   /** Per-engine split, for the telemetry bar (a review_gemini stage can fall back to Claude). */
   usageByEngine?: Record<string, { inputTokens: number; outputTokens: number; costUsd: number }>;
   error?: string;

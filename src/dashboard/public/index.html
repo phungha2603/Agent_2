@@ -18,6 +18,7 @@
       <button id="pause-btn" class="btn btn-ghost" title="Không bắt đầu bước mới; các lượt đang chạy được làm nốt">⏸ Pause</button>
       <button id="stop-btn" class="btn btn-ghost btn-danger-ghost" title="Huỷ ngay mọi lượt đang chạy (bước đó sẽ chạy lại khi Resume)">⏹ Stop</button>
       <button id="reset-btn" class="btn btn-ghost">Reset</button>
+      <span id="review-badges" class="review-badges"></span>
       <button id="approve-all-btn" class="btn btn-approve" hidden></button>
     </div>
   </header>
@@ -44,7 +45,8 @@
       <button class="filter" data-action="filter" data-filter="running">Đang chạy</button>
       <button class="filter" data-action="filter" data-filter="attention">Cần duyệt / Lỗi</button>
       <button class="filter" data-action="filter" data-filter="done">Đã xong</button>
-      <button class="filter toggle" id="edges-toggle" data-action="toggle-edges" title="Hiện mọi đường giao việc/bàn giao giữa các nhân sự">↔ Đường nối</button>
+      <button class="filter toggle" id="edges-toggle" data-action="toggle-edges" aria-pressed="false" title="Hiện mọi đường giao việc/bàn giao giữa các nhân sự">↔ Đường nối: <b>Tắt</b></button>
+      <span id="focus-chip" class="focus-chip" hidden></span>
     </div>
     <span id="conn" class="conn"></span>
   </nav>
@@ -81,6 +83,11 @@
 
   <div id="drawer-backdrop" class="backdrop" hidden></div>
   <aside id="drawer" class="drawer" hidden aria-label="Chi tiết task"></aside>
+
+  <div id="inbox-backdrop" class="backdrop" hidden></div>
+  <aside id="inbox" class="drawer inbox" hidden aria-label="Hộp duyệt"></aside>
+
+  <div id="g-tip" class="g-tip" hidden></div>
 
   <div id="modal-backdrop" class="backdrop" hidden></div>
   <div id="modal" class="modal" hidden role="dialog"></div>

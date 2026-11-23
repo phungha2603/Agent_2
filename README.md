@@ -292,6 +292,31 @@ The dashboard runs on `src/orchestrator/scheduler.ts` (`Company`).
   by AG-01 and approved by the CEO, with the reason. A task that started
   running between the proposal and your click is skipped and noted.
 
+### Engines, the review inbox and focus
+
+- **Engine badge on every running card**: `● Claude` / `● Gemini` / `● Muse`
+  while a call is running, or `⏳ Chờ slot Muse #2/3` while it waits for
+  that engine — with ↑ to move it to the front of that engine's queue.
+  Clicking an engine (on a card or in the telemetry bar) opens its queue:
+  who is running and who waits, in the order they'll be served, each with
+  ↑ Ưu tiên. Priority only reorders the wait; a step never switches to a
+  different engine (that would break "every bot's work is checked by
+  another bot" — the only engine swap is Claude standing in for a Gemini
+  that is down, which stays automatic).
+- **🔍 Đang thẩm định / ✋ Chờ bạn duyệt** (top right) count what Gemini is
+  reviewing right now (designs, code, the plan) and what waits for you
+  (tasks, the plan, a rebalance proposal). Either opens the **Hộp duyệt**:
+  each waiting item shows how long it has waited and, at the final
+  checkpoint, Build/test · Gemini · Claude verdicts and the gate; act on it
+  right there — Duyệt, Yêu cầu sửa, Từ chối, or Bỏ qua (for later: hidden
+  from the list, still waiting; see the *Để sau* tab).
+- **🎯 Focus** on a card pins that agent: everything unrelated to it (not
+  an input, output or assignment link) stays dimmed, its arrows stay drawn,
+  and the Dòng chảy and Timeline views narrow to it too, until you clear
+  the chip (or press Esc). "↔ Đường nối" now says Bật/Tắt.
+- Time spent waiting for you at a checkpoint is recorded too, so the
+  Timeline shows it — and the agents' own working time excludes it.
+
 ### Visibility
 
 - **Telemetry bar**: company completion %, running / waiting / waiting for
@@ -320,7 +345,10 @@ The dashboard runs on `src/orchestrator/scheduler.ts` (`Company`).
   waiting flagged as the bottleneck), *Timeline* (one row per staff member,
   one bar per stage attempt, striped where it waited for an engine, with
   the critical path — the dependency chain that determined the finish
-  time — outlined), and *Sản phẩm* (every brief, guide, file and log the
+  time — outlined; group by person or by role lane, color by status — Chạy,
+  Chờ duyệt, Lỗi, Dừng, Xong — or by phase, zoom to the last 15 min / 1 h,
+  filter by status and by AG-xx, hover for duration/tokens/engines, click
+  to open the task), and *Sản phẩm* (every brief, guide, file and log the
   team produced: preview, download, or forward to another staff member as
   input material). Filters: Đang chạy, Cần duyệt / Lỗi, Đã xong.
 

@@ -62,6 +62,14 @@ const state = {
   filter: "all",
   showAllEdges: false,
   hoverSlot: null,
+  /** Agent pinned with 🎯: unrelated cards stay dimmed until cleared. */
+  focusSlot: null,
+  engineModal: null,
+  inbox: { open: false, tab: "waiting", sig: "" },
+  /** Waiting items the CEO chose to look at later ("Bỏ qua"). */
+  snoozed: new Set(),
+  tl: { group: "agent", color: "status", range: "all", statuses: new Set(["running", "review", "error", "stopped", "done"]), agents: null, collapsed: new Set() },
+  tlSpans: [],
   /** slotId -> taskId chosen in that card's queue */
   selected: new Map(),
   live: new Map(),
@@ -168,7 +176,7 @@ function renderTelemetry() {
     .join("\n");
   const engines = state.engines
     ? Object.entries(state.engines)
-        .map(([name, s]) => `<span class="engine ${s.running >= s.limit ? "busy" : ""}" title="${esc(ENGINE_LABEL[name])}: ${s.running}/${s.limit} đang chạy${s.waiting ? `, ${s.waiting} đang chờ lượt` : ""}"><b>${ENGINE_LABEL[name] ?? name}</b> ${s.running}/${s.limit}${s.waiting ? ` · chờ ${s.waiting}` : ""}</span>`)
+        .map(([name, s]) => `<button class="engine eng-${name} ${s.running >= s.limit ? "busy" : ""}" data-action="engine-open" data-engine="${name}" title="${esc(ENGINE_LABEL[name])}: ${s.running}/${s.limit} đang chạy${s.waiting ? `, ${s.waiting} đang chờ lượt` : ""} — bấm để xem hàng đợi"><b>${ENGINE_LABEL[name] ?? name}</b> ${s.running}/${s.limit}${s.waiting ? ` · chờ ${s.waiting}` : ""}</button>`)
         .join("")
     : "";
   el.innerHTML = `
@@ -179,7 +187,7 @@ function renderTelemetry() {
     <div class="tm-counts">
       <span class="tm q-running">▶ <b>${t.counts.running}</b> chạy</span>
       <span class="tm q-queued">⏸ <b>${t.counts.queued}</b> chờ</span>
-      <span class="tm q-waiting_you">✋ <b>${t.counts.waitingYou}</b> chờ duyệt</span>
+      <button class="tm tm-link q-waiting_you" data-action="inbox-open" data-tab="waiting" title="Mở hộp duyệt">✋ <b>${t.counts.waitingYou}</b> chờ duyệt</button>
       <span class="tm q-error">⚠ <b>${t.counts.errors}</b> lỗi/chặn</span>
       <span class="tm q-done">✓ <b>${t.counts.done}</b>/${t.counts.total} xong</span>
     </div>
@@ -354,9 +362,12 @@ function updateCard(slot) {
   card.dataset.state = st.kind;
   card.querySelector('[data-part="tools"]').innerHTML = `
     ${slot.isBoss ? `<span class="gate on" title="Kế hoạch của Sếp luôn chờ bạn duyệt">🔒</span>` : `<button class="gate ${slot.gated ? "on" : ""}" data-action="gate" data-slot="${slot.id}" data-enabled="${slot.gated ? "0" : "1"}" title="${slot.gated ? "Cổng duyệt đang BẬT: kết quả chỉ bàn giao sau khi bạn duyệt. Bấm để tắt." : "Cổng duyệt đang tắt: bàn giao ngay khi Claude đã duyệt. Bấm để bật."}">${slot.gated ? "🔒" : "🔓"}</button>`}
+    <button class="pin ${state.focusSlot === slot.id ? "on" : ""}" data-action="focus" data-slot="${slot.id}" title="${state.focusSlot === slot.id ? "Bỏ tập trung" : `Tập trung vào ${slot.id}: làm mờ nhân sự không liên quan, hiện đường nối`}">🎯</button>
     <span class="parallel" title="Số task đang chạy / tối đa">${slot.counts.running}/${slot.parallel}</span>`;
   card.querySelector('[data-part="state"]').innerHTML = `
-    <div class="state-row"><span class="state-pill s-${st.kind}">${STATE_ICON[st.kind] ?? ""} ${esc(st.label)}</span>${st.detail ? `<span class="state-detail" title="${esc(st.detail)}">${esc(st.detail)}</span>` : ""}</div>`;
+    <div class="state-row"><span class="state-pill s-${st.kind}">${STATE_ICON[st.kind] ?? ""} ${esc(st.label)}</span>${
+      st.kind === "running" ? engineBadge(slot.tasks.find((x) => x.queueState === "running")) : st.detail ? `<span class="state-detail" title="${esc(st.detail)}">${esc(st.detail)}</span>` : ""
+    }</div>`;
   card.querySelector('[data-part="links"]').innerHTML = slotLinks(slot, t);
   card.querySelector('[data-part="body"]').innerHTML = taskBody(slot, t);
   const actions = card.querySelector('[data-part="actions"]');
@@ -575,6 +586,218 @@ function renderRebalance() {
   box.innerHTML = `<div class="rb"><div class="panel-sub">⚖ Đề xuất cân tải của Sếp</div>${inner}</div>`;
 }
 
+// ---------- focus, engine slots, review inbox ----------
+/** The agent itself plus everyone it takes input from, hands output to, or was assigned by / assigns to. */
+function relatedSlots(id) {
+  const out = new Set([id]);
+  const s = state.slots.get(id);
+  if (!s) return out;
+  s.inFrom.forEach((x) => out.add(x));
+  s.outTo.forEach((x) => out.add(x));
+  if (s.isBoss) {
+    for (const o of state.slots.values()) if (o.tasks.some((t) => t.assignedBy?.startsWith("AG-01"))) out.add(o.id);
+  } else if (s.tasks.some((t) => t.assignedBy?.startsWith("AG-01"))) {
+    out.add("AG-01");
+  }
+  return out;
+}
+
+function setFocus(slotId) {
+  state.focusSlot = slotId;
+  state.tl.agents = slotId ? relatedSlots(slotId) : null;
+  renderFocusChip();
+  for (const slot of state.slots.values()) updateCard(slot);
+  drawEdges();
+  if (state.view === "flow") renderFlowView();
+  if (state.view === "timeline") renderTimeline();
+}
+
+function renderFocusChip() {
+  const chip = $("#focus-chip");
+  const s = state.focusSlot && state.slots.get(state.focusSlot);
+  chip.hidden = !s;
+  if (s) chip.innerHTML = `🎯 Tập trung: <b>${s.id}</b> ${esc(s.name.replace(/^AI /, ""))} <span class="muted">(+${relatedSlots(s.id).size - 1} liên quan)</span> <button class="x" data-action="focus-clear" title="Bỏ tập trung (Esc)">×</button>`;
+}
+
+const ENGINE_HINT = { claude: "Claude", gemini: "Gemini", muse: "Muse", workspace: "Thư mục dự án" };
+/** Which engine the running task is on right now — or which slot queue it is waiting in, and where. */
+function engineBadge(t) {
+  if (!t) return "";
+  const q = t.engineQueue;
+  if (!q) return `<span class="eng-badge eng-none" title="Bước này không gọi AI (ví dụ đang chạy build/test hoặc chuyển bước)">⚙ ${esc(t.stage)}</span>`;
+  const name = ENGINE_HINT[q.engine] ?? q.engine;
+  if (q.state === "running") {
+    return `<button class="eng-badge eng-${q.engine}" data-action="engine-open" data-engine="${q.engine}" title="Đang dùng ${esc(name)} — bấm để xem hàng đợi của engine này">● ${esc(name)}</button>`;
+  }
+  return `<span class="eng-badge waiting eng-${q.engine}"><button class="eng-link" data-action="engine-open" data-engine="${q.engine}" title="Đang chờ tới lượt dùng ${esc(name)} — bấm để xem hàng đợi">⏳ Chờ slot ${esc(name)} #${q.position}/${q.of}</button>${
+    q.position > 1 ? `<button class="mini" data-action="promote" data-engine="${q.engine}" data-id="${esc(t.id)}" title="Ưu tiên lượt này lên đầu hàng đợi ${esc(name)}">↑</button>` : ""
+  }</span>`;
+}
+
+function renderEngineModal() {
+  const name = state.engineModal;
+  if (!name || !state.engines?.[name]) return;
+  const e = state.engines[name];
+  const row = (x, i, waiting) => `
+    <div class="eq-row">
+      <span class="eq-pos">${waiting ? `#${i + 1}` : "●"}</span>
+      ${x.slotId ? ownerChip(x.slotId) : ""}
+      <span class="eq-title" ${x.id.includes(":") || x.id === "rebalance" ? "" : `data-action="open-drawer" data-task="${esc(x.id)}"`}>${esc(x.label)}</span>
+      ${x.since ? `<span class="muted small">${waiting ? "chờ" : "chạy"} <span class="elapsed" data-since="${esc(x.since)}">${elapsed(x.since)}</span></span>` : ""}
+      ${waiting && i > 0 ? `<button class="btn btn-small-inline" data-action="promote" data-engine="${name}" data-id="${esc(x.id)}">↑ Ưu tiên</button>` : ""}
+    </div>`;
+  openModal(`
+    <div class="modal-title">Hàng đợi ${esc(ENGINE_LABEL[name] ?? name)} · ${e.running}/${e.limit} đang chạy${e.waiting ? ` · ${e.waiting} đang chờ` : ""}</div>
+    <div class="muted small">${name === "muse" ? "Muse chỉ có 1 trình duyệt nên luôn chạy từng lượt một." : name === "workspace" ? "Bước viết code + build/test của các task dùng chung thư mục dự án nên chạy lần lượt." : `Tối đa ${e.limit} lượt cùng lúc (đổi trong .env).`} Ưu tiên chỉ đổi thứ tự chờ, không đổi engine — mỗi bước vẫn do đúng vai trò của nó thực hiện.</div>
+    <div class="panel-sub">Đang chạy</div>
+    ${e.queue.running.map((x, i) => row(x, i, false)).join("") || `<div class="muted small">Không có.</div>`}
+    <div class="panel-sub">Đang chờ (theo thứ tự được phục vụ)</div>
+    ${e.queue.waiting.map((x, i) => row(x, i, true)).join("") || `<div class="muted small">Không ai đang chờ.</div>`}
+    <div class="decision-row"><button class="btn btn-ghost" data-action="modal-close">Đóng</button></div>`);
+}
+
+function inboxData() {
+  const waiting = [];
+  const reviewing = [];
+  const snoozed = [];
+  const waitingIds = new Set();
+  for (const slot of state.slots.values()) {
+    for (const t of slot.tasks) {
+      if (t.queueState === "waiting_you") {
+        waitingIds.add(t.id);
+        (state.snoozed.has(t.id) ? snoozed : waiting).push({ slot, t });
+      }
+      if ((t.stage === "architecture_review" || t.stage === "review_gemini") && (t.queueState === "running" || t.queueState === "queued")) reviewing.push({ slot, t });
+    }
+  }
+  for (const id of [...state.snoozed]) if (!waitingIds.has(id)) state.snoozed.delete(id);
+  waiting.sort((a, b) => (a.t.waitingSince ?? "").localeCompare(b.t.waitingSince ?? ""));
+  const plan = state.plan;
+  const planWaiting = plan?.status === "awaiting_approval";
+  const planReviewing = plan?.status === "drafting" && /Gemini/.test(plan.phase ?? "");
+  const rb = state.rebalance;
+  const rbWaiting = rb?.status === "ready" && rb.moves.length > 0;
+  return {
+    waiting,
+    reviewing,
+    snoozed,
+    planWaiting,
+    planReviewing,
+    rbWaiting,
+    waitingCount: waiting.length + (planWaiting ? 1 : 0) + (rbWaiting ? 1 : 0),
+    reviewingCount: reviewing.length + (planReviewing ? 1 : 0),
+  };
+}
+
+function renderReviewBadges() {
+  const d = inboxData();
+  $("#review-badges").innerHTML = `
+    <button class="rv-badge rv-reviewing${d.reviewingCount ? " has" : ""}" data-action="inbox-open" data-tab="reviewing" title="Các bước Gemini đang thẩm định (thiết kế, code, kế hoạch)">🔍 Đang thẩm định <b>${d.reviewingCount}</b></button>
+    <button class="rv-badge rv-waiting${d.waitingCount ? " has" : ""}" data-action="inbox-open" data-tab="waiting" title="Các mục đang chờ bạn quyết định — bấm để duyệt nhanh">✋ Chờ bạn duyệt <b>${d.waitingCount}</b>${d.snoozed.length ? ` <span class="muted">(+${d.snoozed.length} để sau)</span>` : ""}</button>`;
+}
+
+function verdictChip(v, label) {
+  const cls = v === "approve" || v === "passed" ? "ok" : v === "reject" || v === "failed" ? "bad" : "na";
+  const mark = cls === "ok" ? "✓" : cls === "bad" ? "✗" : "—";
+  return `<span class="rv-chip ${cls}">${label} ${mark}</span>`;
+}
+
+function inboxWaitingItem({ slot, t }, snoozed) {
+  const final = t.stage === "checkpoint_final";
+  const r = t.review;
+  const body = final
+    ? `<div class="rv-chips">${verdictChip(r.verification, "Build/test")}${verdictChip(r.gemini, r.geminiStandIn ? "Claude (thay Gemini)" : "Gemini")}${verdictChip(r.claude, "Claude chốt")}${t.acceptanceCriteria.length ? `<span class="rv-chip na">${t.acceptanceCriteria.length} tiêu chí</span>` : ""}${t.gated ? `<span class="rv-chip gate">🔒 cổng duyệt</span>` : ""}</div>${t.lastFeedback ? details(`rvfb:${t.id}`, "Phản hồi gần nhất", `<div class="feedback-box">${esc(t.lastFeedback)}</div>`) : ""}`
+    : `<div class="rv-brief">${esc((t.checkpointBrief || "").slice(0, 420))}${(t.checkpointBrief || "").length > 420 ? "…" : ""}</div>`;
+  return `
+    <div class="rv-item">
+      <div class="rv-head">${ownerChip(slot.id)} <span class="qstate q-waiting_you">${final ? "Duyệt kết quả" : "Duyệt ý tưởng"}</span>${t.waitingSince ? `<span class="muted small">chờ <span class="elapsed" data-since="${esc(t.waitingSince)}">${elapsed(t.waitingSince)}</span></span>` : ""}</div>
+      <div class="rv-title">${esc(t.title)}</div>
+      ${body}
+      ${snoozed
+        ? `<div class="row-inline"><button class="btn btn-small-inline" data-action="unsnooze" data-task="${esc(t.id)}">Đưa lại vào danh sách</button><button class="btn btn-small-inline" data-action="open-drawer" data-task="${esc(t.id)}">Chi tiết</button></div>`
+        : `<textarea rows="1" data-keep="rv:${esc(t.id)}" data-feedback-for="${esc(t.id)}" placeholder="${final ? "Yêu cầu sửa / lý do từ chối (tuỳ chọn)" : "Lý do từ chối (tuỳ chọn)"}"></textarea>
+      <div class="decision-row">
+        <button class="btn btn-approve" data-action="approve" data-task="${esc(t.id)}">Duyệt</button>
+        ${final ? `<button class="btn btn-revise" data-action="revise" data-task="${esc(t.id)}">Yêu cầu sửa</button>` : ""}
+        <button class="btn btn-reject" data-action="reject" data-task="${esc(t.id)}">Từ chối</button>
+        <button class="btn btn-ghost" data-action="snooze" data-task="${esc(t.id)}" title="Để sau: ẩn khỏi danh sách, task vẫn chờ bạn">Bỏ qua</button>
+        <button class="btn btn-ghost" data-action="open-drawer" data-task="${esc(t.id)}">Chi tiết</button>
+      </div>`}
+    </div>`;
+}
+
+function renderInbox() {
+  const panel = $("#inbox");
+  if (!state.inbox.open) {
+    panel.hidden = true;
+    $("#inbox-backdrop").hidden = true;
+    return;
+  }
+  panel.hidden = false;
+  $("#inbox-backdrop").hidden = false;
+  const d = inboxData();
+  const tab = state.inbox.tab;
+  const sig = JSON.stringify([
+    tab,
+    d.waiting.map((x) => [x.t.id, x.t.stage]),
+    d.snoozed.map((x) => x.t.id),
+    d.reviewing.map((x) => [x.t.id, x.t.stage, x.t.queueState, x.t.activity?.state]),
+    d.planWaiting,
+    d.planReviewing,
+    d.rbWaiting,
+  ]);
+  if (sig === state.inbox.sig) return;
+  state.inbox.sig = sig;
+  const keep = {};
+  for (const el of $$("#inbox [data-keep]")) keep[el.dataset.keep] = el.value;
+  const body = $("#inbox .drawer-body");
+  const scroll = body?.scrollTop ?? 0;
+
+  let html = "";
+  if (tab === "waiting") {
+    if (d.planWaiting) {
+      html += `<div class="rv-item rv-plan"><div class="rv-head"><span class="owner lead">AG-01</span> <span class="qstate q-waiting_you">Duyệt kế hoạch</span></div><div class="rv-title">${esc(state.plan.goal)}</div>
+        <div class="rv-brief">${esc(state.plan.summary ?? "")} · ${state.plan.epics?.length ?? 0} epic, ${(state.plan.epics ?? []).reduce((n, e) => n + e.subtasks.length, 0)} subtask${state.plan.unresolvedReview ? " · ⚠ Gemini còn ý kiến" : ""}</div>
+        <textarea rows="1" data-keep="rv:plan" data-plan-feedback="${esc(state.plan.id)}" placeholder="Feedback nếu từ chối (Sếp sẽ lập lại theo ý này)"></textarea>
+        <div class="decision-row"><button class="btn btn-approve" data-action="plan-approve" data-plan="${esc(state.plan.id)}">Duyệt kế hoạch</button><button class="btn btn-reject" data-action="plan-reject" data-plan="${esc(state.plan.id)}">Từ chối & lập lại</button><button class="btn btn-ghost" data-action="goto-panel" data-target="plan-panel">Xem cây việc</button></div></div>`;
+    }
+    if (d.rbWaiting) {
+      html += `<div class="rv-item"><div class="rv-head"><span class="owner lead">AG-01</span> <span class="qstate q-waiting_you">Đề xuất cân tải</span></div><div class="rv-title">${state.rebalance.moves.length} thay đổi được đề xuất</div><div class="rv-brief">${esc(state.rebalance.summary)}</div><div class="decision-row"><button class="btn btn-small-inline" data-action="goto-panel" data-target="rebalance-box">Xem & chọn áp dụng</button></div></div>`;
+    }
+    html += d.waiting.map((x) => inboxWaitingItem(x, false)).join("");
+    if (!html) html = `<div class="muted">Không có gì đang chờ bạn. 🎉</div>`;
+  } else if (tab === "reviewing") {
+    if (d.planReviewing) html += `<div class="rv-item"><div class="rv-head"><span class="owner lead">AG-01</span> <span class="qstate q-running">Gemini thẩm định kế hoạch</span></div><div class="rv-title">${esc(state.plan.goal)}</div><div class="muted small">${esc(state.plan.phase)}</div></div>`;
+    html += d.reviewing
+      .map(
+        ({ slot, t }) => `<div class="rv-item" data-action="open-drawer" data-task="${esc(t.id)}">
+        <div class="rv-head">${ownerChip(slot.id)} <span class="qstate q-${t.queueState}">${t.stage === "architecture_review" ? "Gemini thẩm định thiết kế" : "Gemini review code"}</span>${t.activity ? `<span class="muted small">${t.activity.state === "waiting" ? `chờ slot ${ENGINE_LABEL[t.activity.engine]}` : ENGINE_LABEL[t.activity.engine]} <span class="elapsed" data-since="${esc(t.activity.since)}">${elapsed(t.activity.since)}</span></span>` : t.queueState === "queued" ? `<span class="muted small">trong hàng đợi</span>` : ""}</div>
+        <div class="rv-title">${esc(t.title)}</div>
+      </div>`,
+      )
+      .join("");
+    if (!html) html = `<div class="muted">Gemini không thẩm định gì lúc này.</div>`;
+    html = `<div class="muted small rv-note">Gemini thẩm định trước, rồi Claude chốt, rồi mới tới bạn. Mục ở đây sẽ chuyển sang "Chờ bạn duyệt" khi xong.</div>` + html;
+  } else {
+    html = d.snoozed.map((x) => inboxWaitingItem(x, true)).join("") || `<div class="muted">Không có mục nào đang để sau.</div>`;
+  }
+
+  panel.innerHTML = `
+    <div class="drawer-head"><div><div class="drawer-title">Hộp duyệt</div><div class="muted small">Gemini thẩm định → Claude chốt → bạn duyệt</div></div><button class="btn btn-icon" data-action="inbox-close" title="Đóng (Esc)">✕</button></div>
+    <div class="drawer-tabs">
+      <button class="tab${tab === "waiting" ? " active" : ""}" data-action="inbox-tab" data-tab="waiting">✋ Chờ bạn duyệt (${d.waitingCount})</button>
+      <button class="tab${tab === "reviewing" ? " active" : ""}" data-action="inbox-tab" data-tab="reviewing">🔍 Đang thẩm định (${d.reviewingCount})</button>
+      <button class="tab${tab === "snoozed" ? " active" : ""}" data-action="inbox-tab" data-tab="snoozed">Để sau (${d.snoozed.length})</button>
+    </div>
+    <div class="drawer-body">${html}</div>`;
+  for (const [k, v] of Object.entries(keep)) {
+    const el = $(`#inbox [data-keep="${CSS.escape(k)}"]`);
+    if (el) el.value = v;
+  }
+  const nb = $("#inbox .drawer-body");
+  if (nb) nb.scrollTop = scroll;
+}
+
 // ---------- edges (dependency / handoff arrows) ----------
 function slotEdges() {
   const edges = [];
@@ -604,9 +827,10 @@ function drawEdges() {
   svg.setAttribute("viewBox", `0 0 ${box.width} ${org.scrollHeight}`);
   $$("path.edge, text.edge-label", svg).forEach((p) => p.remove());
   $$(".card.related-in, .card.related-out, .card.related-self", org).forEach((c) => c.classList.remove("related-in", "related-out", "related-self"));
-  org.classList.toggle("focusing", Boolean(state.hoverSlot));
-
-  const focus = state.hoverSlot;
+  const focus = state.hoverSlot ?? state.focusSlot;
+  org.classList.toggle("focusing", Boolean(focus));
+  $$(".card.pinned", org).forEach((c) => c.classList.remove("pinned"));
+  if (state.focusSlot) $(`#org .card[data-slot="${state.focusSlot}"]`)?.classList.add("pinned");
   const all = slotEdges();
   const shown = all.filter((e) => (focus ? e.from === focus || e.to === focus : state.showAllEdges && e.kind !== "assign"));
   if (focus) {
@@ -660,6 +884,7 @@ function renderFlowView() {
     cols["Mục tiêu"].push(`<div class="flow-card ph-goal"><div class="fc-top"><span class="owner lead">AG-01</span> <span class="qstate ${plan.status === "awaiting_approval" ? "q-waiting_you" : plan.status === "failed" ? "q-error" : "q-running"}">${esc(PLAN_STATUS[plan.status])}</span></div><div class="fc-title">${esc(plan.goal)}</div></div>`);
   }
   const waitingIn = Object.fromEntries(PHASES.map((p) => [p, 0]));
+  const related = state.focusSlot ? relatedSlots(state.focusSlot) : null;
   for (const slot of state.slots.values()) {
     if (!matchesFilter(slot)) continue;
     for (const t of slot.tasks) {
@@ -667,7 +892,7 @@ function renderFlowView() {
       const waiting = t.queueState === "queued" || t.queueState === "waiting_deps" || t.activity?.state === "waiting";
       if (waiting) waitingIn[phase]++;
       cols[phase].push(`
-        <div class="flow-card ${PHASE_CLASS[phase] ?? ""}${t.queueState === "running" ? " is-running" : ""}" data-action="open-drawer" data-task="${esc(t.id)}">
+        <div class="flow-card ${PHASE_CLASS[phase] ?? ""}${t.queueState === "running" ? " is-running" : ""}${related && !related.has(slot.id) ? " dim" : ""}" data-action="open-drawer" data-task="${esc(t.id)}">
           <div class="fc-top"><span class="owner" data-hover-slot="${slot.id}">${slot.id}</span> <span class="qstate q-${t.queueState}">${QUEUE_LABEL[t.queueState]}</span>${t.activity ? ` <span class="muted small">${ENGINE_LABEL[t.activity.engine]} ${t.activity.state === "waiting" ? "chờ" : ""}</span>` : ""}</div>
           <div class="fc-title">${esc(t.title)}</div>
           <div class="fc-meta"><span class="stage-raw">${esc(t.stage)}</span>${t.queueState === "running" && t.stageStartedAt ? ` · ⏱ <span class="elapsed" data-since="${esc(t.stageStartedAt)}">${elapsed(t.stageStartedAt)}</span>` : ""}${t.deps.total ? ` · phụ thuộc ${t.deps.ready}/${t.deps.total}` : ""}</div>
@@ -698,51 +923,129 @@ async function loadTimeline() {
 }
 const refreshTimeline = debounce(() => state.view === "timeline" && loadTimeline(), 1500);
 
+const TL_STATUS = { running: "Chạy", review: "Chờ duyệt", error: "Lỗi", stopped: "Dừng", done: "Xong" };
+const FILTER_STATUSES = { all: ["running", "review", "error", "stopped", "done"], running: ["running"], attention: ["review", "error", "stopped"], done: ["done"] };
+const TIER_NAME = { 1: "Sếp", 2: "Trưởng nhóm", 3: "Nhân viên" };
+
+function tlToolbar() {
+  const o = state.tl;
+  const seg = (action, value, label, active) => `<button class="seg${active ? " active" : ""}" data-action="${action}" data-value="${value}">${label}</button>`;
+  const agents = [...state.slots.values()]
+    .map((x) => `<button class="chip-agent${!o.agents || o.agents.has(x.id) ? " on" : ""}" data-action="tl-agent" data-slot="${x.id}" title="${esc(x.name)}">${x.id}</button>`)
+    .join("");
+  return `
+    <div class="tl-toolbar">
+      <div class="seg-group"><span class="bar-label">Nhóm</span>${seg("tl-group", "agent", "Theo nhân sự", o.group === "agent")}${seg("tl-group", "tier", "Theo vai trò", o.group === "tier")}</div>
+      <div class="seg-group"><span class="bar-label">Màu</span>${seg("tl-color", "status", "Trạng thái", o.color === "status")}${seg("tl-color", "phase", "Khâu", o.color === "phase")}</div>
+      <div class="seg-group"><span class="bar-label">Khoảng</span>${seg("tl-range", "all", "Tất cả", o.range === "all")}${seg("tl-range", "15", "15 phút", o.range === 15)}${seg("tl-range", "60", "1 giờ", o.range === 60)}</div>
+      <div class="seg-group"><span class="bar-label">Trạng thái</span>${Object.entries(TL_STATUS)
+        .map(([k, label]) => `<button class="chip-status st-${k}${o.statuses.has(k) ? " on" : ""}" data-action="tl-status" data-value="${k}">${label}</button>`)
+        .join("")}</div>
+      <div class="seg-group agents"><span class="bar-label">Nhân sự</span><button class="chip-agent${!o.agents ? " on" : ""}" data-action="tl-agents-all">Tất cả</button>${agents}</div>
+    </div>`;
+}
+
 function renderTimeline() {
   const el = $("#view-timeline");
   const tl = state.timeline;
+  const o = state.tl;
   if (!tl || !tl.start) {
-    el.innerHTML = `<div class="view-intro">Chưa có lượt chạy nào để vẽ timeline.</div>`;
+    el.innerHTML = tlToolbar() + `<div class="view-intro">Chưa có lượt chạy nào để vẽ timeline.</div>`;
     return;
   }
-  const t0 = new Date(tl.start).getTime();
-  const t1 = Math.max(Date.now(), new Date(tl.now).getTime(), t0 + 15000);
+  const now = Date.now();
+  const tStart = new Date(tl.start).getTime();
+  const t0 = o.range === "all" ? tStart : Math.max(tStart, now - o.range * 60000);
+  const t1 = Math.max(now, new Date(tl.now).getTime(), t0 + 15000);
   const span = t1 - t0;
-  const pct = (iso) => (((iso ? new Date(iso).getTime() : Date.now()) - t0) / span) * 100;
+  const pct = (ms) => ((ms - t0) / span) * 100;
+  const endOf = (sp) => (sp.endedAt ? new Date(sp.endedAt).getTime() : now);
+  const related = state.focusSlot ? relatedSlots(state.focusSlot) : null;
   const ticks = [];
   const step = niceStep(span / 8);
   for (let x = Math.ceil(t0 / step) * step; x <= t1; x += step) ticks.push(x);
 
-  const rows = tl.rows
-    .map((r) => {
-      const last = r.spans.at(-1);
-      const idleMs = last ? (last.endedAt ? Date.now() - new Date(last.endedAt).getTime() : 0) : Date.now() - t0;
-      const bars = r.spans
-        .map((s) => {
-          const left = pct(s.startedAt);
-          const width = Math.max(0.4, pct(s.endedAt) - left);
-          const dur = (s.endedAt ? new Date(s.endedAt).getTime() : Date.now()) - new Date(s.startedAt).getTime();
-          const waitPct = dur > 0 ? Math.min(100, (s.waitMs / dur) * 100) : 0;
-          const phase = STAGE_PHASE[s.stage] ?? "Phân tích";
-          const cls = [PHASE_CLASS[phase], s.critical ? "critical" : "", s.outcome === "error" ? "err" : "", s.outcome === "cancelled" ? "cancelled" : "", !s.endedAt ? "live-bar" : ""].join(" ");
-          return `<div class="bar ${cls}" style="left:${left}%;width:${width}%" data-action="open-drawer" data-task="${esc(s.taskId)}" title="${esc(`${s.title}\n${s.stage} · ${fmtDur(dur)}${s.waitMs > 1000 ? ` (chờ engine ${fmtDur(s.waitMs)})` : ""} · ${fmtTok(s.tokens)} tok${s.outcome && s.outcome !== "ok" ? ` · ${s.outcome}` : ""}${s.critical ? "\n★ nằm trên critical path" : ""}`)}">${waitPct > 3 ? `<span class="wait" style="width:${waitPct}%"></span>` : ""}</div>`;
-        })
-        .join("");
-      return `<div class="g-row"><div class="g-label" data-hover-slot="${r.slotId}"><b>${r.slotId}</b> ${esc(r.name.replace(/^AI /, ""))}${idleMs > 5 * 60000 && r.spans.length ? `<span class="idle" title="Không chạy gì từ ${fmtDur(idleMs)}">💤 ${fmtDur(idleMs)}</span>` : ""}</div><div class="g-track">${bars}</div></div>`;
-    })
-    .join("");
+  state.tlSpans = [];
+  const counts = Object.fromEntries(Object.keys(TL_STATUS).map((k) => [k, 0]));
+  const bar = (sp, slotId) => {
+    if (!o.statuses.has(sp.status) || endOf(sp) < t0) return "";
+    counts[sp.status]++;
+    const left = Math.max(0, pct(new Date(sp.startedAt).getTime()));
+    const width = Math.max(0.4, pct(endOf(sp)) - left);
+    const dur = endOf(sp) - new Date(sp.startedAt).getTime();
+    const waitPct = dur > 0 && !sp.human ? Math.min(100, (sp.waitMs / dur) * 100) : 0;
+    const colorCls = o.color === "status" ? `st-${sp.status}` : sp.human ? "ph-review" : PHASE_CLASS[STAGE_PHASE[sp.stage] ?? "Phân tích"];
+    const idx = state.tlSpans.push({ ...sp, slotId, dur }) - 1;
+    const cls = [colorCls, sp.critical ? "critical" : "", !sp.endedAt ? "live-bar" : "", sp.human ? "human" : ""].join(" ");
+    return `<div class="bar ${cls}" style="left:${left}%;width:${width}%" data-action="open-drawer" data-task="${esc(sp.taskId)}" data-span="${idx}">${waitPct > 3 ? `<span class="wait" style="width:${waitPct}%"></span>` : ""}</div>`;
+  };
+  const agentRow = (r) => {
+    const last = r.spans.filter((x) => !x.human).at(-1);
+    const idleMs = last ? (last.endedAt ? now - new Date(last.endedAt).getTime() : 0) : 0;
+    return `<div class="g-row${related && !related.has(r.slotId) ? " dim" : ""}"><div class="g-label" data-hover-slot="${r.slotId}"><b>${r.slotId}</b> ${esc(r.name.replace(/^AI /, ""))}${idleMs > 5 * 60000 ? `<span class="idle" title="Không chạy gì từ ${fmtDur(idleMs)}">💤 ${fmtDur(idleMs)}</span>` : ""}</div><div class="g-track">${r.spans.map((sp) => bar(sp, r.slotId)).join("")}</div></div>`;
+  };
+  const visible = tl.rows.filter((r) => !o.agents || o.agents.has(r.slotId));
+  let rowsHtml;
+  if (o.group === "tier") {
+    rowsHtml = [1, 2, 3]
+      .map((tier) => {
+        const lane = visible.filter((r) => r.tier === tier);
+        if (!lane.length) return "";
+        const collapsed = o.collapsed.has(tier);
+        const runs = lane.reduce((n, r) => n + r.spans.length, 0);
+        const head = `<div class="g-row g-lane" data-action="tl-lane" data-tier="${tier}"><div class="g-label">${collapsed ? "▸" : "▾"} <b>${TIER_NAME[tier]}</b> <span class="muted small">${lane.length} người · ${runs} lượt</span></div><div class="g-track">${
+          collapsed ? lane.flatMap((r) => r.spans.map((sp) => bar(sp, r.slotId))).join("") : ""
+        }</div></div>`;
+        return head + (collapsed ? "" : lane.map(agentRow).join(""));
+      })
+      .join("");
+  } else {
+    rowsHtml = visible.map(agentRow).join("");
+  }
   const cp = tl.criticalPath;
+  const legend =
+    o.color === "status"
+      ? Object.entries(TL_STATUS).map(([k, label]) => `<span><i class="sw st-${k}"></i>${label}</span>`).join("")
+      : Object.entries(PHASE_CLASS).map(([p, c]) => `<span><i class="sw ${c}"></i>${p}</span>`).join("");
   el.innerHTML = `
+    ${tlToolbar()}
     <div class="view-intro">
-      Mỗi hàng là một nhân sự, mỗi thanh là một lượt chạy (màu theo khâu; phần sọc là thời gian <b>chờ engine</b>). Các thanh chồng nhau theo cột dọc = chạy song song.
+      Mỗi hàng là một nhân sự, mỗi thanh là một lượt chạy hoặc một khoảng <b>chờ bạn duyệt</b>; phần sọc là thời gian <b>chờ engine</b>. Rê chuột để xem chi tiết, bấm để mở task.
       ${cp ? `<div class="critical">★ Critical path (${fmtDur(cp.totalMs)}): ${cp.tasks.map((t) => `<span class="owner" data-hover-slot="${esc(t.slotId)}">${esc(t.slotId)}</span> ${esc(t.title)}`).join(" → ")}</div>` : ""}
     </div>
-    <div class="legend">${Object.entries(PHASE_CLASS).map(([p, c]) => `<span><i class="sw ${c}"></i>${p}</span>`).join("")}<span><i class="sw critical-sw"></i>Critical path</span><span><i class="sw wait-sw"></i>Chờ engine</span></div>
+    <div class="legend">${legend}<span><i class="sw critical-sw"></i>Critical path</span><span><i class="sw wait-sw"></i>Chờ engine</span><span class="muted">Đang hiện: ${Object.entries(counts).filter(([, n]) => n).map(([k, n]) => `${n} ${TL_STATUS[k].toLowerCase()}`).join(" · ") || "không có lượt nào khớp bộ lọc"}</span></div>
     <div class="gantt">
-      <div class="g-row g-axis"><div class="g-label"></div><div class="g-track">${ticks.map((x) => `<span class="tick" style="left:${((x - t0) / span) * 100}%">${new Date(x).toLocaleTimeString("vi-VN", { hour: "2-digit", minute: "2-digit", second: span < 10 * 60000 ? "2-digit" : undefined })}</span>`).join("")}<span class="now-line" style="left:${((Date.now() - t0) / span) * 100}%"></span></div></div>
-      ${rows}
+      <div class="g-row g-axis"><div class="g-label"></div><div class="g-track">${ticks.map((x) => `<span class="tick" style="left:${pct(x)}%">${new Date(x).toLocaleTimeString("vi-VN", { hour: "2-digit", minute: "2-digit", second: span < 10 * 60000 ? "2-digit" : undefined })}</span>`).join("")}<span class="now-line" style="left:${pct(now)}%"></span></div></div>
+      ${rowsHtml || `<div class="muted small" style="padding:10px">Không có nhân sự nào khớp bộ lọc.</div>`}
     </div>`;
 }
+
+function showTip(e) {
+  const bar = e.target.closest(".gantt .bar[data-span]");
+  const tip = $("#g-tip");
+  if (!bar) {
+    tip.hidden = true;
+    return;
+  }
+  const sp = state.tlSpans[Number(bar.dataset.span)];
+  if (!sp) return;
+  const t = (iso) => new Date(iso).toLocaleTimeString("vi-VN");
+  const decision = { approve: "đã duyệt", reject: "đã từ chối", revise: "yêu cầu sửa" }[sp.decision] ?? "";
+  tip.innerHTML = `
+    <div class="tip-title">${esc(sp.title)}</div>
+    <div><b>${esc(sp.slotId)}</b> · <span class="stage-raw">${esc(sp.stage)}</span> · <span class="tip-st st-text-${sp.status}">${TL_STATUS[sp.status]}${decision ? ` (${decision})` : ""}</span></div>
+    <div>${t(sp.startedAt)} → ${sp.endedAt ? t(sp.endedAt) : "đang diễn ra"} · <b>${fmtDur(sp.dur)}</b></div>
+    ${sp.human ? `<div class="muted">Thời gian chờ bạn quyết định</div>` : `<div>${sp.waitMs > 1000 ? `chờ engine ${fmtDur(sp.waitMs)} · ` : ""}${fmtTok(sp.tokens)} token${sp.costUsd ? ` · ${fmtCost(sp.costUsd)}` : ""}${sp.engines?.length ? ` · ${sp.engines.map((x) => ENGINE_LABEL[x] ?? x).join(", ")}` : ""}</div>`}
+    ${sp.critical ? `<div class="critical">★ nằm trên critical path</div>` : ""}
+    <div class="muted small">Bấm để mở chi tiết task</div>`;
+  tip.hidden = false;
+  const x = Math.min(e.clientX + 14, window.innerWidth - tip.offsetWidth - 8);
+  const y = e.clientY + 16 + tip.offsetHeight > window.innerHeight ? e.clientY - tip.offsetHeight - 10 : e.clientY + 16;
+  tip.style.left = `${Math.max(8, x)}px`;
+  tip.style.top = `${y}px`;
+}
+document.addEventListener("mousemove", (e) => state.view === "timeline" && showTip(e));
+
 function niceStep(ms) {
   const steps = [5e3, 1e4, 3e4, 6e4, 2 * 6e4, 5 * 6e4, 10 * 6e4, 15 * 6e4, 30 * 6e4, 36e5, 2 * 36e5, 6 * 36e5];
   return steps.find((s) => s >= ms) ?? 12 * 36e5;
@@ -998,6 +1301,7 @@ function openModal(html) {
   $("#modal textarea, #modal input")?.focus();
 }
 function closeModal() {
+  state.engineModal = null;
   $("#modal").hidden = true;
   $("#modal-backdrop").hidden = true;
 }
@@ -1055,8 +1359,73 @@ document.addEventListener("click", async (e) => {
       return renderDrawer();
     case "view":
       return setView(ds.view);
+    case "focus":
+      return setFocus(state.focusSlot === ds.slot ? null : ds.slot);
+    case "focus-clear":
+      return setFocus(null);
+    case "engine-open":
+      state.engineModal = ds.engine;
+      return renderEngineModal();
+    case "inbox-open":
+      state.inbox.open = true;
+      state.inbox.tab = ds.tab;
+      state.inbox.sig = "";
+      return renderInbox();
+    case "inbox-tab":
+      state.inbox.tab = ds.tab;
+      state.inbox.sig = "";
+      return renderInbox();
+    case "inbox-close":
+      state.inbox.open = false;
+      return renderInbox();
+    case "snooze":
+    case "unsnooze":
+      if (action === "snooze") state.snoozed.add(ds.task);
+      else state.snoozed.delete(ds.task);
+      state.inbox.sig = "";
+      renderInbox();
+      return renderReviewBadges();
+    case "goto-panel":
+      state.inbox.open = false;
+      renderInbox();
+      if (state.view !== "org") setView("org");
+      return $(`#${ds.target}`)?.scrollIntoView({ behavior: "smooth", block: "center" });
+    case "tl-group":
+      state.tl.group = ds.value;
+      return renderTimeline();
+    case "tl-color":
+      state.tl.color = ds.value;
+      return renderTimeline();
+    case "tl-range":
+      state.tl.range = ds.value === "all" ? "all" : Number(ds.value);
+      return renderTimeline();
+    case "tl-status": {
+      const set = state.tl.statuses;
+      if (set.has(ds.value) && set.size > 1) set.delete(ds.value);
+      else set.add(ds.value);
+      return renderTimeline();
+    }
+    case "tl-agent": {
+      // First click isolates one agent; later clicks add/remove.
+      if (!state.tl.agents) state.tl.agents = new Set([ds.slot]);
+      else if (state.tl.agents.has(ds.slot)) state.tl.agents.delete(ds.slot);
+      else state.tl.agents.add(ds.slot);
+      if (!state.tl.agents.size) state.tl.agents = null;
+      return renderTimeline();
+    }
+    case "tl-agents-all":
+      state.tl.agents = null;
+      return renderTimeline();
+    case "tl-lane": {
+      const tier = Number(ds.tier);
+      if (state.tl.collapsed.has(tier)) state.tl.collapsed.delete(tier);
+      else state.tl.collapsed.add(tier);
+      return renderTimeline();
+    }
     case "filter":
       state.filter = ds.filter;
+      state.tl.statuses = new Set(FILTER_STATUSES[ds.filter] ?? FILTER_STATUSES.all);
+      if (state.view === "timeline") renderTimeline();
       $$(".filter[data-filter]").forEach((b) => b.classList.toggle("active", b.dataset.filter === ds.filter));
       for (const slot of state.slots.values()) applyFilter($(`#org .card[data-slot="${slot.id}"]`), slot);
       if (state.view === "flow") renderFlowView();
@@ -1064,6 +1433,9 @@ document.addEventListener("click", async (e) => {
     case "toggle-edges":
       state.showAllEdges = !state.showAllEdges;
       btn.classList.toggle("active", state.showAllEdges);
+      btn.setAttribute("aria-pressed", String(state.showAllEdges));
+      btn.innerHTML = `↔ Đường nối: <b>${state.showAllEdges ? "Bật" : "Tắt"}</b>`;
+      if (state.view !== "org") setView("org");
       return drawEdges();
     case "steer-open":
       return steerModal(ds.slot);
@@ -1119,7 +1491,7 @@ document.addEventListener("click", async (e) => {
       }
     }
     if (action === "plan-approve" || action === "plan-reject") {
-      const fb = document.querySelector(`[data-plan-feedback="${CSS.escape(ds.plan)}"]`)?.value ?? "";
+      const fb = [...document.querySelectorAll(`[data-plan-feedback="${CSS.escape(ds.plan)}"]`)].map((x) => x.value).find((v) => v.trim()) ?? "";
       await post(`/api/plan/${encodeURIComponent(ds.plan)}/decision`, { approved: action === "plan-approve", feedback: fb });
     }
     if (action === "plan-retry") await post(`/api/plan/${encodeURIComponent(ds.plan)}/retry`);
@@ -1136,6 +1508,7 @@ document.addEventListener("click", async (e) => {
       if (res) toast(`Đã áp dụng ${res.applied} đề xuất${res.skipped ? `, bỏ qua ${res.skipped} (xem ghi chú)` : ""}.`);
     }
     if (action === "rebalance-dismiss") await post("/api/rebalance/dismiss");
+    if (action === "promote") (await post(`/api/engines/${encodeURIComponent(ds.engine)}/promote`, { id: ds.id })) && toast("Đã đưa lượt này lên đầu hàng đợi.");
   } finally {
     btn.disabled = false;
   }
@@ -1192,8 +1565,16 @@ document.addEventListener("keydown", (e) => {
   if (e.key !== "Escape") return;
   if (!$("#modal").hidden) closeModal();
   else if (!$("#drawer").hidden) closeDrawer();
+  else if (state.inbox.open) {
+    state.inbox.open = false;
+    renderInbox();
+  } else if (state.focusSlot) setFocus(null);
 });
 $("#drawer-backdrop").addEventListener("click", closeDrawer);
+$("#inbox-backdrop").addEventListener("click", () => {
+  state.inbox.open = false;
+  renderInbox();
+});
 $("#modal-backdrop").addEventListener("click", closeModal);
 
 document.addEventListener("input", (e) => {
@@ -1243,7 +1624,8 @@ function setView(view) {
   state.view = view;
   $$(".tab[data-view]").forEach((b) => b.classList.toggle("active", b.dataset.view === view));
   for (const v of ["org", "flow", "timeline", "artifacts"]) $(`#view-${v}`).hidden = v !== view;
-  $("#filters").classList.toggle("hidden-filters", view === "timeline" || view === "artifacts");
+  $("#filters").classList.toggle("hidden-filters", view === "artifacts");
+  $("#g-tip").hidden = true;
   if (view === "org") scheduleEdges();
   if (view === "flow") renderFlowView();
   if (view === "timeline") loadTimeline();
@@ -1266,6 +1648,9 @@ function applyStatus(data) {
   renderFlowPanel();
   renderRebalance();
   renderApproveAll();
+  renderReviewBadges();
+  renderFocusChip();
+  renderInbox();
   if (state.view === "flow") renderFlowView();
 }
 
@@ -1293,6 +1678,8 @@ function connect() {
     state.slots.set(slot.id, slot);
     updateCard(slot);
     renderApproveAll();
+    renderReviewBadges();
+    if (state.inbox.open) renderInbox();
     scheduleEdges();
     rerenderFlow();
     refreshTimeline();
@@ -1303,6 +1690,8 @@ function connect() {
   es.addEventListener("plan", (e) => {
     state.plan = JSON.parse(e.data);
     renderPlanPanel();
+    renderReviewBadges();
+    if (state.inbox.open) renderInbox();
     const boss = [...state.slots.values()].find((s) => s.isBoss);
     if (boss) updateCard(boss);
     rerenderFlow();
@@ -1310,6 +1699,7 @@ function connect() {
   es.addEventListener("engines", (e) => {
     state.engines = JSON.parse(e.data);
     renderTelemetry();
+    if (state.engineModal && !$("#modal").hidden) renderEngineModal();
   });
   es.addEventListener("telemetry", (e) => {
     state.telemetry = JSON.parse(e.data);
@@ -1324,6 +1714,8 @@ function connect() {
     const was = state.rebalance?.status;
     state.rebalance = next;
     renderRebalance();
+    renderReviewBadges();
+    if (state.inbox.open) renderInbox();
     if (was === "drafting" && next?.status === "ready") {
       toast(next.moves.length ? `Sếp đề xuất ${next.moves.length} thay đổi — chọn và bấm Áp dụng.` : "Sếp thấy phân bổ hiện tại ổn.");
     }

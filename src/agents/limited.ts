@@ -54,7 +54,7 @@ export function limitAgent(agent: Agent, sem: Semaphore, engine: EngineName, hoo
       const id = opts?.taskId ?? "unknown";
       const waitStart = Date.now();
       hooks.onWait?.(id, engine);
-      const release = await sem.acquire();
+      const release = await sem.acquire(id);
       if (opts?.signal?.aborted) {
         // Stopped while queued for this engine (or before the call began) — never start it.
         release();

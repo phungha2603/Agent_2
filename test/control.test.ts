@@ -282,6 +282,69 @@ describe("reassigning and prioritizing", () => {
   });
 });
 
+describe("engine queues and checkpoint waits", () => {
+  it("shows each task's place in an engine queue and lets the CEO move one to the front", async () => {
+    const order: string[] = [];
+    let release: () => void = () => {};
+    const gate = new Promise<void>((r) => (release = r));
+    const gemini: Agent = {
+      role: "gemini",
+      async send(_p, ctx): Promise<AgentResponse> {
+        order.push(ctx.title);
+        if (order.length === 1) await gate; // hold the only slot so the others queue up
+        return { role: "gemini", content: `brief for ${ctx.title}` };
+      },
+    };
+    const { c } = await setup({ gemini });
+    // One Gemini slot for this test.
+    (c as any).engines.gemini = new (await import("../src/orchestrator/semaphore.js")).Semaphore(1);
+    (c as any).agents.gemini = (await import("../src/agents/limited.js")).limitAgent(gemini, (c as any).engines.gemini, "gemini", {
+      onWait: (id: string, e: any) => (c as any).pushActivity(id, e, "waiting"),
+      onStart: (id: string, e: any) => (c as any).markRunning(id, e),
+      onEnd: (id: string, e: any) => (c as any).popActivity(id, e),
+    });
+    await c.runSlot("AG-03", "first");
+    await c.runSlot("AG-04", "second");
+    await c.runSlot("AG-06", "third");
+    await waitFor(() => c.engineSnapshot().gemini.waiting === 2);
+
+    const snap = c.engineSnapshot().gemini;
+    expect(snap.queue.running.map((x: any) => x.label)).toEqual(["first"]);
+    expect(snap.queue.waiting.map((x: any) => x.label)).toEqual(["second", "third"]);
+    const third = (await c.slotSnapshot("AG-06")).tasks[0];
+    expect(third.engineQueue).toEqual({ engine: "gemini", state: "waiting", position: 2, of: 2 });
+
+    await c.promote("gemini", third.id);
+    expect(c.engineSnapshot().gemini.queue.waiting.map((x: any) => x.label)).toEqual(["third", "second"]);
+    release();
+    await waitFor(() => order.length === 3);
+    expect(order).toEqual(["first", "third", "second"]);
+    expect((await c.taskDetail(third.id)).task.trace?.some((t: any) => t.kind === "priority" && /gemini queue/.test(t.text))).toBe(true);
+    await expect(c.promote("gemini", third.id)).rejects.toThrow(/không còn trong hàng đợi/);
+  });
+
+  it("records the time a task waits for the CEO, closes it with the decision, and summarizes the reviews", async () => {
+    const { c } = await setup();
+    const id = await taskAtFinal(c);
+    const snap = (await c.slotSnapshot("AG-03")).tasks[0];
+    expect(snap.review).toEqual({ verification: "passed", gemini: "approve", geminiStandIn: false, claude: "approve" });
+    expect(snap.waitingSince).toBeTruthy();
+
+    await c.decide(id, "approve");
+    const runs = (await c.taskDetail(id)).task.runs!.filter((r: any) => r.human);
+    expect(runs.map((r: any) => [r.stage, r.decision, Boolean(r.endedAt)])).toEqual([
+      ["checkpoint_idea", "approve", true],
+      ["checkpoint_final", "approve", true],
+    ]);
+    // Waiting for the CEO isn't counted as the agents' working time.
+    expect((await c.slotSnapshot("AG-03")).tasks[0].lastRun.stage).not.toMatch(/checkpoint/);
+
+    const statuses = (await c.timeline()).rows.find((r: any) => r.slotId === "AG-03").spans.map((s: any) => s.status);
+    expect(statuses.filter((x: string) => x === "review")).toHaveLength(2);
+    expect(statuses).toContain("done");
+  });
+});
+
 describe("artifacts, traces and telemetry", () => {
   it("forwards one agent's artifact to another slot as input material", async () => {
     const { c, seen } = await setup();
