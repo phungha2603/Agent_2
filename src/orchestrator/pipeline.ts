@@ -8,6 +8,7 @@ import type {
   Stage,
   TaskContext,
   TaskRecord,
+  TraceEntry,
 } from "../types.js";
 import type { VerifyConfig } from "../verify/runner.js";
 import { runVerification } from "../verify/runner.js";
@@ -103,6 +104,11 @@ export interface PipelineConfig {
 
 export interface AdvanceHooks {
   onChunk?: (text: string) => void;
+  signal?: AbortSignal;
+}
+
+export function trace(task: TaskRecord, by: string, kind: TraceEntry["kind"], text: string): void {
+  (task.trace ??= []).push({ at: new Date().toISOString(), by, kind, text });
 }
 
 const PROMPTS = {
@@ -218,6 +224,7 @@ function exhaustBudget(task: TaskRecord, config: PipelineConfig, reason: string)
   task.reviewRejections = 0;
   task.architectureRounds = 0;
   log(task, task.stage, "system", `Budget exhausted (${reason}) — automatic recovery ${used + 1}/${max}: back to architecture with all accumulated feedback.`);
+  trace(task, "System", "recovery", `Out of attempts (${reason}); sent back to Claude to revise the architecture (${used + 1}/${max}).`);
   task.stage = "architecture";
 }
 
@@ -236,7 +243,7 @@ export function isTerminal(task: TaskRecord): boolean {
  * resolveCheckpoint for the former.
  */
 export async function advance(task: TaskRecord, agents: Agents, config: PipelineConfig, hooks: AdvanceHooks = {}): Promise<TaskRecord> {
-  const opts: SendOptions = { onChunk: hooks.onChunk, taskId: task.id };
+  const opts: SendOptions = { onChunk: hooks.onChunk, taskId: task.id, signal: hooks.signal };
   const ctx = (stage: Stage): TaskContext => pruneContext(stage, task.context);
 
   switch (task.stage) {
@@ -438,6 +445,27 @@ export function resolveCheckpoint(task: TaskRecord, approved: boolean, feedback?
   if (!approved && feedback) {
     task.context.reviewFeedback = [feedback];
   }
+  return task;
+}
+
+/**
+ * The lighter alternative to rejecting at the final checkpoint: the design
+ * is fine, the result needs specific changes. Goes back to implementation
+ * with the CEO's request, keeping the idea brief and architecture — unlike
+ * a rejection, which reopens the whole direction through ideation.
+ */
+export function requestRevision(task: TaskRecord, feedback: string): TaskRecord {
+  if (task.stage !== "checkpoint_final") {
+    throw new Error(`Only a task waiting for final approval can be sent back for a revision (stage: ${task.stage}).`);
+  }
+  const request = feedback.trim() || "Revise the result: it doesn't meet the acceptance criteria yet.";
+  task.implementationAttempts = 0;
+  task.reviewRejections = 0;
+  task.autoRecoveries = 0;
+  task.context.reviewFeedback = [`CEO revision request (keep the architecture; change exactly this):\n${request}`];
+  log(task, task.stage, "ceo", `Revision requested: ${request}`);
+  trace(task, "CEO", "revise", `Sent back to implementation for a revision: ${request}`);
+  task.stage = "implementation";
   return task;
 }
 

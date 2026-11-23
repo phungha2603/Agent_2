@@ -11,7 +11,15 @@ function formatHandoff(h: HandoffArtifact): string {
 /** Renders everything an agent should see about the task into one prompt block. */
 export function formatContext(context: TaskContext): string {
   const parts = [`Task: ${context.title}`];
+  if (context.directives?.length) {
+    parts.push(`--- CEO directives (follow these; they override any earlier instruction) ---\n${context.directives.map((d) => `- ${d}`).join("\n")}`);
+  }
   if (context.sharedBrief) parts.push(`--- Shared plan context ---\n${context.sharedBrief}`);
+  if (context.attachments?.length) {
+    parts.push(
+      `--- Input material forwarded by the CEO ---\n${context.attachments.map((a) => `[${a.title} — from ${a.from}]\n${a.content}`).join("\n\n")}`,
+    );
+  }
   if (context.ideaBrief) parts.push(`--- Idea brief ---\n${context.ideaBrief}`);
   if (context.acceptanceCriteria?.length) {
     parts.push(`--- Acceptance criteria (every one must be met) ---\n${context.acceptanceCriteria.map((c) => `- ${c}`).join("\n")}`);

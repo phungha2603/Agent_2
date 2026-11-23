@@ -98,6 +98,9 @@ async function allTasks(c: any) {
 describe("Company scheduler", () => {
   it("plans, waits for the CEO, then runs the whole tree in parallel within engine limits and in dependency order", async () => {
     const { company: c, t } = await setup();
+    // This test is about parallelism and dependency order; gates have their own test below.
+    await c.setGate("AG-08", false);
+    await c.setGate("AG-10", false);
 
     const plan = await c.startPlan("Build the analytics product");
     await waitFor(async () => (await c.planSnapshot())?.status === "awaiting_approval");
@@ -203,6 +206,6 @@ describe("Company scheduler", () => {
   it("refuses to start a second plan while one is waiting for approval", async () => {
     const { company: c } = await setup();
     await c.startPlan("goal one");
-    await expect(c.startPlan("goal two")).rejects.toThrow(/already/);
+    await expect(c.startPlan("goal two")).rejects.toThrow(/kế hoạch/);
   });
 });

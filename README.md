@@ -257,6 +257,63 @@ The dashboard runs on `src/orchestrator/scheduler.ts` (`Company`).
   problem, not just the code.
 - On restart, the dashboard resumes any task that was mid-stage.
 
+### Human-in-the-loop controls
+
+- **Pause / Resume / Stop** (top bar). Pause starts nothing new and lets
+  calls already in flight finish. Stop aborts them *now* — the Claude CLI
+  process is killed, HTTP requests are cancelled, the Muse MCP call is
+  cancelled — and that stage runs again from its start on Resume (it's
+  logged as stopped, not counted as an error).
+- **Directives** (steering). Type an instruction for the whole company
+  (bar under the telemetry) or one staff member (✎ Chỉ thị on its card, or
+  in its drawer). It is added to every agent call for those tasks from the
+  next stage on, as "CEO directives — follow these; they override any
+  earlier instruction", and stays until you remove it (×). Tick *làm lại*
+  to also send work already past architecture back to Claude with the
+  directive as feedback (a task mid-stage does that when its stage ends).
+- **Approval gates** (🔒/🔓 on each card; AG-08 QA & Security and AG-10
+  Release on by default; the boss's plan always waits for you). A gated
+  slot's results only hand off to the next step after you approve them;
+  an ungated slot hands off as soon as it's verified and Claude signed off.
+- At a final checkpoint you can **Duyệt** (ship), **Yêu cầu sửa** (keep the
+  design, back to implementation with exactly your change request), or
+  **Từ chối** (a redesign from the idea).
+- **Reassign / reprioritize**: drag a queued task row onto another card,
+  click ↑ to put it first in its own queue, or use the drawer. Running tasks
+  can't be moved (pause first); plan owners update to match.
+
+### Visibility
+
+- **Telemetry bar**: company completion %, running / waiting / waiting for
+  you / errors / done, run time, tokens (hover for the per-engine split) and
+  cost. The Claude CLI reports an API-equivalent cost per call; Gemini and
+  the Claude API are only priced if you set `*_PRICE_*_PER_MTOK`; Muse
+  reports nothing, so its tokens are estimated from text length (marked *).
+- **Cards** show a distinct state (Idle (Ready), Waiting on AG-xx, Running,
+  Needs Review, Blocked, Done, Paused), who assigned the task and which
+  slots it takes input from / hands off to, the current task plus how many
+  are queued behind it, and the last run's duration, wait and tokens.
+  Hovering a card (or any AG-xx mention) draws its input/output arrows and
+  dims everyone else; "↔ Đường nối" shows every handoff arrow at once.
+- **Click a card** (or a plan subtask, a flow card, a timeline bar) to open
+  its drawer: full outputs (brief, architecture guide, Muse's reply,
+  verification log, upstream handoffs), its artifacts, every agent call
+  with the exact prompt and output, the full log, and the **decision
+  trace** — why the boss gave it to this person and what it builds on (the
+  plan now has to give a `rationale` and `inputs` per item), plus every
+  reassignment, directive, gate approval and automatic recovery since.
+  Full prompts/outputs are kept in `data/calls/<task>.jsonl`.
+- **Views**: *Sơ đồ tổ chức* (the org chart, with the goal and work tree to
+  the right of the boss and the handoff/bottleneck panel to the right of
+  the leads), *Dòng chảy* (tasks moving across Phân tích → Kỹ thuật →
+  Kiểm thử → Chờ duyệt → Xuất bản, with the column where the most tasks are
+  waiting flagged as the bottleneck), *Timeline* (one row per staff member,
+  one bar per stage attempt, striped where it waited for an engine, with
+  the critical path — the dependency chain that determined the finish
+  time — outlined), and *Sản phẩm* (every brief, guide, file and log the
+  team produced: preview, download, or forward to another staff member as
+  input material). Filters: Đang chạy, Cần duyệt / Lỗi, Đã xong.
+
 ### Context pruning
 
 Each stage sends its agent only what that stage acts on

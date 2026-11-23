@@ -49,7 +49,7 @@ export function createMuseAgent(opts: { serverPath: string; profileDir?: string;
       clientPromise = null;
       if (pending) await (await pending.catch(() => null))?.close();
     },
-    async send(prompt: string, context: TaskContext, _opts?: SendOptions): Promise<AgentResponse> {
+    async send(prompt: string, context: TaskContext, sendOpts?: SendOptions): Promise<AgentResponse> {
       const c = await getClient();
       const timeoutSec = opts.timeoutSec ?? 300;
       const result = await c.callTool(
@@ -65,7 +65,7 @@ export function createMuseAgent(opts: { serverPath: string; profileDir?: string;
         // timeout_sec argument above — give it extra headroom so a long
         // reply (Muse typing a real answer in the browser) isn't cut off
         // first by the transport layer.
-        { timeout: (timeoutSec + 60) * 1000 },
+        { timeout: (timeoutSec + 60) * 1000, signal: sendOpts?.signal },
       );
       const rawText = Array.isArray(result.content)
         ? result.content

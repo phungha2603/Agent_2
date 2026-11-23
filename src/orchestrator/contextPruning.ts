@@ -7,6 +7,8 @@ export const PRUNE_LIMITS = {
   /** The previous attempt, shown to the engineer only on a fix round. */
   previousImplementationHead: 30000,
   previousSpecHead: 20000,
+  attachments: 3,
+  attachmentChars: 12000,
 };
 
 function head(text: string | undefined, max: number): string | undefined {
@@ -27,7 +29,12 @@ function tail(text: string | undefined, max: number): string | undefined {
  * refers to; everything else is dropped or truncated.
  */
 export function pruneContext(stage: Stage, ctx: TaskContext): TaskContext {
-  const base: TaskContext = { title: ctx.title };
+  // CEO directives go to every stage; forwarded material only to the stages that produce the work.
+  const base: TaskContext = { title: ctx.title, directives: ctx.directives?.length ? ctx.directives : undefined };
+  const producing = stage === "ideation" || stage === "architecture" || stage === "architecture_review" || stage === "implementation";
+  if (producing && ctx.attachments?.length) {
+    base.attachments = ctx.attachments.slice(-PRUNE_LIMITS.attachments).map((a) => ({ ...a, content: head(a.content, PRUNE_LIMITS.attachmentChars)! }));
+  }
   const fixRound = Boolean(ctx.reviewFeedback?.length);
 
   switch (stage) {

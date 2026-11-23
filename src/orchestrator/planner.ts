@@ -1,5 +1,5 @@
 import type { Agent, ProjectConfig, SendOptions, TaskRecord } from "../types.js";
-import { createPlannedTask } from "./pipeline.js";
+import { createPlannedTask, trace } from "./pipeline.js";
 
 export interface Department {
   id: string;
@@ -14,6 +14,10 @@ export interface PlanSubtask {
   description: string;
   acceptanceCriteria: string[];
   dependsOn: string[];
+  /** The boss's reason for giving this subtask to this owner. */
+  rationale: string;
+  /** What this subtask builds on (goal parts, upstream outputs). */
+  inputs: string;
   taskId?: string;
 }
 
@@ -23,6 +27,7 @@ export interface PlanEpic {
   owner: string;
   goal: string;
   acceptanceCriteria: string[];
+  rationale: string;
   subtasks: PlanSubtask[];
   /** The lead's integration task, depending on all of this epic's subtasks. */
   taskId?: string;
@@ -48,6 +53,8 @@ export interface WorkPlanRecord extends Partial<WorkPlan> {
   unresolvedReview?: string;
   revisionFeedback?: string;
   error?: string;
+  /** Tokens/cost spent drafting and reviewing this plan. */
+  usage?: { input: number; output: number; costUsd: number };
 }
 
 export interface PlanLimits {
@@ -72,9 +79,10 @@ export function buildPlanPrompt(goal: string, departments: Department[], limits:
     "- Every subtask must be concrete, implementable and verifiable in code, and contribute directly to the goal. No vague research or documentation subtasks unless the goal itself needs them.",
     "- acceptanceCriteria: 2-5 specific, testable statements per epic and per subtask — things a reviewer can check by running the code or its tests.",
     "- dependsOn: ids of subtasks (in any epic) that must finish first because this one consumes their output. No cycles. Leave it empty whenever work can proceed in parallel.",
-    "- Write titles, descriptions and criteria in the same language as the goal.",
+    "- rationale: one sentence per epic and subtask on why that owner is the right one (their specialty vs. what the work needs). inputs: what the subtask builds on — which part of the goal, which other subtask's output.",
+    "- Write titles, descriptions, criteria, rationale and inputs in the same language as the goal.",
     "Reply with ONLY one JSON object, no prose before or after, in exactly this shape:",
-    '{"summary": "...", "epics": [{"id": "E1", "title": "...", "owner": "AG-05", "goal": "...", "acceptanceCriteria": ["..."], "subtasks": [{"id": "E1.S1", "title": "...", "owner": "AG-03", "description": "...", "acceptanceCriteria": ["..."], "dependsOn": []}]}]}',
+    '{"summary": "...", "epics": [{"id": "E1", "title": "...", "owner": "AG-05", "goal": "...", "rationale": "...", "acceptanceCriteria": ["..."], "subtasks": [{"id": "E1.S1", "title": "...", "owner": "AG-03", "description": "...", "rationale": "...", "inputs": "...", "acceptanceCriteria": ["..."], "dependsOn": []}]}]}',
     "",
     `Company-wide goal: ${goal}`,
   ];
@@ -177,6 +185,8 @@ export function parsePlan(text: string, departments: Department[], limits: PlanL
         description: typeof s?.description === "string" && s.description.trim() ? s.description.trim() : requireString(s?.title, `subtask ${subId} title`),
         acceptanceCriteria: asStringArray(s?.acceptanceCriteria, `subtask ${subId}`),
         dependsOn: Array.isArray(s?.dependsOn) ? s.dependsOn.filter((d: unknown): d is string => typeof d === "string").map((d: string) => d.trim()) : [],
+        rationale: typeof s?.rationale === "string" ? s.rationale.trim() : "",
+        inputs: typeof s?.inputs === "string" ? s.inputs.trim() : "",
       };
     });
     return {
@@ -185,6 +195,7 @@ export function parsePlan(text: string, departments: Department[], limits: PlanL
       owner,
       goal: typeof e?.goal === "string" ? e.goal.trim() : "",
       acceptanceCriteria: asStringArray(e?.acceptanceCriteria, `epic ${epicId}`),
+      rationale: typeof e?.rationale === "string" ? e.rationale.trim() : "",
       subtasks,
     };
   });
@@ -207,9 +218,9 @@ export function parsePlan(text: string, departments: Department[], limits: PlanL
 export function renderPlan(plan: WorkPlan): string {
   const lines = [`Summary: ${plan.summary}`];
   for (const e of plan.epics) {
-    lines.push("", `${e.id} [lead ${e.owner}] ${e.title} — ${e.goal}`, ...e.acceptanceCriteria.map((c) => `  AC: ${c}`));
+    lines.push("", `${e.id} [lead ${e.owner}] ${e.title} — ${e.goal}`, `  Why this lead: ${e.rationale || "(not given)"}`, ...e.acceptanceCriteria.map((c) => `  AC: ${c}`));
     for (const s of e.subtasks) {
-      lines.push(`  ${s.id} [${s.owner}] ${s.title}${s.dependsOn.length ? ` (after ${s.dependsOn.join(", ")})` : ""}`, `    ${s.description}`);
+      lines.push(`  ${s.id} [${s.owner}] ${s.title}${s.dependsOn.length ? ` (after ${s.dependsOn.join(", ")})` : ""}`, `    ${s.description}`, `    Why this owner: ${s.rationale || "(not given)"} · Builds on: ${s.inputs || "(not given)"}`);
       lines.push(...s.acceptanceCriteria.map((c) => `    AC: ${c}`));
     }
   }
@@ -318,6 +329,14 @@ export function materializePlan(record: WorkPlanRecord, projectConfig?: ProjectC
       taskIdBySubtask.set(s.id, task.id);
       pending.push({ task, deps: s.dependsOn });
       tasks.push(task);
+      trace(
+        task,
+        "AG-01 (Claude)",
+        "assign",
+        `Assigned ${s.id} to ${s.owner}: ${s.rationale || "(no reason given)"}` +
+          `${s.inputs ? ` · Builds on: ${s.inputs}` : ""}${s.dependsOn.length ? ` · Waits for: ${s.dependsOn.join(", ")}` : ""}`,
+      );
+      for (const note of notesFor(record, s.id)) trace(task, "System", "note", note);
     }
   }
   for (const { task, deps } of pending) {
@@ -341,6 +360,19 @@ export function materializePlan(record: WorkPlanRecord, projectConfig?: ProjectC
     task.dependsOn = epic.subtasks.map((s) => s.taskId!).filter(Boolean);
     epic.taskId = task.id;
     tasks.push(task);
+    trace(
+      task,
+      "AG-01 (Claude)",
+      "assign",
+      `Integration of ${epic.id} assigned to its lead ${epic.owner}: ${epic.rationale || "(no reason given)"} · Waits for: ${epic.subtasks.map((s) => s.id).join(", ")}`,
+    );
+    for (const note of notesFor(record, epic.id)) trace(task, "System", "note", note);
   }
+  for (const t of tasks) trace(t, "CEO", "gate", `Plan ${record.id} approved by the CEO.`);
   return tasks;
+}
+
+/** Validation notes ("Subtask E1.S1: owner ... reassigned") that concern one plan item. */
+function notesFor(record: WorkPlanRecord, id: string): string[] {
+  return (record.notes ?? []).filter((n) => n.startsWith(`Subtask ${id}:`) || n.startsWith(`Epic ${id}:`));
 }

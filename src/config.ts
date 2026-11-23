@@ -11,6 +11,7 @@ import { createClaudeCliAgent } from "./agents/claude-cli.js";
 import { createMuseAgent } from "./agents/muse.js";
 import { screenshotBuildOutput } from "./verify/screenshot.js";
 import type { SchedulerSettings } from "./orchestrator/scheduler.js";
+import type { Price } from "./agents/limited.js";
 
 function provider(name: string): "real" | "mock" {
   const v = (process.env[name] ?? "mock").toLowerCase();
@@ -126,7 +127,16 @@ export function buildSchedulerSettings(): SchedulerSettings {
     handoffOn,
     planMaxRounds: Math.max(1, num("PLAN_MAX_REVIEW_ROUNDS", 3)),
     planLimits: { maxEpics: Math.max(1, num("PLAN_MAX_EPICS", 3)), maxSubtasks: Math.max(1, num("PLAN_MAX_SUBTASKS", 8)) },
+    prices: { claude: price("CLAUDE"), gemini: price("GEMINI") },
   };
+}
+
+/** USD per million tokens from <NAME>_PRICE_IN_PER_MTOK / <NAME>_PRICE_OUT_PER_MTOK — only when both are set. */
+function price(name: string): Price | undefined {
+  const inP = process.env[`${name}_PRICE_IN_PER_MTOK`];
+  const outP = process.env[`${name}_PRICE_OUT_PER_MTOK`];
+  if (!inP || !outP || !Number.isFinite(Number(inP)) || !Number.isFinite(Number(outP))) return undefined;
+  return { inPerM: Number(inP), outPerM: Number(outP) };
 }
 
 /**

@@ -13,11 +13,21 @@ export type Stage =
 
 export type RoleName = "gemini" | "claude" | "muse" | "ceo" | "system";
 
+export interface Usage {
+  inputTokens: number;
+  outputTokens: number;
+  /** Set when the provider reports it (the Claude CLI does) or a price is configured. */
+  costUsd?: number;
+  /** True when counted from text length because the provider reported nothing (Muse, mocks). */
+  estimated?: boolean;
+}
+
 export interface AgentResponse {
   role: RoleName;
   content: string;
   /** Structured verdict for review-type stages; absent for free-form output. */
   verdict?: "approve" | "reject";
+  usage?: Usage;
 }
 
 export interface SendOptions {
@@ -25,6 +35,8 @@ export interface SendOptions {
   onChunk?: (text: string) => void;
   /** Which task (or "plan:<id>") this call is for — used for engine activity tracking. */
   taskId?: string;
+  /** Aborts the call in flight (Stop). */
+  signal?: AbortSignal;
 }
 
 export interface Agent {
@@ -59,6 +71,10 @@ export interface TaskContext {
   acceptanceCriteria?: string[];
   /** Results handed over by the tasks this one depends on. */
   upstream?: HandoffArtifact[];
+  /** CEO steering instructions, company-wide and for this task's slot — they override earlier instructions. */
+  directives?: string[];
+  /** Material the CEO forwarded to this task from another agent's output. */
+  attachments?: { title: string; from: string; content: string }[];
   architectureSpec?: string;
   implementationDiff?: string;
   implementationFiles?: string[];
@@ -101,6 +117,32 @@ export interface ProjectConfig {
   screenshotWaitMs?: number;
 }
 
+/** One attempt at one stage: what the timeline, the per-card duration/token figures and the critical path are built from. */
+export interface StageRun {
+  stage: Stage;
+  startedAt: string;
+  endedAt?: string;
+  outcome?: "ok" | "error" | "cancelled";
+  /** Time spent waiting for an engine or the workspace lock rather than working. */
+  waitMs: number;
+  engines: string[];
+  inputTokens: number;
+  outputTokens: number;
+  costUsd: number;
+  estimated: boolean;
+  /** Per-engine split, for the telemetry bar (a review_gemini stage can fall back to Claude). */
+  usageByEngine?: Record<string, { inputTokens: number; outputTokens: number; costUsd: number }>;
+  error?: string;
+}
+
+/** Why something happened to a task — assignment rationale, reassignments, gates, directives. */
+export interface TraceEntry {
+  at: string;
+  by: string;
+  kind: "assign" | "reassign" | "priority" | "directive" | "gate" | "revise" | "recovery" | "input" | "note";
+  text: string;
+}
+
 export interface TaskError {
   at: string;
   stage: Stage;
@@ -138,4 +180,8 @@ export interface TaskRecord {
   lastError?: TaskError;
   /** When the current stage started — drives the elapsed-time display. */
   stageStartedAt?: string;
+  runs?: StageRun[];
+  trace?: TraceEntry[];
+  /** A CEO directive asking to redo the work, applied once the stage currently running finishes. */
+  redoRequested?: string;
 }

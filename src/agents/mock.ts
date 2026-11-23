@@ -6,33 +6,36 @@ export const MOCK_PLAN = {
   epics: [
     {
       id: "E1",
+      rationale: "Backend architect owns data + model integration.",
       title: "Data & model",
       owner: "AG-05",
       goal: "Ingest data and serve a model.",
       acceptanceCriteria: ["Pipeline output feeds the model", "Model endpoint returns predictions"],
       subtasks: [
-        { id: "E1.S1", title: "Data pipeline", owner: "AG-03", description: "Build the ingestion pipeline.", acceptanceCriteria: ["Ingests a sample file"], dependsOn: [] },
-        { id: "E1.S2", title: "Model", owner: "AG-04", description: "Train a baseline model on the pipeline output.", acceptanceCriteria: ["Baseline accuracy reported"], dependsOn: ["E1.S1"] },
+        { id: "E1.S1", rationale: "Data engineering is AG-03's specialty.", inputs: "The goal's data sources.", title: "Data pipeline", owner: "AG-03", description: "Build the ingestion pipeline.", acceptanceCriteria: ["Ingests a sample file"], dependsOn: [] },
+        { id: "E1.S2", rationale: "Modeling belongs with the data scientist.", inputs: "E1.S1's pipeline output.", title: "Model", owner: "AG-04", description: "Train a baseline model on the pipeline output.", acceptanceCriteria: ["Baseline accuracy reported"], dependsOn: ["E1.S1"] },
       ],
     },
     {
       id: "E2",
+      rationale: "Market researcher owns the product story.",
       title: "Content",
       owner: "AG-02",
       goal: "Explain the product.",
       acceptanceCriteria: ["Landing copy exists"],
-      subtasks: [{ id: "E2.S1", title: "Landing copy", owner: "AG-09", description: "Write the landing page copy.", acceptanceCriteria: ["Copy covers the main use case"], dependsOn: [] }],
+      subtasks: [{ id: "E2.S1", rationale: "Copywriting fits Content & SEO.", inputs: "The product summary.", title: "Landing copy", owner: "AG-09", description: "Write the landing page copy.", acceptanceCriteria: ["Copy covers the main use case"], dependsOn: [] }],
     },
     {
       id: "E3",
+      rationale: "QA & Security owns the release gate.",
       title: "Quality & release",
       owner: "AG-08",
       goal: "Ship it safely.",
       acceptanceCriteria: ["CI is green", "Release notes exist"],
       subtasks: [
-        { id: "E3.S1", title: "UI shell", owner: "AG-06", description: "Build the UI shell.", acceptanceCriteria: ["UI renders"], dependsOn: [] },
-        { id: "E3.S2", title: "CI automation", owner: "AG-07", description: "Automate build and test.", acceptanceCriteria: ["CI runs tests"], dependsOn: ["E3.S1"] },
-        { id: "E3.S3", title: "Release", owner: "AG-10", description: "Cut the release.", acceptanceCriteria: ["Release notes list changes"], dependsOn: ["E1.S2", "E3.S2"] },
+        { id: "E3.S1", rationale: "UI work goes to the frontend specialist.", inputs: "The goal's dashboard requirement.", title: "UI shell", owner: "AG-06", description: "Build the UI shell.", acceptanceCriteria: ["UI renders"], dependsOn: [] },
+        { id: "E3.S2", rationale: "CI is automation work.", inputs: "E3.S1's UI build.", title: "CI automation", owner: "AG-07", description: "Automate build and test.", acceptanceCriteria: ["CI runs tests"], dependsOn: ["E3.S1"] },
+        { id: "E3.S3", rationale: "Releases are the release manager's job.", inputs: "The model and CI outputs.", title: "Release", owner: "AG-10", description: "Cut the release.", acceptanceCriteria: ["Release notes list changes"], dependsOn: ["E1.S2", "E3.S2"] },
       ],
     },
   ],
@@ -77,6 +80,11 @@ export function createMockAgent(role: RoleName): Agent {
         const words = res.content.split(/(?<=\s)/);
         for (const w of words) {
           await new Promise((r) => setTimeout(r, delayMs / words.length));
+          if (opts?.signal?.aborted) {
+            const err = new Error("stopped by the CEO");
+            err.name = "AbortError";
+            throw err;
+          }
           opts?.onChunk?.(w);
         }
       } else {

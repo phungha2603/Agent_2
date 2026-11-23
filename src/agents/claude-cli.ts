@@ -1,5 +1,5 @@
 import { spawn } from "node:child_process";
-import type { Agent, AgentResponse, SendOptions, TaskContext } from "../types.js";
+import type { Agent, AgentResponse, SendOptions, TaskContext, Usage } from "../types.js";
 import { formatContext } from "./context.js";
 import { LineDecoder, parseClaudeCliLine } from "./streamParsers.js";
 
@@ -17,17 +17,41 @@ interface ProcessResult {
  * OS limit (128 KB per argument on Linux). Closing stdin also means the CLI
  * never sits waiting for more input.
  */
-function runCli(bin: string, args: string[], input: string, cwd: string | undefined, timeoutMs: number, onStdout?: (chunk: string) => void): Promise<ProcessResult> {
+function abortError(): Error {
+  const err = new Error("stopped by the CEO");
+  err.name = "AbortError";
+  return err;
+}
+
+function runCli(
+  bin: string,
+  args: string[],
+  input: string,
+  cwd: string | undefined,
+  timeoutMs: number,
+  onStdout?: (chunk: string) => void,
+  signal?: AbortSignal,
+): Promise<ProcessResult> {
   return new Promise((resolve, reject) => {
+    if (signal?.aborted) return reject(abortError());
     const child = spawn(bin, args, { cwd, stdio: ["pipe", "pipe", "pipe"] });
     let stdout = "";
     let stderr = "";
     let timedOut = false;
-    const timer = setTimeout(() => {
-      timedOut = true;
+    let aborted = false;
+    const kill = () => {
       child.kill("SIGTERM");
       setTimeout(() => child.kill("SIGKILL"), 5000).unref();
+    };
+    const timer = setTimeout(() => {
+      timedOut = true;
+      kill();
     }, timeoutMs);
+    const onAbort = () => {
+      aborted = true;
+      kill();
+    };
+    signal?.addEventListener("abort", onAbort, { once: true });
     child.stdout.setEncoding("utf8");
     child.stderr.setEncoding("utf8");
     child.stdout.on("data", (chunk: string) => {
@@ -43,7 +67,9 @@ function runCli(bin: string, args: string[], input: string, cwd: string | undefi
     });
     child.on("close", (code) => {
       clearTimeout(timer);
-      if (timedOut) reject(new Error(`claude CLI timed out after ${Math.round(timeoutMs / 1000)}s`));
+      signal?.removeEventListener("abort", onAbort);
+      if (aborted) reject(abortError());
+      else if (timedOut) reject(new Error(`claude CLI timed out after ${Math.round(timeoutMs / 1000)}s`));
       else resolve({ code, stdout, stderr });
     });
     child.stdin.on("error", () => {
@@ -69,12 +95,12 @@ export function createClaudeCliAgent(
   const modelArgs = opts.model ? ["--model", opts.model] : [];
   let streaming = opts.stream ?? true;
 
-  async function runStreaming(input: string, onChunk?: (t: string) => void): Promise<string> {
+  async function runStreaming(input: string, onChunk?: (t: string) => void, signal?: AbortSignal): Promise<{ text: string; usage?: Usage }> {
     const lines = new LineDecoder();
     let partial = "";
     let assistant = "";
     let sawDelta = false;
-    let result: { text: string; isError: boolean } | undefined;
+    let result: { text: string; isError: boolean; usage?: Usage } | undefined;
     const handle = (line: string): void => {
       const ev = parseClaudeCliLine(line);
       if (ev.delta) {
@@ -96,6 +122,7 @@ export function createClaudeCliAgent(
       opts.cwd,
       timeoutMs,
       (chunk) => lines.push(chunk).forEach(handle),
+      signal,
     );
     lines.flush().forEach(handle);
     if (!result && proc.code !== 0) {
@@ -103,15 +130,15 @@ export function createClaudeCliAgent(
       throw new Error(`claude CLI exited with code ${proc.code}: ${proc.stderr.slice(-2000)}`);
     }
     if (result?.isError) throw new Error(`claude CLI reported an error: ${result.text.slice(0, 2000)}`);
-    return (result?.text || assistant || partial).trim();
+    return { text: (result?.text || assistant || partial).trim(), usage: result?.usage };
   }
 
-  async function runPlain(input: string, onChunk?: (t: string) => void): Promise<string> {
-    const proc = await runCli(bin, ["-p", ...modelArgs], input, opts.cwd, timeoutMs);
+  async function runPlain(input: string, onChunk?: (t: string) => void, signal?: AbortSignal): Promise<{ text: string; usage?: Usage }> {
+    const proc = await runCli(bin, ["-p", ...modelArgs], input, opts.cwd, timeoutMs, undefined, signal);
     if (proc.code !== 0) throw new Error(`claude CLI exited with code ${proc.code}: ${proc.stderr.slice(-2000)}`);
     const text = proc.stdout.trim();
     onChunk?.(text);
-    return text;
+    return { text };
   }
 
   return {
@@ -122,22 +149,23 @@ export function createClaudeCliAgent(
       // only if it's run from that project's directory, not wherever this
       // orchestrator script happens to live.
       const input = `${prompt}\n\n${formatContext(context)}`;
-      let text: string;
+      const signal = sendOpts?.signal;
+      let out: { text: string; usage?: Usage };
       if (streaming) {
         try {
-          text = await runStreaming(input, sendOpts?.onChunk);
+          out = await runStreaming(input, sendOpts?.onChunk, signal);
         } catch (err) {
           if (!(err instanceof StreamFlagsUnsupported)) throw err;
           streaming = false;
-          text = await runPlain(input, sendOpts?.onChunk);
+          out = await runPlain(input, sendOpts?.onChunk, signal);
         }
       } else {
-        text = await runPlain(input, sendOpts?.onChunk);
+        out = await runPlain(input, sendOpts?.onChunk, signal);
       }
       const verdict = prompt.startsWith("REVIEW:")
-        ? (/\breject\b/i.test(text) ? "reject" : "approve")
+        ? (/\breject\b/i.test(out.text) ? "reject" : "approve")
         : undefined;
-      return { role: "claude", content: text, verdict };
+      return { role: "claude", content: out.text, verdict, usage: out.usage };
     },
   };
 }

@@ -44,15 +44,36 @@ export const SLOTS: SlotDef[] = [
  * Which tasks each slot holds (oldest first) and which plan, if any, the
  * boss is currently showing — persisted across server restarts.
  */
+export interface Directive {
+  id: string;
+  /** null = for the whole company. */
+  slotId: string | null;
+  text: string;
+  at: string;
+}
+
 export interface DashboardState {
   slots: Record<string, string[]>;
   activePlanId: string | null;
+  /** Slots whose results only hand off after the CEO approves them (approval gates). */
+  gates: Record<string, boolean>;
+  directives: Directive[];
+  paused: boolean;
 }
+
+/** QA/security and release are the natural gates; the CEO can toggle any slot. */
+export const DEFAULT_GATED_SLOTS = ["AG-08", "AG-10"];
 
 const STATE_PATH = path.resolve(process.cwd(), "data/dashboard.json");
 
 function emptyState(): DashboardState {
-  return { slots: Object.fromEntries(SLOTS.map((s) => [s.id, []])), activePlanId: null };
+  return {
+    slots: Object.fromEntries(SLOTS.map((s) => [s.id, []])),
+    activePlanId: null,
+    gates: Object.fromEntries(SLOTS.map((s) => [s.id, DEFAULT_GATED_SLOTS.includes(s.id)])),
+    directives: [],
+    paused: false,
+  };
 }
 
 /**
@@ -69,6 +90,13 @@ function normalize(parsed: any): DashboardState {
     state.slots[s.id] = Array.isArray(v) ? v.filter((x): x is string => typeof x === "string") : typeof v === "string" ? [v] : [];
   }
   state.activePlanId = isV2 && typeof parsed.activePlanId === "string" ? parsed.activePlanId : null;
+  if (isV2 && parsed.gates && typeof parsed.gates === "object") {
+    for (const s of SLOTS) if (typeof parsed.gates[s.id] === "boolean") state.gates[s.id] = parsed.gates[s.id];
+  }
+  if (isV2 && Array.isArray(parsed.directives)) {
+    state.directives = parsed.directives.filter((d: any) => d && typeof d.text === "string" && typeof d.id === "string");
+  }
+  state.paused = isV2 && parsed.paused === true;
   return state;
 }
 

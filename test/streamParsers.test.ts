@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { LineDecoder, SseDecoder, anthropicChunkText, geminiChunkText, parseClaudeCliLine } from "../src/agents/streamParsers.js";
+import { LineDecoder, SseDecoder, anthropicChunkText, anthropicStreamUsage, geminiChunkText, geminiUsageOf, parseClaudeCliLine } from "../src/agents/streamParsers.js";
 
 describe("SseDecoder", () => {
   it("reassembles events split across arbitrary chunk boundaries, including CRLF", () => {
@@ -38,6 +38,19 @@ describe("geminiChunkText / anthropicChunkText", () => {
   });
 });
 
+describe("usage parsing", () => {
+  it("reads Gemini usageMetadata, counting thinking tokens as output", () => {
+    expect(geminiUsageOf({ usageMetadata: { promptTokenCount: 120, candidatesTokenCount: 30, thoughtsTokenCount: 10 } })).toEqual({ inputTokens: 120, outputTokens: 40 });
+    expect(geminiUsageOf({ candidates: [] })).toBeUndefined();
+  });
+
+  it("reads Anthropic stream usage from message_start and message_delta", () => {
+    expect(anthropicStreamUsage(JSON.stringify({ type: "message_start", message: { usage: { input_tokens: 5, cache_read_input_tokens: 100 } } }))).toEqual({ inputTokens: 105 });
+    expect(anthropicStreamUsage(JSON.stringify({ type: "message_delta", usage: { output_tokens: 42 } }))).toEqual({ outputTokens: 42 });
+    expect(anthropicStreamUsage(JSON.stringify({ type: "ping" }))).toEqual({});
+  });
+});
+
 describe("parseClaudeCliLine", () => {
   // Captured from a real `claude -p --output-format stream-json --verbose --include-partial-messages` run (trimmed).
   const real = [
@@ -55,6 +68,13 @@ describe("parseClaudeCliLine", () => {
     expect(events[3].assistantText).toBe("OK");
     expect(events[5].result).toEqual({ text: "OK", isError: false });
     expect(events[0]).toEqual({});
+  });
+
+  it("reads token usage (cached input included) and the reported cost from the result line", () => {
+    const line =
+      '{"type":"result","subtype":"success","is_error":false,"result":"OK","total_cost_usd":0.0877708,' +
+      '"usage":{"input_tokens":2,"cache_creation_input_tokens":10291,"cache_read_input_tokens":26774,"output_tokens":4}}';
+    expect(parseClaudeCliLine(line).result?.usage).toEqual({ inputTokens: 37067, outputTokens: 4, costUsd: 0.0877708 });
   });
 
   it("reports tool calls and error results, and ignores non-JSON noise", () => {

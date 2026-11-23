@@ -1,8 +1,8 @@
-import type { Agent, AgentResponse, SendOptions, TaskContext } from "../types.js";
+import type { Agent, AgentResponse, SendOptions, TaskContext, Usage } from "../types.js";
 import { formatContext } from "./context.js";
 import { readImageParts } from "./imageParts.js";
 import { HttpStatusError, withRetry } from "./retry.js";
-import { SseDecoder, geminiChunkText } from "./streamParsers.js";
+import { SseDecoder, geminiChunkText, geminiUsageOf } from "./streamParsers.js";
 
 const DEFAULT_MODEL = "gemini-2.5-pro";
 
@@ -41,39 +41,43 @@ export function createGeminiAgent(opts: { apiKey: string; model?: string }): Age
       const onChunk = sendOpts?.onChunk;
 
       let attempt = 0;
-      const text = await withRetry(async () => {
+      const { text, usage } = await withRetry(async () => {
         if (attempt++ > 0) onChunk?.("\n…(retrying)…\n");
         const base = `https://generativelanguage.googleapis.com/v1beta/models/${model}`;
         const url = onChunk ? `${base}:streamGenerateContent?alt=sse` : `${base}:generateContent`;
-        const res = await fetch(url, { method: "POST", headers, body });
+        const res = await fetch(url, { method: "POST", headers, body, signal: sendOpts?.signal });
         if (!res.ok) {
           const errText = await res.text();
           throw new HttpStatusError(res.status, `Gemini API error ${res.status}: ${errText}`, parseGoogleRetryDelayMs(errText));
         }
         if (!onChunk) {
           const data = (await res.json()) as any;
-          return (data?.candidates?.[0]?.content?.parts ?? []).map((p: any) => p.text ?? "").join("");
+          return { text: (data?.candidates?.[0]?.content?.parts ?? []).map((p: any) => p.text ?? "").join(""), usage: geminiUsageOf(data) };
         }
         const decoder = new SseDecoder();
         const utf8 = new TextDecoder();
         let full = "";
-        for await (const chunk of res.body as unknown as AsyncIterable<Uint8Array>) {
-          for (const payload of decoder.push(utf8.decode(chunk, { stream: true }))) {
-            const piece = geminiChunkText(payload);
-            if (piece) {
-              full += piece;
-              onChunk(piece);
-            }
+        let lastUsage: Usage | undefined;
+        const consume = (payload: string) => {
+          const data = JSON.parse(payload);
+          lastUsage = geminiUsageOf(data) ?? lastUsage; // the final chunk carries the totals
+          const piece = geminiChunkText(payload);
+          if (piece) {
+            full += piece;
+            onChunk(piece);
           }
+        };
+        for await (const chunk of res.body as unknown as AsyncIterable<Uint8Array>) {
+          decoder.push(utf8.decode(chunk, { stream: true })).forEach(consume);
         }
-        for (const payload of decoder.flush()) full += geminiChunkText(payload);
-        return full;
+        decoder.flush().forEach(consume);
+        return { text: full, usage: lastUsage };
       });
 
       const verdict = prompt.startsWith("REVIEW:")
         ? (/\breject\b/i.test(text) ? "reject" : "approve")
         : undefined;
-      return { role: "gemini", content: text, verdict };
+      return { role: "gemini", content: text, verdict, usage };
     },
   };
 }

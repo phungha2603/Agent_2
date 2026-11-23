@@ -1,23 +1,27 @@
 import { EventEmitter } from "node:events";
-import type { HandoffArtifact, ProjectConfig, TaskRecord } from "../types.js";
+import type { HandoffArtifact, ProjectConfig, Stage, StageRun, TaskRecord } from "../types.js";
 import { Semaphore } from "./semaphore.js";
-import { limitAgent, type EngineName } from "../agents/limited.js";
+import { limitAgent, type CallRecord, type EngineName, type Price } from "../agents/limited.js";
 import {
   advance,
   createTask,
   isTerminal,
   isWaitingForHuman,
   log,
+  requestRevision,
   resolveCheckpoint,
   retryFromRejected,
+  trace,
   type Agents,
   type PipelineConfig,
 } from "./pipeline.js";
 import { buildHandoff, reachedHandoffPoint, type HandoffPoint } from "./handoff.js";
 import { draftAndReviewPlan, materializePlan, newPlanId, type Department, type PlanLimits, type WorkPlan, type WorkPlanRecord } from "./planner.js";
+import { parseFileBlocks } from "../apply/applyFiles.js";
 import { loadTask, saveTask, taskExists } from "../store/taskStore.js";
 import { loadPlan, savePlan } from "../store/planStore.js";
-import { SLOTS, TIER_LABELS, deriveStatus, loadDashboardState, saveDashboardState, type DashboardState } from "../dashboard/slots.js";
+import { appendCall, readCalls } from "../store/callLogStore.js";
+import { SLOTS, TIER_LABELS, deriveStatus, loadDashboardState, saveDashboardState, type DashboardState, type Directive } from "../dashboard/slots.js";
 
 export interface SchedulerSettings {
   claudeConcurrency: number;
@@ -28,9 +32,12 @@ export interface SchedulerSettings {
   /** Automatic retries of a stage that threw (network, CLI crash, ...) before pausing the task. */
   stageErrorRetries: number;
   stageErrorBackoffMs: number[];
+  /** Where non-gated slots hand off; gated slots always wait for the CEO ("done"). */
   handoffOn: HandoffPoint;
   planMaxRounds: number;
   planLimits: PlanLimits;
+  /** Only used when a provider doesn't report its own cost. */
+  prices?: Partial<Record<"claude" | "gemini", Price>>;
 }
 
 export interface CompanyOptions {
@@ -47,11 +54,22 @@ export interface Activity {
 }
 
 export type QueueState = "running" | "waiting_you" | "error" | "rejected" | "blocked" | "waiting_deps" | "queued" | "done";
+export type SlotStateKind = "running" | "needs_review" | "blocked" | "waiting_input" | "ready" | "paused" | "done" | "idle";
+
+export interface RunSummary {
+  stage: Stage;
+  durationMs: number;
+  waitMs: number;
+  tokens: number;
+  costUsd: number;
+  estimated: boolean;
+  outcome?: StageRun["outcome"];
+}
 
 export interface TaskSnapshot {
   id: string;
   title: string;
-  stage: string;
+  stage: Stage;
   label: string;
   colorClass: string;
   progress: number;
@@ -63,12 +81,20 @@ export interface TaskSnapshot {
   logs: { at: string; text: string }[];
   acceptanceCriteria: string[];
   deps: { total: number; ready: number; waitingOn: string[]; blockedBy?: string };
+  /** Slots this task takes input from / delivers to, for the handoff badges and arrows. */
+  inputsFrom: { slotId: string; title: string; handedOff: boolean }[];
+  outputsTo: { slotId: string; title: string }[];
   activity: Activity | null;
   stageStartedAt?: string;
   liveTail: string;
   liveTotal: number;
   planRef?: TaskRecord["planRef"];
   handedOff: boolean;
+  gated: boolean;
+  lastRun: RunSummary | null;
+  totals: { tokens: number; costUsd: number; activeMs: number; runs: number };
+  redoPending: boolean;
+  assignedBy?: string;
 }
 
 export interface SlotSnapshot {
@@ -79,11 +105,49 @@ export interface SlotSnapshot {
   tierLabel: string;
   isBoss: boolean;
   parallel: number;
+  gated: boolean;
+  state: { kind: SlotStateKind; label: string; detail?: string };
   counts: { running: number; queued: number; waitingYou: number; done: number; problems: number };
+  /** Unfinished tasks after the one shown. */
+  queueRemaining: number;
+  directives: Directive[];
+  inFrom: string[];
+  outTo: string[];
   tasks: TaskSnapshot[];
 }
 
 export type EngineSnapshot = Record<EngineName, { limit: number; running: number; waiting: number }>;
+
+export interface Telemetry {
+  paused: boolean;
+  runStartedAt: string | null;
+  runEndedAt: string | null;
+  percent: number;
+  counts: { total: number; running: number; queued: number; waitingYou: number; errors: number; done: number };
+  tokens: { input: number; output: number };
+  byEngine: Record<string, { input: number; output: number; costUsd: number }>;
+  costUsd: number;
+  costPartial: boolean;
+  tokensEstimated: boolean;
+}
+
+export interface Insights {
+  handoffs: { at: string; from: string; to: string[]; title: string }[];
+  waits: { slotId: string; title: string; waitingOn: string[]; sinceMs: number }[];
+  alerts: { level: "error" | "warn" | "info"; text: string }[];
+}
+
+export interface ArtifactInfo {
+  id: string;
+  taskId: string;
+  slotId?: string;
+  taskTitle: string;
+  kind: "brief" | "spec" | "file" | "verification";
+  path?: string;
+  title: string;
+  size: number;
+  updatedAt: string;
+}
 
 interface Worker {
   slotId: string;
@@ -94,33 +158,45 @@ interface DependencyState {
   state: "ready" | "waiting" | "blocked";
   handoffs: HandoffArtifact[];
   waitingOn: string[];
+  waitingOnSlots: string[];
   blockedBy?: string;
   total: number;
 }
+
+type Index = Map<string, TaskRecord>;
 
 const DEPARTMENTS: Department[] = SLOTS.map((s) => ({ id: s.id, name: s.name, tier: s.tier }));
 const BOSS_ID = SLOTS.find((s) => s.tier === 1)!.id;
 const LIVE_TAIL_CHARS = 2000;
 const LIVE_FLUSH_MS = 250;
 const DONE_SHOWN_PER_SLOT = 5;
+const ATTACHMENT_CHARS = 30000;
 const QUEUE_ORDER: QueueState[] = ["running", "waiting_you", "error", "blocked", "waiting_deps", "queued", "rejected", "done"];
+const LATE_STAGES: Stage[] = ["architecture_review", "implementation", "verification", "review_gemini", "review_claude", "checkpoint_final"];
+const LONG_STAGE_MS = 15 * 60 * 1000;
+const LONG_REVIEW_WAIT_MS = 10 * 60 * 1000;
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+const nowIso = () => new Date().toISOString();
 const hhmm = (iso: string) => new Date(iso).toTimeString().slice(0, 5);
+const ms = (from?: string, to?: string) => (from ? (to ? Date.parse(to) : Date.now()) - Date.parse(from) : 0);
+const minutes = (msValue: number) => Math.max(1, Math.round(msValue / 60000));
+
+class UserError extends Error {}
 
 /**
  * Runs the company: per-slot task queues with a per-slot parallelism cap,
  * per-engine concurrency limits (Claude, Gemini, Muse — Muse is always 1,
  * it's one browser), a lock on the shared project directory for the
  * write-then-verify step, dependency-ordered handoffs between tasks,
- * automatic retries, and the boss's plan. Emits "slot" (slotId), "plan",
- * "engines" and "live" ({ id, slotId, text }) events for the dashboard.
+ * approval gates, CEO steering, automatic retries, pause/resume/stop, and
+ * the boss's plan. Records every stage attempt and agent call, so the
+ * dashboard can show timelines, tokens/cost and full prompts. Emits "slot"
+ * (slotId), "plan", "engines", "control" and "live" events.
  *
  * Planning, architecture and reviews (Claude/Gemini) for different tasks run
  * in parallel; implementation+verification is serialized across tasks
- * because they all write into, and build, the same VERIFY_CWD — two tasks'
- * files landing in between one task's write and its build would make that
- * build meaningless.
+ * because they all write into, and build, the same VERIFY_CWD.
  */
 export class Company extends EventEmitter {
   readonly engines: Record<EngineName, Semaphore>;
@@ -129,11 +205,16 @@ export class Company extends EventEmitter {
   private readonly pipeline: PipelineConfig;
   private readonly settings: SchedulerSettings;
   private readonly projectConfig: () => ProjectConfig | undefined;
-  private state: DashboardState = { slots: {}, activePlanId: null };
+  private state: DashboardState = { slots: {}, activePlanId: null, gates: {}, directives: [], paused: false };
   private readonly workers = new Map<string, Worker>();
   /** In-memory task objects for running workers — the source of truth while they run. */
   private readonly running = new Map<string, TaskRecord>();
   private readonly activity = new Map<string, Activity[]>();
+  private readonly currentRun = new Map<string, StageRun>();
+  private readonly controllers = new Map<string, AbortController>();
+  private planController: AbortController | null = null;
+  private readonly planUsage = new Map<string, { input: number; output: number; costUsd: number }>();
+  private pauseWaiters: (() => void)[] = [];
   private readonly liveTail = new Map<string, string>();
   private readonly liveBuffer = new Map<string, { stage: string; start: number; text: string }>();
   /** Characters produced so far in the current stage (not truncated like liveTail). */
@@ -161,10 +242,12 @@ export class Company extends EventEmitter {
       onWait: (id: string, engine: EngineName) => this.pushActivity(id, engine, "waiting"),
       onStart: (id: string, engine: EngineName) => this.markRunning(id, engine),
       onEnd: (id: string, engine: EngineName) => this.popActivity(id, engine),
+      onCall: (rec: CallRecord) => this.recordCall(rec),
     };
+    const prices = opts.settings.prices ?? {};
     this.agents = {
-      claude: limitAgent(opts.agents.claude, this.engines.claude, "claude", hooks),
-      gemini: limitAgent(opts.agents.gemini, this.engines.gemini, "gemini", hooks),
+      claude: limitAgent(opts.agents.claude, this.engines.claude, "claude", hooks, prices.claude),
+      gemini: limitAgent(opts.agents.gemini, this.engines.gemini, "gemini", hooks, prices.gemini),
       muse: limitAgent(opts.agents.muse, this.engines.muse, "muse", hooks),
     };
   }
@@ -178,23 +261,73 @@ export class Company extends EventEmitter {
       plan.error = "The server stopped while this plan was being drafted — retry to draft it again.";
       await savePlan(plan);
     }
+    // A task whose stage was in flight when the process died has an open run; close it.
+    for (const ids of Object.values(this.state.slots)) {
+      for (const id of ids) {
+        const t = await this.load(id);
+        const open = t?.runs?.filter((r) => !r.endedAt) ?? [];
+        if (t && open.length) {
+          for (const r of open) Object.assign(r, { endedAt: t.updatedAt, outcome: "cancelled" });
+          await saveTask(t);
+        }
+      }
+    }
     this.pump();
   }
 
   async close(): Promise<void> {
     for (const w of this.workers.values()) w.cancelled = true;
+    for (const c of this.controllers.values()) c.abort();
+    this.planController?.abort();
+    this.releasePauseWaiters();
     await Promise.all(Object.values(this.rawAgents).map((a) => a.close?.().catch(() => {})));
+  }
+
+  // ---------- run control ----------
+
+  /** Let calls already in flight finish, start nothing new. */
+  async pause(): Promise<void> {
+    await this.mutateState((s) => (s.paused = true));
+    this.emitControl();
+  }
+
+  async resume(): Promise<void> {
+    await this.mutateState((s) => (s.paused = false));
+    this.releasePauseWaiters();
+    this.emitControl();
+    this.pump();
+  }
+
+  /** Abort every call in flight now (the CLI process is killed, HTTP requests cancelled) and pause. Resume restarts the interrupted stages. */
+  async stop(): Promise<void> {
+    await this.mutateState((s) => (s.paused = true));
+    for (const c of this.controllers.values()) c.abort();
+    this.planController?.abort();
+    this.emitControl();
+  }
+
+  private releasePauseWaiters(): void {
+    const waiters = this.pauseWaiters;
+    this.pauseWaiters = [];
+    for (const w of waiters) w();
+  }
+
+  private async waitIfPaused(w: Worker): Promise<void> {
+    while (this.state.paused && !w.cancelled) {
+      await new Promise<void>((r) => this.pauseWaiters.push(r));
+    }
   }
 
   // ---------- commands ----------
 
   /** A goal adds a new task to the slot's queue; no goal resumes the slot's paused (errored) tasks. */
   async runSlot(slotId: string, goal?: string): Promise<void> {
-    if (!SLOTS.some((s) => s.id === slotId)) throw new Error(`unknown slot ${slotId}`);
+    this.requireSlot(slotId);
     const text = goal?.trim();
     if (text) {
       const task = createTask(text, this.projectConfig());
       task.slotId = slotId;
+      trace(task, "CEO", "assign", `Created directly for ${slotId} by the CEO.`);
       await saveTask(task);
       await this.mutateState((s) => s.slots[slotId].push(task.id));
     } else {
@@ -211,23 +344,25 @@ export class Company extends EventEmitter {
     this.pump();
   }
 
-  async decide(taskId: string, approved: boolean, feedback?: string): Promise<void> {
-    if (this.workers.has(taskId)) throw new Error("task is running");
+  /** approve / reject (redesign from ideation) / revise (back to implementation with the CEO's change request). */
+  async decide(taskId: string, action: boolean | "approve" | "reject" | "revise", feedback?: string): Promise<void> {
+    const act = action === true ? "approve" : action === false ? "reject" : action;
+    if (this.workers.has(taskId)) throw new UserError("Task đang chạy.");
     const task = await this.load(taskId);
-    if (!task) throw new Error(`unknown task ${taskId}`);
-    if (!isWaitingForHuman(task)) throw new Error(`task is not waiting for a decision (stage: ${task.stage})`);
+    if (!task) throw new UserError(`Không tìm thấy task ${taskId}.`);
+    if (!isWaitingForHuman(task)) throw new UserError(`Task không ở điểm chờ duyệt (stage: ${task.stage}).`);
     const hadHandoff = Boolean(task.handoff);
-    resolveCheckpoint(task, approved, feedback?.trim() || undefined);
-    if (approved && !task.handoff && reachedHandoffPoint(task.stage, this.settings.handoffOn)) {
-      await this.publishHandoff(task);
-    }
-    if (!approved && hadHandoff) {
+    const gated = this.isGated(task);
+
+    if (act === "revise") requestRevision(task, feedback ?? "");
+    else resolveCheckpoint(task, act === "approve", feedback?.trim() || undefined);
+
+    if (act === "approve") {
+      if (task.stage === "done") trace(task, "CEO", "gate", gated ? "Approved at the approval gate — result handed off." : "Approved and shipped.");
+      if (!task.handoff && reachedHandoffPoint(task.stage, this.handoffPointFor(task))) await this.publishHandoff(task);
+    } else if (hadHandoff) {
       task.handoff = undefined;
-      for (const dep of await this.findDependents(task.id)) {
-        log(dep, dep.stage, "system", `Warning: upstream "${task.context.title}" was sent back by the CEO after handing off — this task built on a version that may still change.`);
-        await saveTask(dep);
-        this.emitTask(dep);
-      }
+      await this.warnDependents(task, act === "revise" ? "sent back for a revision" : "sent back for a redesign");
     }
     await saveTask(task);
     this.emitTask(task);
@@ -242,7 +377,7 @@ export class Company extends EventEmitter {
         if (this.workers.has(id)) continue;
         const task = await this.load(id);
         if (task && isWaitingForHuman(task)) {
-          await this.decide(id, true);
+          await this.decide(id, "approve");
           approved++;
         }
       }
@@ -252,28 +387,133 @@ export class Company extends EventEmitter {
 
   /** Clears a paused runtime error, or gives a rejected task a fresh budget (keeping its last feedback). */
   async retryTask(taskId: string): Promise<void> {
-    if (this.workers.has(taskId)) throw new Error("task is running");
+    if (this.workers.has(taskId)) throw new UserError("Task đang chạy.");
     const task = await this.load(taskId);
-    if (!task) throw new Error(`unknown task ${taskId}`);
+    if (!task) throw new UserError(`Không tìm thấy task ${taskId}.`);
     if (task.lastError) {
       task.lastError = undefined;
       log(task, task.stage, "ceo", "Retry requested by the CEO.");
     } else if (task.stage === "rejected") {
       retryFromRejected(task);
     } else {
-      throw new Error("nothing to retry");
+      throw new UserError("Task này không có gì để thử lại.");
     }
     await saveTask(task);
     this.emitTask(task);
     this.pump();
   }
 
+  async setGate(slotId: string, enabled: boolean): Promise<void> {
+    this.requireSlot(slotId);
+    await this.mutateState((s) => (s.gates[slotId] = enabled));
+    this.emit("slot", slotId);
+  }
+
+  /**
+   * A CEO instruction for one slot (or the whole company when slotId is
+   * null). It reaches every agent call of those tasks from the next stage
+   * on. With redo, tasks already past architecture go back to it with the
+   * instruction as feedback (a task mid-stage does so when that stage ends).
+   */
+  async steer(slotId: string | null, text: string, redo = false): Promise<Directive> {
+    if (slotId) this.requireSlot(slotId);
+    const clean = text.trim();
+    if (!clean) throw new UserError("Chỉ thị đang trống.");
+    const directive: Directive = { id: `d-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`, slotId, text: clean, at: nowIso() };
+    await this.mutateState((s) => s.directives.push(directive));
+    const scope = slotId ? [slotId] : SLOTS.map((s) => s.id);
+    for (const sid of scope) {
+      for (const id of this.state.slots[sid] ?? []) {
+        const task = await this.load(id);
+        if (!task || isTerminal(task)) continue;
+        trace(task, "CEO", "directive", `${slotId ? "" : "Company-wide: "}${clean}${redo ? " (redo requested)" : ""}`);
+        if (redo) {
+          if (this.workers.has(id)) task.redoRequested = clean;
+          else await this.redo(task, clean);
+        }
+        if (!this.workers.has(id)) await saveTask(task);
+      }
+      this.emit("slot", sid);
+    }
+    this.emitControl();
+    this.pump();
+    return directive;
+  }
+
+  async removeDirective(id: string): Promise<void> {
+    const d = this.state.directives.find((x) => x.id === id);
+    await this.mutateState((s) => (s.directives = s.directives.filter((x) => x.id !== id)));
+    if (d?.slotId) this.emit("slot", d.slotId);
+    else for (const s of SLOTS) this.emit("slot", s.id);
+    this.emitControl();
+  }
+
+  /** Reassign a task to another slot and/or move it to the top or bottom of that slot's queue. */
+  async moveTask(taskId: string, toSlot: string, position: "top" | "bottom" = "bottom"): Promise<void> {
+    this.requireSlot(toSlot);
+    if (this.workers.has(taskId)) throw new UserError("Task đang chạy — chờ xong bước hiện tại (hoặc bấm Pause) rồi gán lại.");
+    const task = await this.load(taskId);
+    if (!task) throw new UserError(`Không tìm thấy task ${taskId}.`);
+    if (task.stage === "done") throw new UserError("Task đã xong, không cần gán lại.");
+    const from = this.slotOf(taskId) ?? task.slotId;
+    await this.mutateState((s) => {
+      for (const ids of Object.values(s.slots)) {
+        const i = ids.indexOf(taskId);
+        if (i !== -1) ids.splice(i, 1);
+      }
+      if (position === "top") s.slots[toSlot].unshift(taskId);
+      else s.slots[toSlot].push(taskId);
+    });
+    task.slotId = toSlot;
+    if (from === toSlot) {
+      trace(task, "CEO", "priority", position === "top" ? "Moved to the front of the queue." : "Moved to the back of the queue.");
+    } else {
+      trace(task, "CEO", "reassign", `Reassigned from ${from ?? "?"} to ${toSlot}.`);
+      log(task, task.stage, "ceo", `Reassigned from ${from ?? "?"} to ${toSlot}.`);
+      await this.updatePlanOwner(task, toSlot);
+    }
+    await saveTask(task);
+    if (from) this.emit("slot", from);
+    this.emit("slot", toSlot);
+    this.pump();
+  }
+
+  /** Forward one agent's output to another slot as input material. Creates a task there if it has nothing unfinished. */
+  async sendArtifact(src: { taskId: string; kind: ArtifactInfo["kind"]; path?: string }, toSlot: string, note?: string): Promise<{ taskId: string; created: boolean }> {
+    this.requireSlot(toSlot);
+    const art = await this.artifactContent(src.taskId, src.kind, src.path);
+    const source = await this.load(src.taskId);
+    const fromSlot = source?.slotId ?? this.slotOf(src.taskId) ?? "?";
+    let target: TaskRecord | undefined;
+    for (const id of this.state.slots[toSlot]) {
+      const t = await this.load(id);
+      if (t && !isTerminal(t)) {
+        target = t;
+        break;
+      }
+    }
+    let created = false;
+    if (!target) {
+      target = createTask(note?.trim() || `Tiếp nhận "${art.title}" từ ${fromSlot} và xử lý tiếp`, this.projectConfig());
+      target.slotId = toSlot;
+      created = true;
+      await this.mutateState((s) => s.slots[toSlot].push(target!.id));
+    }
+    const content = `${note?.trim() ? `CEO note: ${note.trim()}\n\n` : ""}${art.content}`.slice(0, ATTACHMENT_CHARS);
+    (target.context.attachments ??= []).push({ title: art.title, from: `${fromSlot} · ${source?.context.title ?? src.taskId}`, content });
+    trace(target, "CEO", "input", `Forwarded "${art.title}" from ${fromSlot}${note?.trim() ? `: ${note.trim()}` : ""}.`);
+    if (!this.workers.has(target.id)) await saveTask(target);
+    this.emit("slot", toSlot);
+    this.pump();
+    return { taskId: target.id, created };
+  }
+
   async startPlan(goal: string): Promise<WorkPlanRecord> {
     const current = await this.activePlan();
     if (current && (current.status === "drafting" || current.status === "awaiting_approval")) {
-      throw new Error("A plan is already being drafted or waiting for approval — decide on it first.");
+      throw new UserError("Đang có một kế hoạch đang lập hoặc chờ duyệt — hãy quyết kế hoạch đó trước.");
     }
-    const now = new Date().toISOString();
+    const now = nowIso();
     const plan: WorkPlanRecord = { id: newPlanId(), goal: goal.trim(), status: "drafting", createdAt: now, updatedAt: now };
     await savePlan(plan);
     await this.mutateState((s) => (s.activePlanId = plan.id));
@@ -284,7 +524,7 @@ export class Company extends EventEmitter {
 
   async decidePlan(planId: string, approved: boolean, feedback?: string): Promise<void> {
     const plan = await loadPlan(planId);
-    if (!plan || plan.status !== "awaiting_approval") throw new Error("plan is not waiting for approval");
+    if (!plan || plan.status !== "awaiting_approval") throw new UserError("Kế hoạch không ở trạng thái chờ duyệt.");
     if (approved) {
       const tasks = materializePlan(plan, this.projectConfig());
       for (const t of tasks) await saveTask(t);
@@ -308,7 +548,7 @@ export class Company extends EventEmitter {
 
   async retryPlan(planId: string): Promise<void> {
     const plan = await loadPlan(planId);
-    if (!plan || plan.status !== "failed") throw new Error("plan has not failed");
+    if (!plan || plan.status !== "failed") throw new UserError("Kế hoạch này không ở trạng thái lỗi.");
     plan.status = "drafting";
     plan.error = undefined;
     await savePlan(plan);
@@ -319,6 +559,7 @@ export class Company extends EventEmitter {
   /** Un-assigns every task (task files stay in data/tasks) and stops running workers after their current stage. */
   async reset(): Promise<void> {
     for (const w of this.workers.values()) w.cancelled = true;
+    this.releasePauseWaiters();
     const plan = await this.activePlan();
     if (plan && (plan.status === "drafting" || plan.status === "awaiting_approval")) {
       plan.status = "discarded";
@@ -327,12 +568,14 @@ export class Company extends EventEmitter {
     await this.mutateState((s) => {
       for (const slot of SLOTS) s.slots[slot.id] = [];
       s.activePlanId = null;
+      s.directives = [];
     });
     for (const slot of SLOTS) this.emit("slot", slot.id);
     this.emitPlan();
+    this.emitControl();
   }
 
-  // ---------- snapshots ----------
+  // ---------- read models ----------
 
   engineSnapshot(): EngineSnapshot {
     const snap = {} as EngineSnapshot;
@@ -342,18 +585,25 @@ export class Company extends EventEmitter {
     return snap;
   }
 
-  async slotSnapshot(slotId: string): Promise<SlotSnapshot> {
+  control() {
+    return { paused: this.state.paused, directives: this.state.directives.filter((d) => !d.slotId), gates: this.state.gates };
+  }
+
+  async slotSnapshot(slotId: string, index?: Index): Promise<SlotSnapshot> {
     const slot = SLOTS.find((s) => s.id === slotId);
-    if (!slot) throw new Error(`unknown slot ${slotId}`);
-    const tasks: TaskSnapshot[] = [];
+    if (!slot) throw new UserError(`unknown slot ${slotId}`);
+    const idx = index ?? (await this.index());
+    const all: TaskSnapshot[] = [];
     for (const id of this.state.slots[slotId] ?? []) {
-      const task = await this.load(id);
-      if (task) tasks.push(await this.taskSnapshot(task));
+      const task = idx.get(id);
+      if (task) all.push(await this.taskSnapshot(task, idx));
     }
-    tasks.sort((a, b) => QUEUE_ORDER.indexOf(a.queueState) - QUEUE_ORDER.indexOf(b.queueState));
-    const done = tasks.filter((t) => t.queueState === "done");
-    const shown = [...tasks.filter((t) => t.queueState !== "done"), ...done.slice(-DONE_SHOWN_PER_SLOT).reverse()];
-    const count = (...states: QueueState[]) => tasks.filter((t) => states.includes(t.queueState)).length;
+    // Stable: keeps the slot's own queue order (priority) within each state.
+    all.sort((a, b) => QUEUE_ORDER.indexOf(a.queueState) - QUEUE_ORDER.indexOf(b.queueState));
+    const done = all.filter((t) => t.queueState === "done");
+    const shown = [...all.filter((t) => t.queueState !== "done"), ...done.slice(-DONE_SHOWN_PER_SLOT).reverse()];
+    const count = (...states: QueueState[]) => all.filter((t) => states.includes(t.queueState)).length;
+    const unfinished = all.filter((t) => t.queueState !== "done").length;
     return {
       id: slot.id,
       name: slot.name,
@@ -362,6 +612,8 @@ export class Company extends EventEmitter {
       tierLabel: TIER_LABELS[slot.tier],
       isBoss: slot.tier === 1,
       parallel: this.parallelFor(slot.id),
+      gated: Boolean(this.state.gates[slot.id]),
+      state: this.slotState(all),
       counts: {
         running: count("running"),
         queued: count("queued", "waiting_deps", "blocked"),
@@ -369,19 +621,23 @@ export class Company extends EventEmitter {
         done: done.length,
         problems: count("error", "rejected"),
       },
+      queueRemaining: Math.max(0, unfinished - 1),
+      directives: this.state.directives.filter((d) => d.slotId === slot.id),
+      inFrom: [...new Set(all.flatMap((t) => t.inputsFrom.map((i) => i.slotId)))].filter((s) => s !== slot.id),
+      outTo: [...new Set(all.flatMap((t) => t.outputsTo.map((o) => o.slotId)))].filter((s) => s !== slot.id),
       tasks: shown,
     };
   }
 
-  async planSnapshot(): Promise<(WorkPlanRecord & { phase: string | null; activity: Activity | null; liveTail: string; liveTotal: number; taskStages: Record<string, string> }) | null> {
+  async planSnapshot() {
     const plan = await this.activePlan();
     if (!plan) return null;
-    const taskStages: Record<string, string> = {};
+    const idx = await this.index();
+    const taskStages: Record<string, { stage: string; queueState: QueueState }> = {};
     for (const epic of plan.epics ?? []) {
       for (const id of [epic.taskId, ...epic.subtasks.map((s) => s.taskId)]) {
-        if (!id) continue;
-        const t = await this.load(id);
-        if (t) taskStages[id] = (await this.taskSnapshot(t)).queueState === "running" ? `${t.stage} ▶` : t.stage;
+        const t = id ? idx.get(id) : undefined;
+        if (t) taskStages[t.id] = { stage: t.stage, queueState: this.queueStateOf(t, await this.dependencyState(t, idx)) };
       }
     }
     const key = `plan:${plan.id}`;
@@ -395,11 +651,214 @@ export class Company extends EventEmitter {
     };
   }
 
-  async statusSnapshot() {
+  async telemetry(index?: Index): Promise<Telemetry> {
+    const idx = index ?? (await this.index());
+    const tasks = [...idx.values()];
+    const t: Telemetry = {
+      paused: this.state.paused,
+      runStartedAt: null,
+      runEndedAt: null,
+      percent: 0,
+      counts: { total: tasks.length, running: 0, queued: 0, waitingYou: 0, errors: 0, done: 0 },
+      tokens: { input: 0, output: 0 },
+      byEngine: {},
+      costUsd: 0,
+      costPartial: false,
+      tokensEstimated: false,
+    };
+    let progress = 0;
+    const plan = await this.activePlan();
+    const starts = tasks.map((x) => x.createdAt);
+    if (plan) starts.push(plan.createdAt);
+    t.runStartedAt = starts.length ? starts.sort()[0] : null;
+    for (const task of tasks) {
+      const qs = this.queueStateOf(task, await this.dependencyState(task, idx));
+      if (qs === "running") t.counts.running++;
+      else if (qs === "waiting_you") t.counts.waitingYou++;
+      else if (qs === "error" || qs === "rejected" || qs === "blocked") t.counts.errors++;
+      else if (qs === "done") t.counts.done++;
+      else t.counts.queued++;
+      progress += isTerminal(task) ? 100 : deriveStatus(task.stage).progress;
+      for (const run of task.runs ?? []) this.addUsage(t, run);
+    }
+    for (const [id, u] of this.planUsage) {
+      if (!plan || `plan:${plan.id}` !== id) continue;
+      this.addEngineUsage(t, "claude", u.input, u.output, u.costUsd);
+    }
+    if (plan?.usage && !this.planUsage.has(`plan:${plan.id}`)) this.addEngineUsage(t, "claude", plan.usage.input, plan.usage.output, plan.usage.costUsd);
+    t.percent = tasks.length ? Math.round(progress / tasks.length) : 0;
+    if (tasks.length && tasks.every(isTerminal)) t.runEndedAt = tasks.map((x) => x.updatedAt).sort().at(-1) ?? null;
+    return t;
+  }
+
+  async insights(index?: Index): Promise<Insights> {
+    const idx = index ?? (await this.index());
+    const out: Insights = { handoffs: [], waits: [], alerts: [] };
+    const dependents = this.dependentsIndex(idx);
+    let waitingYou: TaskRecord[] = [];
+    const phaseQueue: Record<string, number> = {};
+    for (const task of idx.values()) {
+      const deps = await this.dependencyState(task, idx);
+      const qs = this.queueStateOf(task, deps);
+      const slot = task.slotId ?? this.slotOf(task.id) ?? "?";
+      if (task.handoff) {
+        out.handoffs.push({
+          at: task.handoff.at,
+          from: slot,
+          to: [...new Set((dependents.get(task.id) ?? []).map((d) => d.slotId ?? "?"))],
+          title: task.context.title,
+        });
+      }
+      if (qs === "waiting_deps") out.waits.push({ slotId: slot, title: task.context.title, waitingOn: deps.waitingOnSlots, sinceMs: ms(task.createdAt) });
+      if (qs === "waiting_you") waitingYou.push(task);
+      if (qs === "error") out.alerts.push({ level: "error", text: `${slot} · ${task.context.title}: lỗi — ${task.lastError?.message.slice(0, 140)}` });
+      if (qs === "rejected") out.alerts.push({ level: "error", text: `${slot} · ${task.context.title}: bị từ chối sau khi hết lượt thử` });
+      if (qs === "blocked") out.alerts.push({ level: "error", text: `${slot} · ${task.context.title}: bị chặn — ${deps.blockedBy}` });
+      if (qs === "running" && ms(task.stageStartedAt) > LONG_STAGE_MS) {
+        out.alerts.push({ level: "warn", text: `${slot} chạy ${task.stage} đã ${minutes(ms(task.stageStartedAt))} phút` });
+      }
+      if (qs === "queued" || qs === "waiting_deps") phaseQueue[workflowPhase(task.stage)] = (phaseQueue[workflowPhase(task.stage)] ?? 0) + 1;
+    }
+    for (const [name, e] of Object.entries(this.engineSnapshot())) {
+      if (e.waiting >= 2) out.alerts.push({ level: "warn", text: `Nghẽn ở ${ENGINE_PHASE[name] ?? name}: ${e.waiting} lượt đang chờ (${e.running}/${e.limit} đang chạy)` });
+    }
+    if (waitingYou.length) {
+      waitingYou = waitingYou.sort((a, b) => a.updatedAt.localeCompare(b.updatedAt));
+      const oldest = ms(waitingYou[0].updatedAt);
+      if (waitingYou.length >= 2 || oldest > LONG_REVIEW_WAIT_MS) {
+        out.alerts.push({ level: "warn", text: `Nghẽn ở bạn: ${waitingYou.length} task chờ duyệt (lâu nhất ${minutes(oldest)} phút)` });
+      }
+    }
+    const [busiest] = Object.entries(phaseQueue).sort((a, b) => b[1] - a[1]);
+    if (busiest && busiest[1] >= 3) out.alerts.push({ level: "info", text: `Dồn ở khâu ${busiest[0]}: ${busiest[1]} task đang chờ` });
+    if (this.state.paused) out.alerts.unshift({ level: "info", text: "Cả công ty đang tạm dừng — bấm Resume để chạy tiếp." });
+    out.handoffs.sort((a, b) => b.at.localeCompare(a.at)).splice(8);
+    out.waits.sort((a, b) => b.sinceMs - a.sinceMs).splice(8);
+    return out;
+  }
+
+  /** Every stage attempt on a time axis, one row per slot, plus the dependency chain that determined the finish time. */
+  async timeline() {
+    const idx = await this.index();
+    const rows = SLOTS.map((s) => ({ slotId: s.id, name: s.name, spans: [] as any[] }));
+    let start: string | null = null;
+    const finishOf = (t: TaskRecord): number => {
+      if (t.handoff) return Date.parse(t.handoff.at);
+      const runs = t.runs ?? [];
+      if (this.workers.has(t.id) || runs.some((r) => !r.endedAt)) return Date.now();
+      const last = runs.at(-1)?.endedAt;
+      return last ? Date.parse(last) : 0;
+    };
+    const startOf = (t: TaskRecord): number => (t.runs?.[0] ? Date.parse(t.runs[0].startedAt) : 0);
+
+    // Critical path: walk back from the task that finished last through the dependency that finished last.
+    const withRuns = [...idx.values()].filter((t) => t.runs?.length);
+    const chain: TaskRecord[] = [];
+    let cur = withRuns.sort((a, b) => finishOf(b) - finishOf(a))[0];
+    while (cur) {
+      chain.unshift(cur);
+      const deps = (cur.dependsOn ?? []).map((id) => idx.get(id)).filter((t): t is TaskRecord => Boolean(t?.runs?.length));
+      cur = deps.sort((a, b) => finishOf(b) - finishOf(a))[0];
+    }
+    const critical = new Set(chain.map((t) => t.id));
+
+    for (const task of idx.values()) {
+      const row = rows.find((r) => r.slotId === (task.slotId ?? this.slotOf(task.id)));
+      if (!row) continue;
+      for (const run of task.runs ?? []) {
+        if (!start || run.startedAt < start) start = run.startedAt;
+        row.spans.push({
+          taskId: task.id,
+          title: task.context.title,
+          stage: run.stage,
+          startedAt: run.startedAt,
+          endedAt: run.endedAt ?? null,
+          outcome: run.outcome ?? null,
+          waitMs: run.waitMs,
+          tokens: run.inputTokens + run.outputTokens,
+          critical: critical.has(task.id),
+        });
+      }
+    }
+    for (const r of rows) r.spans.sort((a, b) => a.startedAt.localeCompare(b.startedAt));
     return {
-      slots: await Promise.all(SLOTS.map((s) => this.slotSnapshot(s.id))),
+      start,
+      now: nowIso(),
+      rows,
+      criticalPath: chain.length
+        ? {
+            tasks: chain.map((t) => ({ id: t.id, slotId: t.slotId, title: t.context.title })),
+            totalMs: finishOf(chain.at(-1)!) - startOf(chain[0]),
+          }
+        : null,
+    };
+  }
+
+  async listArtifacts(onlyTaskId?: string): Promise<ArtifactInfo[]> {
+    const out: ArtifactInfo[] = [];
+    const idx = await this.index();
+    for (const task of idx.values()) {
+      if (onlyTaskId && task.id !== onlyTaskId) continue;
+      const base = { taskId: task.id, slotId: task.slotId ?? this.slotOf(task.id), taskTitle: task.context.title, updatedAt: task.updatedAt };
+      const c = task.context;
+      if (c.ideaBrief) out.push({ ...base, id: `${task.id}::brief`, kind: "brief", title: "Idea brief", size: c.ideaBrief.length });
+      if (c.architectureSpec) out.push({ ...base, id: `${task.id}::spec`, kind: "spec", title: "Architecture guide", size: c.architectureSpec.length });
+      for (const f of c.implementationDiff ? parseFileBlocks(c.implementationDiff) : []) {
+        out.push({ ...base, id: `${task.id}::file::${f.path}`, kind: "file", path: f.path, title: f.path, size: f.content.length });
+      }
+      if (c.verificationLog) out.push({ ...base, id: `${task.id}::verification`, kind: "verification", title: "Verification log", size: c.verificationLog.length });
+    }
+    return out.sort((a, b) => b.updatedAt.localeCompare(a.updatedAt));
+  }
+
+  /** A task's own version of an artifact (files come from its own implementation reply, not whatever is on disk now). */
+  async artifactContent(taskId: string, kind: ArtifactInfo["kind"], filePath?: string): Promise<{ title: string; content: string; filename: string }> {
+    const task = await this.load(taskId);
+    if (!task) throw new UserError(`Không tìm thấy task ${taskId}.`);
+    const c = task.context;
+    const safe = (s: string) => s.replace(/[^a-zA-Z0-9._-]+/g, "_").slice(0, 60);
+    switch (kind) {
+      case "brief":
+        if (c.ideaBrief) return { title: "Idea brief", content: c.ideaBrief, filename: `${safe(c.title)}-brief.md` };
+        break;
+      case "spec":
+        if (c.architectureSpec) return { title: "Architecture guide", content: c.architectureSpec, filename: `${safe(c.title)}-architecture.md` };
+        break;
+      case "verification":
+        if (c.verificationLog) return { title: "Verification log", content: c.verificationLog, filename: `${safe(c.title)}-verification.log` };
+        break;
+      case "file": {
+        const f = c.implementationDiff ? parseFileBlocks(c.implementationDiff).find((x) => x.path === filePath) : undefined;
+        if (f) return { title: f.path, content: f.content, filename: f.path.split("/").pop() || "file.txt" };
+        break;
+      }
+    }
+    throw new UserError("Không tìm thấy artifact này.");
+  }
+
+  async taskDetail(taskId: string) {
+    const task = await this.load(taskId);
+    if (!task) throw new UserError(`Không tìm thấy task ${taskId}.`);
+    const idx = await this.index();
+    return {
+      task,
+      snapshot: await this.taskSnapshot(task, idx),
+      calls: await readCalls(taskId),
+      artifacts: await this.listArtifacts(taskId),
+      slotDirectives: this.state.directives.filter((d) => d.slotId === (task.slotId ?? this.slotOf(taskId))),
+      companyDirectives: this.state.directives.filter((d) => !d.slotId),
+    };
+  }
+
+  async statusSnapshot() {
+    const idx = await this.index();
+    return {
+      slots: await Promise.all(SLOTS.map((s) => this.slotSnapshot(s.id, idx))),
       engines: this.engineSnapshot(),
       plan: await this.planSnapshot(),
+      telemetry: await this.telemetry(idx),
+      insights: await this.insights(idx),
+      control: this.control(),
       settings: { handoffOn: this.settings.handoffOn, stageErrorRetries: this.settings.stageErrorRetries, maxAutoRecoveries: this.pipeline.maxAutoRecoveries ?? 0 },
     };
   }
@@ -408,6 +867,16 @@ export class Company extends EventEmitter {
 
   private parallelFor(slotId: string): number {
     return this.settings.slotParallel[slotId] ?? this.settings.defaultSlotParallel;
+  }
+
+  private isGated(task: TaskRecord): boolean {
+    const slot = task.slotId ?? this.slotOf(task.id);
+    return Boolean(slot && this.state.gates[slot]);
+  }
+
+  /** A gated slot's results only hand off once the CEO approves them. */
+  private handoffPointFor(task: TaskRecord): HandoffPoint {
+    return this.isGated(task) ? "done" : this.settings.handoffOn;
   }
 
   pump(): void {
@@ -423,10 +892,11 @@ export class Company extends EventEmitter {
     try {
       do {
         this.pumpAgain = false;
+        if (this.state.paused) break;
         for (const slot of SLOTS) {
           const limit = this.parallelFor(slot.id);
           let active = [...this.workers.values()].filter((w) => w.slotId === slot.id).length;
-          for (const id of this.state.slots[slot.id] ?? []) {
+          for (const id of [...(this.state.slots[slot.id] ?? [])]) {
             if (active >= limit) break;
             if (this.workers.has(id)) continue;
             const task = await this.load(id);
@@ -463,7 +933,7 @@ export class Company extends EventEmitter {
         if (!(await this.runStage(task, w))) break;
       }
     } catch (err) {
-      task.lastError = { at: new Date().toISOString(), stage: task.stage, message: (err as Error).message, attempts: 1 };
+      task.lastError = { at: nowIso(), stage: task.stage, message: (err as Error).message, attempts: 1 };
       await saveTask(task).catch(() => {});
     } finally {
       this.workers.delete(task.id);
@@ -476,22 +946,60 @@ export class Company extends EventEmitter {
     }
   }
 
+  private startRun(task: TaskRecord): StageRun {
+    const run: StageRun = {
+      stage: task.stage,
+      startedAt: nowIso(),
+      waitMs: 0,
+      engines: [],
+      inputTokens: 0,
+      outputTokens: 0,
+      costUsd: 0,
+      estimated: false,
+    };
+    (task.runs ??= []).push(run);
+    this.currentRun.set(task.id, run);
+    task.stageStartedAt = run.startedAt;
+    this.resetLive(task.id);
+    return run;
+  }
+
+  private finishRun(task: TaskRecord, outcome: NonNullable<StageRun["outcome"]>, error?: string): void {
+    const run = this.currentRun.get(task.id);
+    if (run && !run.endedAt) Object.assign(run, { endedAt: nowIso(), outcome, error });
+  }
+
   /** Runs the current stage with automatic retries on runtime errors. False means stop this worker. */
   private async runStage(task: TaskRecord, w: Worker): Promise<boolean> {
     const retries = this.settings.stageErrorRetries;
     for (let attempt = 0; ; attempt++) {
-      task.stageStartedAt = new Date().toISOString();
-      this.resetLive(task.id);
-      await saveTask(task);
-      this.emitTask(task);
+      await this.waitIfPaused(w);
+      if (w.cancelled) return false;
+      // Registered before any await, so a Stop that lands while this stage
+      // is still being set up aborts it too.
+      const ctrl = new AbortController();
+      this.controllers.set(task.id, ctrl);
+      task.context.directives = this.directivesFor(task);
+      this.startRun(task);
       try {
-        await this.executeStage(task);
+        await saveTask(task);
+        this.emitTask(task);
+        await this.executeStage(task, ctrl.signal);
+        this.finishRun(task, "ok");
         task.lastError = undefined;
+        if (task.redoRequested) await this.redo(task, task.redoRequested);
         await this.afterStage(task);
         return true;
       } catch (err) {
-        if (w.cancelled) return false;
         const message = (err as Error).message ?? String(err);
+        if (ctrl.signal.aborted || w.cancelled) {
+          this.finishRun(task, "cancelled");
+          log(task, task.stage, "ceo", `Stopped by the CEO during ${task.stage} — it restarts from this stage on Resume.`);
+          await saveTask(task);
+          this.emitTask(task);
+          return false;
+        }
+        this.finishRun(task, "error", message);
         if (attempt < retries) {
           const backoff = this.settings.stageErrorBackoffMs;
           const delay = backoff[Math.min(attempt, backoff.length - 1)] ?? 5000;
@@ -502,17 +1010,20 @@ export class Company extends EventEmitter {
           if (w.cancelled) return false;
           continue;
         }
-        task.lastError = { at: new Date().toISOString(), stage: task.stage, message, attempts: attempt + 1 };
+        task.lastError = { at: nowIso(), stage: task.stage, message, attempts: attempt + 1 };
         log(task, task.stage, "system", `Paused after ${attempt + 1} failed attempt(s) at ${task.stage}: ${message}`);
         await saveTask(task);
         this.emitTask(task);
         return false;
+      } finally {
+        this.controllers.delete(task.id);
+        this.currentRun.delete(task.id);
       }
     }
   }
 
-  private async executeStage(task: TaskRecord): Promise<void> {
-    const hooks = { onChunk: (text: string) => this.onChunk(task.id, text) };
+  private async executeStage(task: TaskRecord, signal: AbortSignal): Promise<void> {
+    const hooks = { onChunk: (text: string) => this.onChunk(task.id, text), signal };
     if (task.stage !== "implementation" && task.stage !== "verification") {
       await advance(task, this.agents, this.pipeline, hooks);
       return;
@@ -523,17 +1034,18 @@ export class Company extends EventEmitter {
       if (wasImplementation && task.stage === "verification") {
         // Verify while still holding the workspace, so no other task's
         // files land between this task's write and its build.
+        this.finishRun(task, "ok");
+        this.startRun(task);
         await saveTask(task);
-        task.stageStartedAt = new Date().toISOString();
-        this.resetLive(task.id);
         this.emitTask(task);
+        if (signal.aborted) throw Object.assign(new Error("stopped by the CEO"), { name: "AbortError" });
         await advance(task, this.agents, this.pipeline, hooks);
       }
     });
   }
 
   private async afterStage(task: TaskRecord): Promise<void> {
-    if (!task.handoff && reachedHandoffPoint(task.stage, this.settings.handoffOn)) {
+    if (!task.handoff && reachedHandoffPoint(task.stage, this.handoffPointFor(task))) {
       await this.publishHandoff(task);
     }
     await saveTask(task);
@@ -554,11 +1066,89 @@ export class Company extends EventEmitter {
     );
   }
 
-  private async dependencyState(task: TaskRecord): Promise<DependencyState> {
+  private async warnDependents(task: TaskRecord, what: string): Promise<void> {
+    for (const dep of await this.findDependents(task.id)) {
+      log(dep, dep.stage, "system", `Warning: upstream "${task.context.title}" was ${what} by the CEO after handing off — this task built on a version that may still change.`);
+      if (!this.workers.has(dep.id)) await saveTask(dep);
+      this.emitTask(dep);
+    }
+  }
+
+  /** Applies a "redo" directive: work already past architecture goes back to it with the directive as feedback. */
+  private async redo(task: TaskRecord, text: string): Promise<void> {
+    task.redoRequested = undefined;
+    if (!LATE_STAGES.includes(task.stage)) return; // not designed yet — the directive simply shapes what comes next
+    task.stage = "architecture";
+    task.implementationAttempts = 0;
+    task.reviewRejections = 0;
+    task.architectureRounds = 0;
+    task.lastError = undefined;
+    task.context.reviewFeedback = [`CEO directive — rework the design with this in mind:\n${text}`];
+    log(task, task.stage, "ceo", `Redo from architecture requested: ${text}`);
+    trace(task, "CEO", "directive", `Sent back to architecture to apply: ${text}`);
+    if (task.handoff) {
+      task.handoff = undefined;
+      await this.warnDependents(task, "sent back for rework");
+    }
+  }
+
+  private directivesFor(task: TaskRecord): string[] | undefined {
+    const slot = task.slotId ?? this.slotOf(task.id);
+    const list = this.state.directives.filter((d) => !d.slotId || d.slotId === slot).map((d) => d.text);
+    return list.length ? list : undefined;
+  }
+
+  private async updatePlanOwner(task: TaskRecord, owner: string): Promise<void> {
+    if (!task.planRef) return;
+    const plan = await loadPlan(task.planRef.planId);
+    const epic = plan?.epics?.find((e) => e.id === task.planRef!.epicId);
+    if (!plan || !epic) return;
+    if (task.planRef.subtaskId) {
+      const sub = epic.subtasks.find((s) => s.id === task.planRef!.subtaskId);
+      if (sub) sub.owner = owner;
+    } else {
+      epic.owner = owner;
+    }
+    await savePlan(plan);
+    this.emitPlan();
+  }
+
+  private queueStateOf(task: TaskRecord, deps: DependencyState): QueueState {
+    if (this.workers.has(task.id)) return "running";
+    if (task.lastError) return "error";
+    if (isWaitingForHuman(task)) return "waiting_you";
+    if (task.stage === "done") return "done";
+    if (task.stage === "rejected") return "rejected";
+    if (deps.state === "blocked") return "blocked";
+    if (deps.state === "waiting") return "waiting_deps";
+    return "queued";
+  }
+
+  private slotState(tasks: TaskSnapshot[]): SlotSnapshot["state"] {
+    const has = (q: QueueState) => tasks.find((t) => t.queueState === q);
+    let t: TaskSnapshot | undefined;
+    if ((t = has("running"))) {
+      const a = t.activity;
+      return { kind: "running", label: "Running", detail: a ? `${a.engine} ${a.state === "waiting" ? "· chờ lượt" : ""}`.trim() : t.stage };
+    }
+    if ((t = has("waiting_you"))) return { kind: "needs_review", label: "Needs Review", detail: t.stage === "checkpoint_idea" ? "duyệt ý tưởng" : "duyệt kết quả" };
+    if ((t = has("error") ?? has("rejected") ?? has("blocked"))) {
+      return { kind: "blocked", label: "Blocked", detail: t.lastError ?? t.deps.blockedBy ?? "bị từ chối" };
+    }
+    if ((t = has("waiting_deps"))) {
+      const slots = [...new Set(t.inputsFrom.filter((i) => !i.handedOff).map((i) => i.slotId))];
+      return { kind: "waiting_input", label: `Waiting on ${slots.join(", ") || "đầu vào"}`, detail: "đang chờ đầu vào" };
+    }
+    if (has("queued")) return this.state.paused ? { kind: "paused", label: "Paused" } : { kind: "ready", label: "Ready", detail: "trong hàng đợi" };
+    if (has("done")) return { kind: "done", label: "Done" };
+    return { kind: "idle", label: "Idle (Ready)" };
+  }
+
+  private async dependencyState(task: TaskRecord, index?: Index): Promise<DependencyState> {
     const ids = task.dependsOn ?? [];
-    const result: DependencyState = { state: "ready", handoffs: [], waitingOn: [], total: ids.length };
+    const result: DependencyState = { state: "ready", handoffs: [], waitingOn: [], waitingOnSlots: [], total: ids.length };
     for (const id of ids) {
-      const dep = await this.load(id);
+      const dep = index?.get(id) ?? (await this.load(id));
       if (!dep) {
         result.state = "blocked";
         result.blockedBy = `dependency ${id} no longer exists`;
@@ -571,33 +1161,36 @@ export class Company extends EventEmitter {
         result.blockedBy = `"${dep.context.title}" was rejected — retry it to unblock this task`;
       } else {
         if (result.state === "ready") result.state = "waiting";
-        result.waitingOn.push(`${dep.slotId ?? "?"} ${dep.context.title}`);
+        const slot = dep.slotId ?? this.slotOf(dep.id) ?? "?";
+        result.waitingOn.push(`${slot} ${dep.context.title}`);
+        result.waitingOnSlots.push(slot);
       }
     }
     return result;
   }
 
   private async findDependents(taskId: string): Promise<TaskRecord[]> {
-    const out: TaskRecord[] = [];
-    for (const ids of Object.values(this.state.slots)) {
-      for (const id of ids) {
-        const t = await this.load(id);
-        if (t?.dependsOn?.includes(taskId)) out.push(t);
-      }
-    }
-    return out;
+    const idx = await this.index();
+    return this.dependentsIndex(idx).get(taskId) ?? [];
+  }
+
+  private dependentsIndex(idx: Index): Map<string, TaskRecord[]> {
+    const map = new Map<string, TaskRecord[]>();
+    for (const t of idx.values()) for (const d of t.dependsOn ?? []) map.set(d, [...(map.get(d) ?? []), t]);
+    return map;
   }
 
   private async generatePlan(plan: WorkPlanRecord, revision?: { feedback: string; previous?: WorkPlan }): Promise<void> {
     const key = `plan:${plan.id}`;
     this.planPhase = "Claude is drafting";
+    this.planController = new AbortController();
     try {
       const res = await draftAndReviewPlan({ claude: this.agents.claude, gemini: this.agents.gemini }, plan.goal, DEPARTMENTS, {
         maxRounds: this.settings.planMaxRounds,
         limits: this.settings.planLimits,
         revisionFeedback: revision?.feedback,
         previous: revision?.previous,
-        send: { taskId: key, onChunk: (t) => this.onChunk(key, t) },
+        send: { taskId: key, onChunk: (t) => this.onChunk(key, t), signal: this.planController.signal },
         onRound: (round, phase) => {
           this.planPhase = phase === "draft" ? `Round ${round}: Claude is drafting` : `Round ${round}: Gemini is reviewing`;
           this.resetLive(key);
@@ -615,18 +1208,72 @@ export class Company extends EventEmitter {
       });
     } catch (err) {
       plan.status = "failed";
-      plan.error = (err as Error).message;
+      plan.error = this.planController.signal.aborted ? "Stopped by the CEO — retry to draft it again." : (err as Error).message;
     }
+    this.planController = null;
     this.planPhase = null;
     this.resetLive(key);
+    const usage = this.planUsage.get(key);
+    if (usage) plan.usage = { ...usage };
     if (this.state.activePlanId !== plan.id) plan.status = "discarded"; // reset while drafting
     await savePlan(plan);
     this.emitPlan();
   }
 
+  // ---------- usage & activity ----------
+
+  private recordCall(rec: CallRecord): void {
+    void appendCall(rec).catch((err) => console.error(`Could not log call for ${rec.taskId}: ${err.message}`));
+    const cost = rec.usage.costUsd ?? 0;
+    if (rec.taskId.startsWith("plan:")) {
+      const u = this.planUsage.get(rec.taskId) ?? { input: 0, output: 0, costUsd: 0 };
+      u.input += rec.usage.inputTokens;
+      u.output += rec.usage.outputTokens;
+      u.costUsd += cost;
+      this.planUsage.set(rec.taskId, u);
+      this.emitControl();
+      return;
+    }
+    const run = this.currentRun.get(rec.taskId);
+    if (!run) return;
+    run.inputTokens += rec.usage.inputTokens;
+    run.outputTokens += rec.usage.outputTokens;
+    run.costUsd += cost;
+    run.waitMs += rec.waitMs;
+    run.estimated ||= Boolean(rec.usage.estimated) || rec.usage.costUsd === undefined;
+    if (!run.engines.includes(rec.engine)) run.engines.push(rec.engine);
+    const by = (run.usageByEngine ??= {});
+    const e = (by[rec.engine] ??= { inputTokens: 0, outputTokens: 0, costUsd: 0 });
+    e.inputTokens += rec.usage.inputTokens;
+    e.outputTokens += rec.usage.outputTokens;
+    e.costUsd += cost;
+  }
+
+  private addUsage(t: Telemetry, run: StageRun): void {
+    t.tokensEstimated ||= run.estimated && run.inputTokens + run.outputTokens > 0;
+    for (const [engine, u] of Object.entries(run.usageByEngine ?? {})) {
+      this.addEngineUsage(t, engine, u.inputTokens, u.outputTokens, u.costUsd);
+      if (engine === "muse" || u.costUsd === 0) t.costPartial = true;
+    }
+  }
+
+  private addEngineUsage(t: Telemetry, engine: string, input: number, output: number, costUsd: number): void {
+    t.tokens.input += input;
+    t.tokens.output += output;
+    t.costUsd += costUsd;
+    const e = (t.byEngine[engine] ??= { input: 0, output: 0, costUsd: 0 });
+    e.input += input;
+    e.output += output;
+    e.costUsd += costUsd;
+  }
+
   // ---------- helpers ----------
 
-  private async activePlan(): Promise<WorkPlanRecord | undefined> {
+  private requireSlot(slotId: string): void {
+    if (!SLOTS.some((s) => s.id === slotId)) throw new UserError(`Không có nhân sự ${slotId}.`);
+  }
+
+  private async activePlan(): Promise<(WorkPlanRecord & { usage?: { input: number; output: number; costUsd: number } }) | undefined> {
     return this.state.activePlanId ? loadPlan(this.state.activePlanId) : undefined;
   }
 
@@ -642,6 +1289,18 @@ export class Company extends EventEmitter {
     }
   }
 
+  /** Every assigned task, loaded once — snapshots use this instead of re-reading files per lookup. */
+  private async index(): Promise<Index> {
+    const idx: Index = new Map();
+    for (const ids of Object.values(this.state.slots)) {
+      for (const id of ids) {
+        const t = await this.load(id);
+        if (t) idx.set(id, t);
+      }
+    }
+    return idx;
+  }
+
   private async mutateState(fn: (s: DashboardState) => void): Promise<void> {
     fn(this.state);
     const snapshot = JSON.parse(JSON.stringify(this.state)) as DashboardState;
@@ -650,8 +1309,11 @@ export class Company extends EventEmitter {
   }
 
   private async withEngine<T>(engine: EngineName, id: string, fn: () => Promise<T>): Promise<T> {
+    const waitStart = Date.now();
     this.pushActivity(id, engine, "waiting");
     const release = await this.engines[engine].acquire();
+    const run = this.currentRun.get(id);
+    if (run) run.waitMs += Date.now() - waitStart;
     this.markRunning(id, engine);
     try {
       return await fn();
@@ -663,7 +1325,7 @@ export class Company extends EventEmitter {
 
   private pushActivity(id: string, engine: EngineName, state: Activity["state"]): void {
     const stack = this.activity.get(id) ?? [];
-    stack.push({ engine, state, since: new Date().toISOString() });
+    stack.push({ engine, state, since: nowIso() });
     this.activity.set(id, stack);
     this.emitActivity(id);
   }
@@ -673,9 +1335,9 @@ export class Company extends EventEmitter {
     const entry = [...stack].reverse().find((a) => a.engine === engine && a.state === "waiting");
     if (entry) {
       entry.state = "running";
-      entry.since = new Date().toISOString();
+      entry.since = nowIso();
     } else {
-      stack.push({ engine, state: "running", since: new Date().toISOString() });
+      stack.push({ engine, state: "running", since: nowIso() });
       this.activity.set(id, stack);
     }
     this.emitActivity(id);
@@ -716,6 +1378,11 @@ export class Company extends EventEmitter {
 
   private emitPlan(): void {
     this.emit("plan");
+    this.emit("slot", BOSS_ID);
+  }
+
+  private emitControl(): void {
+    this.emit("control");
     this.emit("slot", BOSS_ID);
   }
 
@@ -768,19 +1435,15 @@ export class Company extends EventEmitter {
     }
   }
 
-  private async taskSnapshot(task: TaskRecord): Promise<TaskSnapshot> {
+  private async taskSnapshot(task: TaskRecord, idx: Index): Promise<TaskSnapshot> {
     const status = deriveStatus(task.stage);
     const isRunning = this.workers.has(task.id);
-    const deps = await this.dependencyState(task);
-    let queueState: QueueState;
-    if (isRunning) queueState = "running";
-    else if (task.lastError) queueState = "error";
-    else if (isWaitingForHuman(task)) queueState = "waiting_you";
-    else if (task.stage === "done") queueState = "done";
-    else if (task.stage === "rejected") queueState = "rejected";
-    else if (deps.state === "blocked") queueState = "blocked";
-    else if (deps.state === "waiting") queueState = "waiting_deps";
-    else queueState = "queued";
+    const deps = await this.dependencyState(task, idx);
+    const queueState = this.queueStateOf(task, deps);
+    const runs = task.runs ?? [];
+    const last = runs.at(-1);
+    const dependents = this.dependentsIndex(idx).get(task.id) ?? [];
+    const assign = task.trace?.find((t) => t.kind === "assign");
 
     return {
       id: task.id,
@@ -789,21 +1452,78 @@ export class Company extends EventEmitter {
       label: status.label,
       // A planned task "sits at" architecture before it has started; don't color it as if it were planning.
       colorClass: queueState === "queued" || queueState === "waiting_deps" || queueState === "blocked" ? "gray" : status.colorClass,
-      progress: status.progress,
+      progress: isTerminal(task) ? 100 : status.progress,
       queueState,
-      waitingForYou: isWaitingForHuman(task) && !isRunning,
+      waitingForYou: queueState === "waiting_you",
       checkpointBrief: task.stage === "checkpoint_idea" ? task.context.ideaBrief : undefined,
       lastFeedback: task.context.reviewFeedback?.length ? task.context.reviewFeedback.join("\n").slice(0, 1500) : undefined,
       lastError: task.lastError ? `${task.lastError.stage}: ${task.lastError.message}`.slice(0, 1500) : undefined,
       logs: task.history.slice(-4).map((h) => ({ at: hhmm(h.at), text: h.summary })),
       acceptanceCriteria: task.context.acceptanceCriteria ?? [],
       deps: { total: deps.total, ready: deps.handoffs.length, waitingOn: deps.waitingOn, blockedBy: deps.blockedBy },
+      inputsFrom: (task.dependsOn ?? [])
+        .map((id) => idx.get(id))
+        .filter((d): d is TaskRecord => Boolean(d))
+        .map((d) => ({ slotId: d.slotId ?? this.slotOf(d.id) ?? "?", title: d.context.title, handedOff: Boolean(d.handoff) })),
+      outputsTo: dependents.map((d) => ({ slotId: d.slotId ?? this.slotOf(d.id) ?? "?", title: d.context.title })),
       activity: this.currentActivity(task.id),
       stageStartedAt: isRunning ? task.stageStartedAt : undefined,
       liveTail: this.liveTail.get(task.id) ?? "",
       liveTotal: this.liveTotal.get(task.id) ?? 0,
       planRef: task.planRef,
       handedOff: Boolean(task.handoff),
+      gated: this.isGated(task),
+      lastRun: last
+        ? {
+            stage: last.stage,
+            durationMs: ms(last.startedAt, last.endedAt),
+            waitMs: last.waitMs,
+            tokens: last.inputTokens + last.outputTokens,
+            costUsd: last.costUsd,
+            estimated: last.estimated,
+            outcome: last.outcome,
+          }
+        : null,
+      totals: {
+        tokens: runs.reduce((s, r) => s + r.inputTokens + r.outputTokens, 0),
+        costUsd: runs.reduce((s, r) => s + r.costUsd, 0),
+        activeMs: runs.reduce((s, r) => s + Math.max(0, ms(r.startedAt, r.endedAt) - r.waitMs), 0),
+        runs: runs.length,
+      },
+      redoPending: Boolean(task.redoRequested),
+      assignedBy: assign?.by,
     };
   }
+}
+
+const ENGINE_PHASE: Record<string, string> = {
+  claude: "Claude (phân tích/duyệt)",
+  gemini: "Gemini (thẩm định)",
+  muse: "khâu Kỹ thuật (Muse)",
+  workspace: "khâu Kỹ thuật/Kiểm thử (thư mục dự án)",
+};
+
+/** The dashboard's workflow columns. */
+export function workflowPhase(stage: Stage): string {
+  switch (stage) {
+    case "ideation":
+    case "checkpoint_idea":
+    case "architecture":
+    case "architecture_review":
+      return "Phân tích";
+    case "implementation":
+      return "Kỹ thuật";
+    case "verification":
+    case "review_gemini":
+    case "review_claude":
+      return "Kiểm thử";
+    case "checkpoint_final":
+      return "Chờ duyệt";
+    default:
+      return "Xuất bản";
+  }
+}
+
+export function isUserError(err: unknown): boolean {
+  return err instanceof UserError;
 }

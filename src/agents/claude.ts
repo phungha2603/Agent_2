@@ -1,7 +1,7 @@
-import type { Agent, AgentResponse, SendOptions, TaskContext } from "../types.js";
+import type { Agent, AgentResponse, SendOptions, TaskContext, Usage } from "../types.js";
 import { formatContext } from "./context.js";
 import { HttpStatusError, withRetry } from "./retry.js";
-import { SseDecoder, anthropicChunkText } from "./streamParsers.js";
+import { SseDecoder, anthropicChunkText, anthropicInputTokens, anthropicStreamUsage } from "./streamParsers.js";
 
 const DEFAULT_MODEL = "claude-sonnet-5";
 // Architecture guides are meant to be step-by-step and exhaustive; 2048
@@ -20,10 +20,11 @@ export function createClaudeAgent(opts: { apiKey: string; model?: string }): Age
     async send(prompt: string, context: TaskContext, sendOpts?: SendOptions): Promise<AgentResponse> {
       const onChunk = sendOpts?.onChunk;
       let attempt = 0;
-      const text = await withRetry(async () => {
+      const { text, usage } = await withRetry(async () => {
         if (attempt++ > 0) onChunk?.("\n…(retrying)…\n");
         const res = await fetch("https://api.anthropic.com/v1/messages", {
           method: "POST",
+          signal: sendOpts?.signal,
           headers: {
             "Content-Type": "application/json",
             "x-api-key": opts.apiKey,
@@ -41,13 +42,20 @@ export function createClaudeAgent(opts: { apiKey: string; model?: string }): Age
         }
         if (!onChunk) {
           const data = (await res.json()) as any;
-          return (data?.content ?? []).map((b: any) => b.text ?? "").join("");
+          const u: Usage | undefined = data?.usage
+            ? { inputTokens: anthropicInputTokens(data.usage), outputTokens: Number(data.usage.output_tokens ?? 0) }
+            : undefined;
+          return { text: (data?.content ?? []).map((b: any) => b.text ?? "").join(""), usage: u };
         }
         const decoder = new SseDecoder();
         const utf8 = new TextDecoder();
         let full = "";
+        const u: Usage = { inputTokens: 0, outputTokens: 0 };
         for await (const chunk of res.body as unknown as AsyncIterable<Uint8Array>) {
           for (const payload of decoder.push(utf8.decode(chunk, { stream: true }))) {
+            const counts = anthropicStreamUsage(payload);
+            if (counts.inputTokens !== undefined) u.inputTokens = counts.inputTokens;
+            if (counts.outputTokens !== undefined) u.outputTokens = counts.outputTokens;
             const piece = anthropicChunkText(payload);
             if (piece) {
               full += piece;
@@ -55,12 +63,12 @@ export function createClaudeAgent(opts: { apiKey: string; model?: string }): Age
             }
           }
         }
-        return full;
+        return { text: full, usage: u };
       });
       const verdict = prompt.startsWith("REVIEW:")
         ? (/\breject\b/i.test(text) ? "reject" : "approve")
         : undefined;
-      return { role: "claude", content: text, verdict };
+      return { role: "claude", content: text, verdict, usage };
     },
   };
 }

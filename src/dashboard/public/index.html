@@ -8,27 +8,82 @@
 </head>
 <body>
   <header class="topbar">
-    <div class="topbar-title">
-      <h1>AI Agent Company — Sơ Đồ 10 Nhân Sự</h1>
-      <p class="topbar-sub">"Chạy luồng cả công ty" giao mục tiêu cho Sếp (AG-01): Sếp lập cây công việc (Epic → Subtask + tiêu chí nghiệm thu), Gemini thẩm định, bạn duyệt một lần rồi cả đội chạy.</p>
+    <div class="brand">
+      <h1>AI Agent Company</h1>
+      <p class="topbar-sub">Sếp (AG-01) lập cây công việc → Gemini thẩm định → bạn duyệt → cả đội chạy song song, bàn giao cho nhau, bạn chốt từng kết quả.</p>
     </div>
-    <div class="topbar-controls">
+    <div class="command">
       <input id="goal-input" type="text" placeholder="Mục tiêu, ví dụ: Xây dựng hệ thống phân tích dữ liệu & dashboard theo dõi vận hành" />
       <button id="run-all-btn" class="btn btn-primary">▶ Chạy luồng cả công ty</button>
-      <button id="approve-all-btn" class="btn btn-approve" hidden></button>
+      <button id="pause-btn" class="btn btn-ghost" title="Không bắt đầu bước mới; các lượt đang chạy được làm nốt">⏸ Pause</button>
+      <button id="stop-btn" class="btn btn-ghost btn-danger-ghost" title="Huỷ ngay mọi lượt đang chạy (bước đó sẽ chạy lại khi Resume)">⏹ Stop</button>
       <button id="reset-btn" class="btn btn-ghost">Reset</button>
+      <button id="approve-all-btn" class="btn btn-approve" hidden></button>
     </div>
   </header>
 
-  <div class="engines-bar">
-    <span class="engines-label">Công suất</span>
-    <div id="engines" class="engines"></div>
+  <section class="telemetry" id="telemetry" aria-label="Tóm tắt luồng chạy"></section>
+
+  <section class="steer-bar">
+    <span class="bar-label">Chỉ thị cả đội</span>
+    <input id="company-steer" type="text" placeholder="Ví dụ: Mọi giao diện viết bằng tiếng Việt; ưu tiên hiệu năng hơn tính năng phụ" />
+    <label class="check"><input type="checkbox" id="company-redo" /> làm lại phần đã thiết kế</label>
+    <button id="company-steer-btn" class="btn btn-small-inline">Gửi chỉ thị</button>
+    <div id="company-directives" class="directive-chips"></div>
+  </section>
+
+  <nav class="viewbar">
+    <div class="tabs" role="tablist">
+      <button class="tab active" data-action="view" data-view="org">Sơ đồ tổ chức</button>
+      <button class="tab" data-action="view" data-view="flow">Dòng chảy</button>
+      <button class="tab" data-action="view" data-view="timeline">Timeline</button>
+      <button class="tab" data-action="view" data-view="artifacts">Sản phẩm</button>
+    </div>
+    <div class="filters" id="filters">
+      <button class="filter active" data-action="filter" data-filter="all">Tất cả</button>
+      <button class="filter" data-action="filter" data-filter="running">Đang chạy</button>
+      <button class="filter" data-action="filter" data-filter="attention">Cần duyệt / Lỗi</button>
+      <button class="filter" data-action="filter" data-filter="done">Đã xong</button>
+      <button class="filter toggle" id="edges-toggle" data-action="toggle-edges" title="Hiện mọi đường giao việc/bàn giao giữa các nhân sự">↔ Đường nối</button>
+    </div>
     <span id="conn" class="conn"></span>
-  </div>
+  </nav>
 
-  <section id="plan-panel" class="plan-panel" hidden></section>
+  <main>
+    <section id="view-org" class="view">
+      <div id="org" class="org">
+        <svg id="edges" class="edges" aria-hidden="true">
+          <defs>
+            <marker id="arrow-done" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="m-done" /></marker>
+            <marker id="arrow-pending" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="m-pending" /></marker>
+            <marker id="arrow-assign" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="m-assign" /></marker>
+          </defs>
+        </svg>
+        <section class="tier">
+          <h2 class="tier-heading tier-heading-1">Sếp</h2>
+          <div class="tier-row row-boss" id="row-1"><aside id="plan-panel" class="side-panel plan-panel"></aside></div>
+        </section>
+        <section class="tier">
+          <h2 class="tier-heading tier-heading-2">Trưởng nhóm</h2>
+          <div class="tier-row row-leads" id="row-2"><aside id="flow-panel" class="side-panel flow-panel"></aside></div>
+        </section>
+        <section class="tier">
+          <h2 class="tier-heading">Nhân viên</h2>
+          <div class="tier-grid" id="row-3"></div>
+        </section>
+      </div>
+    </section>
 
-  <main id="grid"></main>
+    <section id="view-flow" class="view" hidden></section>
+    <section id="view-timeline" class="view" hidden></section>
+    <section id="view-artifacts" class="view" hidden></section>
+  </main>
+
+  <div id="drawer-backdrop" class="backdrop" hidden></div>
+  <aside id="drawer" class="drawer" hidden aria-label="Chi tiết task"></aside>
+
+  <div id="modal-backdrop" class="backdrop" hidden></div>
+  <div id="modal" class="modal" hidden role="dialog"></div>
 
   <div id="toast" class="toast" hidden></div>
 

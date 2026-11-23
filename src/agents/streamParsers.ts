@@ -1,3 +1,5 @@
+import type { Usage } from "../types.js";
+
 /**
  * Incremental Server-Sent Events decoder: feed it raw text chunks as they
  * arrive, get back the complete `data:` payloads (an event's multiple data
@@ -49,6 +51,29 @@ export class LineDecoder {
   }
 }
 
+/** Token counts in a Gemini (stream or not) response, from usageMetadata, if present. */
+export function geminiUsageOf(data: any): Usage | undefined {
+  const m = data?.usageMetadata;
+  if (!m) return undefined;
+  return {
+    inputTokens: Number(m.promptTokenCount ?? 0),
+    outputTokens: Number(m.candidatesTokenCount ?? 0) + Number(m.thoughtsTokenCount ?? 0),
+  };
+}
+
+/** Anthropic usage blocks count cached input separately; it's still input. */
+export function anthropicInputTokens(u: any): number {
+  return Number(u?.input_tokens ?? 0) + Number(u?.cache_creation_input_tokens ?? 0) + Number(u?.cache_read_input_tokens ?? 0);
+}
+
+/** Usage carried by an Anthropic stream event: message_start has input, message_delta has output. */
+export function anthropicStreamUsage(payload: string): { inputTokens?: number; outputTokens?: number } {
+  const data = JSON.parse(payload);
+  if (data?.type === "message_start" && data.message?.usage) return { inputTokens: anthropicInputTokens(data.message.usage) };
+  if (data?.type === "message_delta" && data.usage?.output_tokens !== undefined) return { outputTokens: Number(data.usage.output_tokens) };
+  return {};
+}
+
 /** Text in one streamGenerateContent SSE payload (a partial GenerateContentResponse). */
 export function geminiChunkText(payload: string): string {
   const data = JSON.parse(payload);
@@ -71,8 +96,8 @@ export interface ClaudeCliEvent {
   tools?: string[];
   /** Text of a completed assistant turn — a fallback when there are no partial deltas. */
   assistantText?: string;
-  /** The final result line. */
-  result?: { text: string; isError: boolean };
+  /** The final result line, with the usage and (API-equivalent) cost the CLI reports. */
+  result?: { text: string; isError: boolean; usage?: Usage };
 }
 
 /** One line of `claude -p --output-format stream-json --verbose [--include-partial-messages]`. */
@@ -96,7 +121,14 @@ export function parseClaudeCliLine(line: string): ClaudeCliEvent {
   }
   if (obj?.type === "result") {
     const isError = obj.is_error === true || (typeof obj.subtype === "string" && obj.subtype !== "success");
-    return { result: { text: typeof obj.result === "string" ? obj.result : "", isError } };
+    const usage: Usage | undefined = obj.usage
+      ? {
+          inputTokens: anthropicInputTokens(obj.usage),
+          outputTokens: Number(obj.usage.output_tokens ?? 0),
+          costUsd: typeof obj.total_cost_usd === "number" ? obj.total_cost_usd : undefined,
+        }
+      : undefined;
+    return { result: { text: typeof obj.result === "string" ? obj.result : "", isError, usage } };
   }
   return {};
 }
