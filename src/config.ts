@@ -23,6 +23,15 @@ function claudeProvider(): "api" | "cli" | "mock" {
   return v === "api" || v === "cli" ? v : "mock";
 }
 
+/** GEMINI_API_KEYS="k1,k2,k3" for a key pool that auto-rotates on 429; falls back to a single GEMINI_API_KEY. */
+function geminiApiKeys(): string[] {
+  const pool = (process.env.GEMINI_API_KEYS ?? "")
+    .split(",")
+    .map((s) => s.trim())
+    .filter(Boolean);
+  return pool.length ? pool : [requireEnv("GEMINI_API_KEY")];
+}
+
 function verifyCwd(): string {
   return process.env.VERIFY_CWD ?? process.cwd();
 }
@@ -56,7 +65,7 @@ export function buildProjectConfigSnapshot(): ProjectConfig {
 export function buildAgents(): Agents {
   const gemini =
     provider("GEMINI_PROVIDER") === "real"
-      ? createGeminiAgent({ apiKey: requireEnv("GEMINI_API_KEY"), model: process.env.GEMINI_MODEL })
+      ? createGeminiAgent({ apiKeys: geminiApiKeys(), model: process.env.GEMINI_MODEL })
       : createMockAgent("gemini");
 
   const claudeMode = claudeProvider();
@@ -143,7 +152,7 @@ function price(name: string): Price | undefined {
 
 /**
  * Enabled by setting REFERENCE_IMAGE_PROMPT — everything else has a
- * sensible default. Needs GEMINI_API_KEY regardless of GEMINI_PROVIDER,
+ * sensible default. Needs GEMINI_API_KEY(S) regardless of GEMINI_PROVIDER,
  * since image generation is a separate use of the Gemini API. This is the
  * live/default config; which task actually uses which parts of it goes
  * through resolveVisual() in the pipeline against each task's own
@@ -154,7 +163,7 @@ function buildVisualConfig(): VisualConfig | undefined {
   if (!referenceImagePrompt) return undefined;
 
   const imageGenerator = createGeminiImageGenerator({
-    apiKey: requireEnv("GEMINI_API_KEY"),
+    apiKeys: geminiApiKeys(),
     model: process.env.GEMINI_IMAGE_MODEL,
   });
 

@@ -62,3 +62,51 @@ export class HttpStatusError extends Error {
     this.retryAfterMs = retryAfterMs;
   }
 }
+
+/** Rotates through a pool of API keys, remembering which one is "current" across calls. */
+export interface KeyPool {
+  readonly size: number;
+  current(): string;
+  /** Advances to the next key (wraps around) — call this after a 429 on the current one. */
+  rotate(): void;
+}
+
+export function createKeyPool(keys: string[]): KeyPool {
+  if (keys.length === 0) throw new Error("createKeyPool requires at least one key");
+  let i = 0;
+  return {
+    get size() {
+      return keys.length;
+    },
+    current() {
+      return keys[i];
+    },
+    rotate() {
+      i = (i + 1) % keys.length;
+    },
+  };
+}
+
+/**
+ * Runs `fn` with the pool's current key. On a 429 it rotates to the next key
+ * and retries immediately (no backoff — a sibling key's quota is unrelated),
+ * up to once per key in the pool. If every key is rate-limited, rethrows the
+ * last error so the caller's own retry/backoff (e.g. withRetry) takes over.
+ */
+export async function withKeyRotation<T>(pool: KeyPool, fn: (apiKey: string) => Promise<T>): Promise<T> {
+  let lastErr: unknown;
+  for (let i = 0; i < pool.size; i++) {
+    const apiKey = pool.current();
+    try {
+      return await fn(apiKey);
+    } catch (err) {
+      lastErr = err;
+      if ((err as { status?: number } | undefined)?.status === 429 && pool.size > 1) {
+        pool.rotate();
+        continue;
+      }
+      throw err;
+    }
+  }
+  throw lastErr;
+}

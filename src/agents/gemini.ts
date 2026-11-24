@@ -1,7 +1,7 @@
 import type { Agent, AgentResponse, SendOptions, TaskContext, Usage } from "../types.js";
 import { formatContext } from "./context.js";
 import { readImageParts } from "./imageParts.js";
-import { HttpStatusError, withRetry } from "./retry.js";
+import { HttpStatusError, createKeyPool, withKeyRotation, withRetry } from "./retry.js";
 import { SseDecoder, geminiChunkText, geminiUsageOf } from "./streamParsers.js";
 
 const DEFAULT_MODEL = "gemini-2.5-pro";
@@ -26,8 +26,9 @@ export function parseGoogleRetryDelayMs(errorBodyText: string): number | undefin
  * streamGenerateContent (SSE) so the dashboard can show the reply as it's
  * written; without one it uses plain generateContent.
  */
-export function createGeminiAgent(opts: { apiKey: string; model?: string }): Agent {
+export function createGeminiAgent(opts: { apiKeys: string[]; model?: string }): Agent {
   const model = opts.model ?? DEFAULT_MODEL;
+  const keyPool = createKeyPool(opts.apiKeys);
   return {
     role: "gemini",
     async send(prompt: string, context: TaskContext, sendOpts?: SendOptions): Promise<AgentResponse> {
@@ -37,12 +38,10 @@ export function createGeminiAgent(opts: { apiKey: string; model?: string }): Age
         parts.push(...(await readImageParts("Actual screenshot of the running implementation:", context.implementationScreenshotPath)));
       }
       const body = JSON.stringify({ contents: [{ role: "user", parts }] });
-      const headers = { "Content-Type": "application/json", "x-goog-api-key": opts.apiKey };
       const onChunk = sendOpts?.onChunk;
 
-      let attempt = 0;
-      const { text, usage } = await withRetry(async () => {
-        if (attempt++ > 0) onChunk?.("\n…(retrying)…\n");
+      async function requestWithKey(apiKey: string): Promise<{ text: string; usage?: Usage }> {
+        const headers = { "Content-Type": "application/json", "x-goog-api-key": apiKey };
         const base = `https://generativelanguage.googleapis.com/v1beta/models/${model}`;
         const url = onChunk ? `${base}:streamGenerateContent?alt=sse` : `${base}:generateContent`;
         const res = await fetch(url, { method: "POST", headers, body, signal: sendOpts?.signal });
@@ -72,6 +71,12 @@ export function createGeminiAgent(opts: { apiKey: string; model?: string }): Age
         }
         decoder.flush().forEach(consume);
         return { text: full, usage: lastUsage };
+      }
+
+      let attempt = 0;
+      const { text, usage } = await withRetry(async () => {
+        if (attempt++ > 0) onChunk?.("\n…(retrying)…\n");
+        return withKeyRotation(keyPool, requestWithKey);
       });
 
       const verdict = prompt.startsWith("REVIEW:")

@@ -96,7 +96,10 @@ in `.env` as you wire each one up, with these keys:
 - **Gemini** — `GEMINI_API_KEY` (Google AI Studio key). Flash/Flash-Lite
   models have the most generous free tier; Pro is more capable but has a
   much tighter (or no) free quota — check what's free for your account at
-  https://aistudio.google.com.
+  https://aistudio.google.com. With more than one Google account, set
+  `GEMINI_API_KEYS=key1,key2,key3` instead — on a 429 it rotates to the next
+  key immediately (no backoff wait) and sticks with it until that one also
+  rate-limits.
 - **Claude** — two ways to run it, no code change needed:
   - `CLAUDE_PROVIDER=api` + `ANTHROPIC_API_KEY` — calls `api.anthropic.com`
     directly, billed per token via the Claude Console (separate from any

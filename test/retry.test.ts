@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from "vitest";
-import { HttpStatusError, isTransientApiError, withRetry } from "../src/agents/retry.js";
+import { HttpStatusError, createKeyPool, isTransientApiError, withKeyRotation, withRetry } from "../src/agents/retry.js";
 
 describe("withRetry", () => {
   it("retries transient errors and eventually succeeds", async () => {
@@ -78,6 +78,63 @@ describe("withRetry", () => {
     );
     expect(result).toBe("ok");
     expect(calls).toBe(2);
+  });
+});
+
+describe("withKeyRotation", () => {
+  it("rotates to the next key on 429 and succeeds without touching withRetry's backoff", async () => {
+    const pool = createKeyPool(["k1", "k2", "k3"]);
+    const tried: string[] = [];
+    const result = await withKeyRotation(pool, async (key) => {
+      tried.push(key);
+      if (key !== "k3") throw new HttpStatusError(429, "rate limited");
+      return "ok";
+    });
+    expect(result).toBe("ok");
+    expect(tried).toEqual(["k1", "k2", "k3"]);
+    expect(pool.current()).toBe("k3"); // sticks with the working key for the next call
+  });
+
+  it("does not rotate on a non-429 error", async () => {
+    const pool = createKeyPool(["k1", "k2"]);
+    let calls = 0;
+    await expect(
+      withKeyRotation(pool, async () => {
+        calls += 1;
+        throw new HttpStatusError(401, "unauthorized");
+      }),
+    ).rejects.toThrow("unauthorized");
+    expect(calls).toBe(1);
+    expect(pool.current()).toBe("k1");
+  });
+
+  it("rethrows once every key in the pool has 429'd", async () => {
+    const pool = createKeyPool(["k1", "k2"]);
+    let calls = 0;
+    await expect(
+      withKeyRotation(pool, async () => {
+        calls += 1;
+        throw new HttpStatusError(429, "rate limited");
+      }),
+    ).rejects.toThrow("rate limited");
+    expect(calls).toBe(2);
+  });
+
+  it("combines with withRetry: exhausts the pool, backs off, then retries the whole cycle", async () => {
+    const pool = createKeyPool(["k1", "k2"]);
+    let calls = 0;
+    const result = await withRetry(
+      () =>
+        withKeyRotation(pool, async (key) => {
+          calls += 1;
+          // Both keys fail once; the second cycle (after backoff) succeeds on k1.
+          if (calls <= 2) throw new HttpStatusError(429, "rate limited");
+          return key;
+        }),
+      { baseDelayMs: 1 },
+    );
+    expect(result).toBe("k1");
+    expect(calls).toBe(3);
   });
 });
 
