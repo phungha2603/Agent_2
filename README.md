@@ -357,6 +357,20 @@ The dashboard runs on `src/orchestrator/scheduler.ts` (`Company`).
   team produced: preview, download, or forward to another staff member as
   input material). Filters: Đang chạy, Cần duyệt / Lỗi, Đã xong.
 
+### Token usage
+
+- **Claude CLI runs lean by default** (`CLAUDE_CLI_TOOLS`): built-in tools, MCP
+  servers and skills are switched off, because every default `claude -p` call
+  carried ~37,000 input tokens of them (measured with a one-word prompt) and
+  this pipeline sends everything the model needs in the prompt. Lean is ~3,000.
+  Allow `Read,Grep,Glob` if you want Claude to open project files itself, or
+  `default` for the old behaviour. An older CLI that rejects the flags falls
+  back to the full CLI automatically.
+- **`npm run usage`** reads `data/calls` and prints where tokens went: per
+  stage, per engine, the costliest tasks and the biggest single calls.
+- Loop caps that bound spend: `MAX_ARCHITECTURE_ROUNDS`, `PLAN_MAX_REVIEW_ROUNDS`,
+  `MAX_IMPLEMENTATION_ATTEMPTS`, `MAX_REVIEW_REJECTIONS`, `MAX_AUTO_RECOVERIES`.
+
 ### Context pruning
 
 Each stage sends its agent only what that stage acts on

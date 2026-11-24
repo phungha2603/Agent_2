@@ -70,6 +70,8 @@ export function buildAgents(): Agents {
             cwd: verifyCwd(),
             stream: (process.env.CLAUDE_CLI_STREAM ?? "1") !== "0",
             timeoutSec: num("CLAUDE_CLI_TIMEOUT_SEC", 900),
+            // Unset/empty = no tools (lean, ~12x fewer baseline tokens per call); "Read,Grep,Glob"; or "default" for the full CLI.
+            tools: process.env.CLAUDE_CLI_TOOLS ?? "",
           })
         : createMockAgent("claude");
 

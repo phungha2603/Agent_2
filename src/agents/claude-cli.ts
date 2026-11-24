@@ -4,6 +4,7 @@ import { formatContext } from "./context.js";
 import { LineDecoder, parseClaudeCliLine } from "./streamParsers.js";
 
 class StreamFlagsUnsupported extends Error {}
+class LeanFlagsUnsupported extends Error {}
 
 interface ProcessResult {
   code: number | null;
@@ -86,14 +87,28 @@ function runCli(
  * API billing. Streams token-by-token via --output-format stream-json; if
  * the installed CLI doesn't know those flags, falls back to plain output
  * for the rest of the process's life.
+ *
+ * Token overhead: a default `claude -p` call carries Claude Code's whole
+ * tool set, skills and MCP servers in its prompt — about 37,000 input tokens
+ * for a one-word question, measured. This pipeline sends everything the
+ * model needs in the prompt, so by default the built-in tools, MCP servers
+ * and skills are switched off (~3,000 tokens, measured): `tools` = "" (the
+ * default) is that lean mode, "Read,Grep,Glob" lets Claude open files from
+ * the project itself (roughly 6,000-15,000 depending on the CLI's cache),
+ * and "default" restores the full CLI.
  */
 export function createClaudeCliAgent(
-  opts: { command?: string; model?: string; cwd?: string; stream?: boolean; timeoutSec?: number } = {},
+  opts: { command?: string; model?: string; cwd?: string; stream?: boolean; timeoutSec?: number; tools?: string } = {},
 ): Agent {
   const bin = opts.command ?? "claude";
   const timeoutMs = (opts.timeoutSec ?? 900) * 1000;
   const modelArgs = opts.model ? ["--model", opts.model] : [];
   let streaming = opts.stream ?? true;
+  const toolsSetting = opts.tools ?? "";
+  // An old CLI that doesn't know these flags falls back to the full CLI instead of failing every call.
+  let lean = toolsSetting !== "default";
+  const leanArgs = () =>
+    lean ? ["--tools", toolsSetting, "--strict-mcp-config", "--mcp-config", '{"mcpServers":{}}', "--disable-slash-commands"] : [];
 
   async function runStreaming(input: string, onChunk?: (t: string) => void, signal?: AbortSignal): Promise<{ text: string; usage?: Usage }> {
     const lines = new LineDecoder();
@@ -117,7 +132,7 @@ export function createClaudeCliAgent(
     };
     const proc = await runCli(
       bin,
-      ["-p", "--output-format", "stream-json", "--verbose", "--include-partial-messages", ...modelArgs],
+      ["-p", "--output-format", "stream-json", "--verbose", "--include-partial-messages", ...modelArgs, ...leanArgs()],
       input,
       opts.cwd,
       timeoutMs,
@@ -126,6 +141,7 @@ export function createClaudeCliAgent(
     );
     lines.flush().forEach(handle);
     if (!result && proc.code !== 0) {
+      if (lean && /unknown option[^\n]*(--tools|--strict-mcp-config|--mcp-config|--disable-slash-commands)/i.test(proc.stderr)) throw new LeanFlagsUnsupported(proc.stderr);
       if (/unknown option|output-format|include-partial-messages|--verbose/i.test(proc.stderr)) throw new StreamFlagsUnsupported(proc.stderr);
       throw new Error(`claude CLI exited with code ${proc.code}: ${proc.stderr.slice(-2000)}`);
     }
@@ -134,8 +150,11 @@ export function createClaudeCliAgent(
   }
 
   async function runPlain(input: string, onChunk?: (t: string) => void, signal?: AbortSignal): Promise<{ text: string; usage?: Usage }> {
-    const proc = await runCli(bin, ["-p", ...modelArgs], input, opts.cwd, timeoutMs, undefined, signal);
-    if (proc.code !== 0) throw new Error(`claude CLI exited with code ${proc.code}: ${proc.stderr.slice(-2000)}`);
+    const proc = await runCli(bin, ["-p", ...modelArgs, ...leanArgs()], input, opts.cwd, timeoutMs, undefined, signal);
+    if (proc.code !== 0) {
+      if (lean && /unknown option[^\n]*(--tools|--strict-mcp-config|--mcp-config|--disable-slash-commands)/i.test(proc.stderr)) throw new LeanFlagsUnsupported(proc.stderr);
+      throw new Error(`claude CLI exited with code ${proc.code}: ${proc.stderr.slice(-2000)}`);
+    }
     const text = proc.stdout.trim();
     onChunk?.(text);
     return { text };
@@ -144,23 +163,28 @@ export function createClaudeCliAgent(
   return {
     role: "claude",
     async send(prompt: string, context: TaskContext, sendOpts?: SendOptions): Promise<AgentResponse> {
-      // Headless `claude -p` still has real tool access (Bash, Read, ...),
-      // so it can independently check the actual project on disk — but
-      // only if it's run from that project's directory, not wherever this
-      // orchestrator script happens to live.
+      // With tools enabled ("Read,Grep,Glob" or "default"), headless
+      // `claude -p` can check the actual project on disk — but only if it's
+      // run from that project's directory, which is why cwd is VERIFY_CWD.
       const input = `${prompt}\n\n${formatContext(context)}`;
       const signal = sendOpts?.signal;
-      let out: { text: string; usage?: Usage };
-      if (streaming) {
+      const attempt = async (): Promise<{ text: string; usage?: Usage }> => {
+        if (!streaming) return runPlain(input, sendOpts?.onChunk, signal);
         try {
-          out = await runStreaming(input, sendOpts?.onChunk, signal);
+          return await runStreaming(input, sendOpts?.onChunk, signal);
         } catch (err) {
           if (!(err instanceof StreamFlagsUnsupported)) throw err;
           streaming = false;
-          out = await runPlain(input, sendOpts?.onChunk, signal);
+          return runPlain(input, sendOpts?.onChunk, signal);
         }
-      } else {
-        out = await runPlain(input, sendOpts?.onChunk, signal);
+      };
+      let out: { text: string; usage?: Usage };
+      try {
+        out = await attempt();
+      } catch (err) {
+        if (!(err instanceof LeanFlagsUnsupported)) throw err;
+        lean = false;
+        out = await attempt();
       }
       const verdict = prompt.startsWith("REVIEW:")
         ? (/\breject\b/i.test(out.text) ? "reject" : "approve")
