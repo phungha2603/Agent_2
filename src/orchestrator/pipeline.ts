@@ -238,6 +238,52 @@ export function isTerminal(task: TaskRecord): boolean {
 }
 
 /**
+ * Asks Muse for the implementation and records the reply (and the bumped
+ * attempt count) on the task — no filesystem writes yet. Split out of the
+ * "implementation" stage so the scheduler can run this chat call without
+ * holding the shared workspace lock; only applyImplementation below, which
+ * actually touches disk, needs it.
+ */
+export async function draftImplementation(task: TaskRecord, agents: Agents, hooks: AdvanceHooks = {}): Promise<void> {
+  const opts: SendOptions = { onChunk: hooks.onChunk, taskId: task.id, signal: hooks.signal };
+  const feedback = task.context.reviewFeedback?.length
+    ? `\n\nAddress this feedback from the previous attempt:\n${task.context.reviewFeedback.join("\n")}`
+    : "";
+  const res = await agents.muse.send(PROMPTS.implementation + feedback, pruneContext("implementation", task.context), opts);
+  task.context.implementationDiff = res.content;
+  task.implementationAttempts += 1;
+}
+
+/**
+ * Writes the diff draftImplementation already fetched and moves on to
+ * verification. Touches the shared project directory — callers should hold
+ * the workspace lock across this (and, without releasing it in between,
+ * across the verification that immediately follows).
+ */
+export async function applyImplementation(task: TaskRecord, config: PipelineConfig): Promise<void> {
+  const files = parseFileBlocks(task.context.implementationDiff ?? "");
+  if (files.length === 0) {
+    task.context.implementationFiles = [];
+    log(
+      task,
+      task.stage,
+      "system",
+      `Implementation attempt #${task.implementationAttempts}: reply had no "FILE:" blocks — nothing was written to disk.`,
+    );
+  } else {
+    const written = await writeFiles(resolveVerify(task, config).cwd, files);
+    task.context.implementationFiles = written;
+    log(
+      task,
+      task.stage,
+      "muse",
+      `Implementation attempt #${task.implementationAttempts}: wrote ${written.length} file(s): ${written.join(", ")}.`,
+    );
+  }
+  task.stage = "verification";
+}
+
+/**
  * Runs the current stage's action and moves the task to its next stage.
  * Must not be called while isWaitingForHuman(task) or isTerminal(task) — use
  * resolveCheckpoint for the former.
@@ -287,33 +333,8 @@ export async function advance(task: TaskRecord, agents: Agents, config: Pipeline
     }
 
     case "implementation": {
-      const feedback = task.context.reviewFeedback?.length
-        ? `\n\nAddress this feedback from the previous attempt:\n${task.context.reviewFeedback.join("\n")}`
-        : "";
-      const res = await agents.muse.send(PROMPTS.implementation + feedback, ctx("implementation"), opts);
-      task.context.implementationDiff = res.content;
-      task.implementationAttempts += 1;
-
-      const files = parseFileBlocks(res.content);
-      if (files.length === 0) {
-        task.context.implementationFiles = [];
-        log(
-          task,
-          task.stage,
-          "system",
-          `Implementation attempt #${task.implementationAttempts}: reply had no "FILE:" blocks — nothing was written to disk.`,
-        );
-      } else {
-        const written = await writeFiles(resolveVerify(task, config).cwd, files);
-        task.context.implementationFiles = written;
-        log(
-          task,
-          task.stage,
-          "muse",
-          `Implementation attempt #${task.implementationAttempts}: wrote ${written.length} file(s): ${written.join(", ")}.`,
-        );
-      }
-      task.stage = "verification";
+      await draftImplementation(task, agents, hooks);
+      await applyImplementation(task, config);
       return task;
     }
 

@@ -4,7 +4,9 @@ import { Semaphore } from "./semaphore.js";
 import { limitAgent, type CallRecord, type EngineName, type Price } from "../agents/limited.js";
 import {
   advance,
+  applyImplementation,
   createTask,
+  draftImplementation,
   isTerminal,
   isWaitingForHuman,
   log,
@@ -1185,14 +1187,14 @@ export class Company extends EventEmitter {
 
   private async executeStage(task: TaskRecord, signal: AbortSignal): Promise<void> {
     const hooks = { onChunk: (text: string) => this.onChunk(task.id, text), signal };
-    if (task.stage !== "implementation" && task.stage !== "verification") {
-      await advance(task, this.agents, this.pipeline, hooks);
-      return;
-    }
-    await this.withEngine("workspace", task.id, async () => {
-      const wasImplementation = task.stage === "implementation";
-      await advance(task, this.agents, this.pipeline, hooks);
-      if (wasImplementation && task.stage === "verification") {
+
+    if (task.stage === "implementation") {
+      // Ask Muse for the diff first, without holding the workspace lock —
+      // only the disk write and the build/test that follows need it
+      // exclusive, not the (potentially long) chat call itself.
+      await draftImplementation(task, this.agents, hooks);
+      await this.withEngine("workspace", task.id, async () => {
+        await applyImplementation(task, this.pipeline);
         // Verify while still holding the workspace, so no other task's
         // files land between this task's write and its build.
         this.finishRun(task, "ok");
@@ -1201,8 +1203,15 @@ export class Company extends EventEmitter {
         this.emitTask(task);
         if (signal.aborted) throw Object.assign(new Error("stopped by the CEO"), { name: "AbortError" });
         await advance(task, this.agents, this.pipeline, hooks);
-      }
-    });
+      });
+      return;
+    }
+
+    if (task.stage !== "verification") {
+      await advance(task, this.agents, this.pipeline, hooks);
+      return;
+    }
+    await this.withEngine("workspace", task.id, () => advance(task, this.agents, this.pipeline, hooks));
   }
 
   private async afterStage(task: TaskRecord): Promise<void> {

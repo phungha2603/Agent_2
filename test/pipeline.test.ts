@@ -5,8 +5,10 @@ import { describe, expect, it } from "vitest";
 import {
   advance,
   amendShippedTask,
+  applyImplementation,
   createPlannedTask,
   createTask,
+  draftImplementation,
   isTerminal,
   isWaitingForHuman,
   resolveCheckpoint,
@@ -87,6 +89,32 @@ describe("pipeline", () => {
     resolveCheckpoint(task, true);
     expect(task.stage).toBe("done");
     expect(isTerminal(task)).toBe(true);
+  });
+
+  it("splits implementation so Muse is asked without touching disk, and the write never calls Muse again — this is what lets the scheduler hold the workspace lock only around the write", async () => {
+    const task = createTask("Split implementation");
+    task.stage = "implementation";
+    const cfg = passingConfig();
+    let museCalls = 0;
+    const countingMuse: Agent = {
+      role: "muse",
+      async send(): Promise<AgentResponse> {
+        museCalls += 1;
+        return { role: "muse", content: "FILE: a.txt\nhello" };
+      },
+    };
+
+    await draftImplementation(task, agents({ muse: countingMuse }));
+    expect(museCalls).toBe(1);
+    expect(task.context.implementationDiff).toBe("FILE: a.txt\nhello");
+    expect(task.implementationAttempts).toBe(1);
+    expect(task.stage).toBe("implementation"); // not advanced yet — nothing written
+    expect(() => readFileSync(path.join(cfg.verify.cwd, "a.txt"), "utf8")).toThrow(); // disk untouched
+
+    await applyImplementation(task, cfg);
+    expect(museCalls).toBe(1); // the write never re-asks Muse
+    expect(task.stage).toBe("verification");
+    expect(readFileSync(path.join(cfg.verify.cwd, "a.txt"), "utf8")).toBe("hello");
   });
 
   it("never reaches done when verification keeps failing — it gives up instead", async () => {

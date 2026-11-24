@@ -30,7 +30,7 @@ Công ty AI: Gemini (ý tưởng, thẩm định) → Claude (architecture, ch�
 - Target là ES2022: không có `Array.prototype.findLast`.
 - Không viết comment trừ khi giải thích một lý do khó thấy. Không thêm tính năng ngoài yêu cầu.
 - Mọi ghi file JSON dữ liệu đi qua `writeFileAtomic`. Lỗi của người dùng ném `UserError` (trả 400, không crash).
-- Muse chỉ có 1 trình duyệt: luôn 1 lượt một lần. Bước viết code + build/test chạy lần lượt dưới khoá `workspace`.
+- Muse chỉ có 1 trình duyệt: luôn 1 lượt một lần (khoá `muse` riêng). Khoá `workspace` chỉ bao phần ghi file (`applyImplementation`) và build/test ngay sau đó (liên tục, không nhả giữa hai bước) — **không** bao lượt chat với Muse (`draftImplementation`), để một task đang chờ Muse trả lời không chặn task khác ghi file/build.
 - Claude CLI mặc định tắt công cụ/MCP/skill (≈3k token nền thay vì ≈37k). Đừng bật lại nếu không cần (`CLAUDE_CLI_TOOLS`).
 - Nhánh làm việc: `claude/eager-ramanujan-ek5fpm`. Chỉ commit/push khi được yêu cầu hoặc đã được cho phép trong phiên.
 
