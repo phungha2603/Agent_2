@@ -106,6 +106,9 @@ export interface TaskSnapshot {
   /** When the task started waiting for the CEO, if it is. */
   waitingSince?: string;
   assignedBy?: string;
+  /** How many Claude↔Gemini architecture rounds and review rejections this task has gone through so far. */
+  architectureRounds: number;
+  reviewRejections: number;
 }
 
 export interface SlotSnapshot {
@@ -1698,6 +1701,8 @@ export class Company extends EventEmitter {
       },
       waitingSince: queueState === "waiting_you" ? ([...(task.runs ?? [])].reverse().find((r) => r.human && !r.endedAt)?.startedAt ?? task.updatedAt) : undefined,
       assignedBy: assign?.by,
+      architectureRounds: task.architectureRounds ?? 0,
+      reviewRejections: task.reviewRejections ?? 0,
     };
   }
 }

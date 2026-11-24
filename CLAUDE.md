@@ -21,7 +21,7 @@ Công ty AI: Gemini (ý tưởng, thẩm định) → Claude (architecture, ch�
 | `src/orchestrator/planner.ts` | Kế hoạch Goal → Epic → Subtask (Claude soạn, Gemini thẩm định) và biến kế hoạch thành task |
 | `rebalance.ts`, `handoff.ts`, `contextPruning.ts`, `archRevision.ts`, `compressForClaude.ts`, `semaphore.ts`, `usageReport.ts` | Đề xuất cân tải · gói bàn giao · cắt ngữ cảnh theo bước · áp diff/patch cho bản sửa architecture (`applyArchitectureRevision`, dùng gói `diff`) · nhờ Gemini tóm log/diff/feedback dài trước khi gọi Claude (`compressForClaude`, chỉ khi > 4000 ký tự, luôn fail-open) · semaphore có tên · báo cáo token |
 | `src/agents/` | `claude-cli.ts` (CLI, chế độ gọn), `claude.ts` (API), `gemini.ts` (bể key: xoay round-robin mỗi lượt gọi + xoay ngay khi 429), `muse.ts` (MCP; `createMusePoolAgent` gộp nhiều tài khoản/profile), `mock.ts`, `limited.ts` (giới hạn engine + ghi từng lượt gọi), `retry.ts` (`withRetry`, bể key dùng chung cho Gemini), `streamParsers.ts` |
-| `src/dashboard/` | `server.ts` (API + SSE), `slots.ts` (10 nhân sự, 3 bậc, trạng thái lưu), `auth.ts`; `public/app.js` (~1.700 dòng), `style.css`, `index.html` |
+| `src/dashboard/` | `server.ts` (API + SSE), `slots.ts` (10 nhân sự, 3 bậc, trạng thái lưu), `auth.ts`; `public/app.js` (~1.700 dòng), `style.css`, `index.html`. `TaskSnapshot` (scheduler.ts) có sẵn `architectureRounds`/`reviewRejections` cho UI hiện số vòng/số lần từ chối; dây nối (`#edges`) tự sáng (`edge-active`) khi task đích đang `running` và đã nhận handoff từ task nguồn, bất kể bật/tắt "Đường nối" |
 | `src/store/` | Ghi file nguyên tử; `data/tasks`, `data/plans`, `data/calls`, `data/dashboard.json` (không commit) |
 
 ## Quy ước và bẫy

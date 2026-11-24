@@ -125,6 +125,9 @@ async function post(url, body) {
   }
   return data;
 }
+function truncate(text, max) {
+  return text.length <= max ? text : `${text.slice(0, max)}…`;
+}
 function details(id, summary, inner, cls = "") {
   return `<details class="${cls}" data-open-id="${esc(id)}"${state.open.has(id) ? " open" : ""}><summary>${summary}</summary>${inner}</details>`;
 }
@@ -174,6 +177,8 @@ function renderTelemetry() {
   const engineTip = Object.entries(t.byEngine)
     .map(([e, u]) => `${ENGINE_LABEL[e] ?? e}: ${fmtTok(u.input)} in / ${fmtTok(u.output)} out${u.costUsd ? ` · ${fmtCost(u.costUsd)}` : ""}`)
     .join("\n");
+  const claudeUsage = t.byEngine.claude;
+  const claudeTok = claudeUsage ? claudeUsage.input + claudeUsage.output : 0;
   const engines = state.engines
     ? Object.entries(state.engines)
         .map(([name, s]) => `<button class="engine eng-${name} ${s.running >= s.limit ? "busy" : ""}" data-action="engine-open" data-engine="${name}" title="${esc(ENGINE_LABEL[name])}: ${s.running}/${s.limit} đang chạy${s.waiting ? `, ${s.waiting} đang chờ lượt` : ""} — bấm để xem hàng đợi"><b>${ENGINE_LABEL[name] ?? name}</b> ${s.running}/${s.limit}${s.waiting ? ` · chờ ${s.waiting}` : ""}</button>`)
@@ -194,6 +199,7 @@ function renderTelemetry() {
     <div class="tm-usage">
       ${runClock}
       <span class="tm" title="${esc(engineTip)}"><b>${fmtTok(t.tokens.input + t.tokens.output)}</b> token${t.tokensEstimated ? "*" : ""}</span>
+      <span class="tm eng-claude" title="Riêng Claude đã dùng trong phiên này${claudeUsage ? ` — ${fmtTok(claudeUsage.input)} in / ${fmtTok(claudeUsage.output)} out${claudeUsage.costUsd ? ` · ${fmtCost(claudeUsage.costUsd)}` : ""}` : ""}">🧠 Claude <b>${fmtTok(claudeTok)}</b> tok</span>
       <span class="tm" title="Claude CLI tự báo chi phí (theo giá API — gói Pro/Max không tính thêm). Gemini/Claude API chỉ tính nếu đặt giá trong .env. Muse không có số liệu."><b>${fmtCost(t.costUsd)}</b>${t.costPartial ? " ước tính" : ""}</span>
       ${t.paused ? `<span class="tm paused-pill">⏸ Đang tạm dừng</span>` : ""}
     </div>
@@ -290,6 +296,8 @@ function taskBody(slot, t) {
         <span class="qstate q-${t.queueState}">${QUEUE_LABEL[t.queueState]}</span>
         ${t.handedOff ? `<span class="qstate q-done" title="Kết quả đã bàn giao cho task phụ thuộc">↪ đã bàn giao</span>` : ""}
         ${t.redoPending ? `<span class="qstate q-waiting_you" title="Sẽ quay lại architecture khi bước hiện tại xong">↻ chờ làm lại</span>` : ""}
+        ${t.architectureRounds ? `<span class="qstate round-badge" title="Số vòng Claude ↔ Gemini bàn bạc architecture">🔄 vòng ${t.architectureRounds}</span>` : ""}
+        ${t.reviewRejections ? `<span class="qstate round-badge" title="Số lần bị từ chối ở review">✗ từ chối ${t.reviewRejections}x</span>` : ""}
         <span class="stage-raw">${esc(t.stage)}</span>
       </div>
       <div class="progress-track"><div class="progress-fill ${t.colorClass}" style="width:${t.progress}%"></div></div>
@@ -300,7 +308,7 @@ function taskBody(slot, t) {
     ${ac}
     <div class="logs">${logs}</div>
     ${t.lastError ? `<div class="feedback-box is-error">⚠ ${esc(t.lastError)}</div>` : ""}
-    ${!t.waitingForYou && t.lastFeedback ? details(`fb:${t.id}`, "Phản hồi gần nhất", `<div class="feedback-box">${esc(t.lastFeedback)}</div>`) : ""}`;
+    ${!t.waitingForYou && t.lastFeedback ? `<div class="feedback-box reject-hint">💬 ${esc(truncate(t.lastFeedback, 220))}</div>${t.lastFeedback.length > 220 ? details(`fb:${t.id}`, "Xem toàn bộ phản hồi", `<div class="feedback-box">${esc(t.lastFeedback)}</div>`) : ""}` : ""}`;
 }
 
 function taskActions(t) {
@@ -516,6 +524,19 @@ function ensureFlowPanel() {
   }
 }
 
+/** Tasks currently in (or that went through) a Claude↔Gemini discuss/reject loop, for the flow panel below. */
+function discussionTasks() {
+  const out = [];
+  for (const slot of state.slots.values()) {
+    for (const t of slot.tasks) {
+      if (t.queueState === "done") continue;
+      if (!t.architectureRounds && !t.reviewRejections) continue;
+      out.push({ slotId: slot.id, title: t.title, architectureRounds: t.architectureRounds, reviewRejections: t.reviewRejections, feedback: t.waitingForYou ? undefined : t.lastFeedback });
+    }
+  }
+  return out;
+}
+
 function renderFlowPanel() {
   const ins = state.insights;
   ensureFlowPanel();
@@ -524,6 +545,15 @@ function renderFlowPanel() {
   const alerts = ins.alerts.length
     ? ins.alerts.map((a) => `<li class="alert ${a.level}">${a.level === "error" ? "⛔" : a.level === "warn" ? "⚠" : "ℹ"} ${esc(a.text)}</li>`).join("")
     : `<li class="muted">Không có điểm nghẽn.</li>`;
+  const discussions = discussionTasks();
+  const discussionsHtml = discussions.length
+    ? discussions
+        .map(
+          (d) =>
+            `<li><b data-hover-slot="${d.slotId}">${d.slotId}</b> ${d.architectureRounds ? `🔄 vòng ${d.architectureRounds}` : ""}${d.reviewRejections ? ` ✗ từ chối ${d.reviewRejections}x` : ""}<div class="flow-title">${esc(d.title)}</div>${d.feedback ? `<div class="flow-reason">💬 ${esc(truncate(d.feedback, 160))}</div>` : ""}</li>`,
+        )
+        .join("")
+    : `<li class="muted">Không có vòng bàn bạc/từ chối nào đang diễn ra.</li>`;
   const handoffs = ins.handoffs.length
     ? ins.handoffs
         .map((h) => `<li><span class="flow-edge"><b data-hover-slot="${h.from}">${h.from}</b> → ${h.to.length ? h.to.map((s) => `<b data-hover-slot="${s}">${s}</b>`).join(", ") : "<i>(không ai phụ thuộc)</i>"}</span> <span class="muted">${esc(fmtTime(h.at))}</span><div class="flow-title">${esc(h.title)}</div></li>`)
@@ -534,6 +564,7 @@ function renderFlowPanel() {
     : `<li class="muted">Không ai đang chờ đầu vào.</li>`;
   panel.innerHTML = `
     <div class="panel-sub">Cảnh báo</div><ul class="flow-list">${alerts}</ul>
+    <div class="panel-sub">Đang thảo luận / bị từ chối</div><ul class="flow-list">${discussionsHtml}</ul>
     <div class="panel-sub">Bàn giao gần đây</div><ul class="flow-list">${handoffs}</ul>
     <div class="panel-sub">Đang chờ đầu vào</div><ul class="flow-list">${waits}</ul>`;
 }
@@ -804,14 +835,20 @@ function slotEdges() {
   for (const slot of state.slots.values()) {
     const seen = new Map();
     for (const t of slot.tasks) {
+      const running = t.queueState === "running";
       for (const i of t.inputsFrom) {
         if (i.slotId === slot.id) continue;
         const prev = seen.get(i.slotId);
-        seen.set(i.slotId, { from: i.slotId, to: slot.id, kind: prev?.kind === "pending" || !i.handedOff ? "pending" : "done" });
+        // Lights up (regardless of the hover/toggle filters below) while a
+        // task that actually took this input is running right now — a
+        // visible trace of where the live flow is, not just the static map.
+        const active = Boolean(prev?.active) || (running && i.handedOff);
+        seen.set(i.slotId, { from: i.slotId, to: slot.id, kind: prev?.kind === "pending" || !i.handedOff ? "pending" : "done", active });
       }
     }
     edges.push(...seen.values());
-    if (slot.tasks.some((t) => t.assignedBy?.startsWith("AG-01")) && !slot.isBoss) edges.push({ from: "AG-01", to: slot.id, kind: "assign" });
+    const assignedRunning = slot.tasks.some((t) => t.assignedBy?.startsWith("AG-01") && t.queueState === "running");
+    if (slot.tasks.some((t) => t.assignedBy?.startsWith("AG-01")) && !slot.isBoss) edges.push({ from: "AG-01", to: slot.id, kind: "assign", active: assignedRunning });
   }
   return edges;
 }
@@ -832,7 +869,7 @@ function drawEdges() {
   $$(".card.pinned", org).forEach((c) => c.classList.remove("pinned"));
   if (state.focusSlot) $(`#org .card[data-slot="${state.focusSlot}"]`)?.classList.add("pinned");
   const all = slotEdges();
-  const shown = all.filter((e) => (focus ? e.from === focus || e.to === focus : state.showAllEdges && e.kind !== "assign"));
+  const shown = all.filter((e) => e.active || (focus ? e.from === focus || e.to === focus : state.showAllEdges && e.kind !== "assign"));
   if (focus) {
     $(`#org .card[data-slot="${focus}"]`)?.classList.add("related-self");
     for (const e of shown) {
@@ -869,7 +906,7 @@ function drawEdges() {
     }
     const path = document.createElementNS("http://www.w3.org/2000/svg", "path");
     path.setAttribute("d", d);
-    path.setAttribute("class", `edge e-${e.kind}`);
+    path.setAttribute("class", `edge e-${e.kind}${e.active ? " edge-active" : ""}`);
     path.setAttribute("marker-end", `url(#arrow-${e.kind})`);
     svg.appendChild(path);
   }
@@ -893,9 +930,10 @@ function renderFlowView() {
       if (waiting) waitingIn[phase]++;
       cols[phase].push(`
         <div class="flow-card ${PHASE_CLASS[phase] ?? ""}${t.queueState === "running" ? " is-running" : ""}${related && !related.has(slot.id) ? " dim" : ""}" data-action="open-drawer" data-task="${esc(t.id)}">
-          <div class="fc-top"><span class="owner" data-hover-slot="${slot.id}">${slot.id}</span> <span class="qstate q-${t.queueState}">${QUEUE_LABEL[t.queueState]}</span>${t.activity ? ` <span class="muted small">${ENGINE_LABEL[t.activity.engine]} ${t.activity.state === "waiting" ? "chờ" : ""}</span>` : ""}</div>
+          <div class="fc-top"><span class="owner" data-hover-slot="${slot.id}">${slot.id}</span> <span class="qstate q-${t.queueState}">${QUEUE_LABEL[t.queueState]}</span>${t.activity ? ` <span class="muted small">${ENGINE_LABEL[t.activity.engine]} ${t.activity.state === "waiting" ? "chờ" : ""}</span>` : ""}${t.architectureRounds ? ` <span class="qstate round-badge" title="Số vòng Claude ↔ Gemini bàn bạc architecture">🔄 ${t.architectureRounds}</span>` : ""}${t.reviewRejections ? ` <span class="qstate round-badge" title="Số lần bị từ chối ở review">✗ ${t.reviewRejections}x</span>` : ""}</div>
           <div class="fc-title">${esc(t.title)}</div>
           <div class="fc-meta"><span class="stage-raw">${esc(t.stage)}</span>${t.queueState === "running" && t.stageStartedAt ? ` · ⏱ <span class="elapsed" data-since="${esc(t.stageStartedAt)}">${elapsed(t.stageStartedAt)}</span>` : ""}${t.deps.total ? ` · phụ thuộc ${t.deps.ready}/${t.deps.total}` : ""}</div>
+          ${!t.waitingForYou && t.lastFeedback ? `<div class="fc-reject" title="${esc(t.lastFeedback)}">💬 ${esc(truncate(t.lastFeedback, 100))}</div>` : ""}
         </div>`);
     }
   }
