@@ -1,6 +1,18 @@
-import { describe, expect, it } from "vitest";
-import { createMusePoolAgent } from "../src/agents/muse.js";
+import { beforeEach, describe, expect, it, vi } from "vitest";
+import { Client } from "@modelcontextprotocol/sdk/client/index.js";
+import { createMuseAgent, createMusePoolAgent } from "../src/agents/muse.js";
 import type { Agent, AgentResponse, TaskContext } from "../src/types.js";
+
+const connectMock = vi.fn();
+const callToolMock = vi.fn();
+const closeMock = vi.fn().mockResolvedValue(undefined);
+
+vi.mock("@modelcontextprotocol/sdk/client/index.js", () => ({
+  Client: vi.fn().mockImplementation(() => ({ connect: connectMock, callTool: callToolMock, close: closeMock })),
+}));
+vi.mock("@modelcontextprotocol/sdk/client/stdio.js", () => ({
+  StdioClientTransport: vi.fn().mockImplementation(() => ({})),
+}));
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
@@ -67,5 +79,68 @@ describe("createMusePoolAgent", () => {
 
   it("rejects an empty pool", () => {
     expect(() => createMusePoolAgent([])).toThrow();
+  });
+});
+
+describe("createMuseAgent", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    connectMock.mockResolvedValue(undefined);
+  });
+
+  it("reconnects with a fresh client after the connection dies mid-session, instead of reusing the dead one forever", async () => {
+    callToolMock
+      .mockRejectedValueOnce(new Error("MCP error -32000: Connection closed"))
+      .mockResolvedValueOnce({ content: [{ type: "text", text: "ok reply" }] });
+
+    const agent = createMuseAgent({ serverPath: "/fake/server.mjs" });
+
+    await expect(agent.send("hi", { title: "t" } as TaskContext)).rejects.toThrow("Connection closed");
+    expect(Client).toHaveBeenCalledTimes(1);
+    expect(closeMock).toHaveBeenCalledTimes(1); // the dead client was closed, not just abandoned
+
+    // A retry (a brand new send() call, exactly what the CEO's "Thử lại" button does) must not hit the same dead connection again.
+    const res = await agent.send("hi again", { title: "t" } as TaskContext);
+    expect(res.content).toBe("ok reply");
+    expect(Client).toHaveBeenCalledTimes(2); // reconnected instead of reusing the broken client
+    expect(connectMock).toHaveBeenCalledTimes(2);
+  });
+
+  it("waits for the dead client to actually finish closing before spawning the next one — a reconnect racing an in-progress Chrome shutdown would fight over the same profile dir", async () => {
+    let resolveClose!: () => void;
+    closeMock.mockImplementationOnce(() => new Promise<void>((resolve) => (resolveClose = resolve)));
+    callToolMock
+      .mockRejectedValueOnce(new Error("MCP error -32000: Connection closed"))
+      .mockResolvedValueOnce({ content: [{ type: "text", text: "ok reply" }] });
+
+    const agent = createMuseAgent({ serverPath: "/fake/server.mjs" });
+    await expect(agent.send("hi", { title: "t" } as TaskContext)).rejects.toThrow("Connection closed");
+    expect(Client).toHaveBeenCalledTimes(1);
+
+    // The retry is already in flight, but close() on the dead client hasn't resolved yet.
+    let settled = false;
+    const retry = agent.send("hi again", { title: "t" } as TaskContext).then((r) => {
+      settled = true;
+      return r;
+    });
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(settled).toBe(false);
+    expect(Client).toHaveBeenCalledTimes(1); // must not have spawned a second client yet
+
+    resolveClose();
+    const res = await retry;
+    expect(res.content).toBe("ok reply");
+    expect(Client).toHaveBeenCalledTimes(2); // only spawned once the old one was fully gone
+  });
+
+  it("keeps reusing the same client across calls when nothing ever fails", async () => {
+    callToolMock.mockResolvedValue({ content: [{ type: "text", text: "ok" }] });
+    const agent = createMuseAgent({ serverPath: "/fake/server.mjs" });
+
+    await agent.send("one", { title: "t" } as TaskContext);
+    await agent.send("two", { title: "t" } as TaskContext);
+
+    expect(Client).toHaveBeenCalledTimes(1); // no reason to reconnect when nothing broke
   });
 });
