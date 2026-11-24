@@ -32,6 +32,12 @@ export function createGeminiAgent(opts: { apiKeys: string[]; model?: string }): 
   return {
     role: "gemini",
     async send(prompt: string, context: TaskContext, sendOpts?: SendOptions): Promise<AgentResponse> {
+      // Round-robin dispatch: each call starts on the next key in the pool,
+      // not whichever one the last call happened to end on — so concurrent
+      // calls spread across accounts instead of piling onto a single key
+      // until it 429s. withKeyRotation still fails over through the rest of
+      // the pool from there if this call's starting key is rate-limited.
+      keyPool.rotate();
       const parts: unknown[] = [{ text: `${prompt}\n\n${formatContext(context)}` }];
       if (prompt.startsWith("REVIEW:")) {
         parts.push(...(await readImageParts("Reference style image (target look):", context.referenceImagePath)));

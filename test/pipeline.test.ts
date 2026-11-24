@@ -15,6 +15,7 @@ import {
   retryFromRejected,
 } from "../src/orchestrator/pipeline.js";
 import { createMockAgent } from "../src/agents/mock.js";
+import { createPatch } from "diff";
 import type { Agent, AgentResponse, TaskContext } from "../src/types.js";
 import type { PipelineConfig } from "../src/orchestrator/pipeline.js";
 
@@ -203,6 +204,36 @@ describe("pipeline", () => {
     expect(seen?.ideaBrief).toBeUndefined();
   });
 
+  it("has Gemini compress a large verification log before Claude's final review, instead of sending the raw log", async () => {
+    const task = createTask("Needs rework");
+    task.stage = "review_claude";
+    const bigLog = "L".repeat(5000) + "\nTHE ACTUAL FAILURE";
+    task.context.implementationDiff = "diff";
+    task.context.verificationLog = bigLog;
+
+    const summarizingGemini: Agent = {
+      role: "gemini",
+      async send(prompt: string): Promise<AgentResponse> {
+        expect(prompt).toContain("=== verificationLog ===");
+        return { role: "gemini", content: "=== verificationLog ===\nFailed: THE ACTUAL FAILURE, in short." };
+      },
+    };
+    let seenLog: string | undefined;
+    const capturingClaude: Agent = {
+      role: "claude",
+      async send(_prompt: string, context: TaskContext): Promise<AgentResponse> {
+        seenLog = context.verificationLog;
+        return { role: "claude", verdict: "approve", content: "Looks good." };
+      },
+    };
+
+    const a = agents({ gemini: summarizingGemini, claude: capturingClaude });
+    await advance(task, a, passingConfig());
+
+    expect(seenLog).toBe("Failed: THE ACTUAL FAILURE, in short.");
+    expect(task.stage).toBe("checkpoint_final");
+  });
+
   it("routes a reviewer's rejection through Claude before looping back to implementation — Gemini alone can't send it back", async () => {
     const task = createTask("Needs rework");
     task.stage = "review_gemini";
@@ -262,7 +293,7 @@ describe("pipeline", () => {
     expect(task.reviewRejections).toBe(0);
   });
 
-  it("falls back to Claude for the review_gemini round when Gemini's own retries are exhausted", async () => {
+  it("when Gemini's own retries are exhausted, Claude does the independent check and final sign-off in one combined call instead of two separate Claude round-trips", async () => {
     const task = createTask("Needs rework");
     task.stage = "review_gemini";
     task.context.implementationDiff = "diff";
@@ -274,10 +305,12 @@ describe("pipeline", () => {
         throw new Error("Gemini API error 503: overloaded");
       },
     };
+    let claudeCalls = 0;
     let claudePrompt = "";
     const standInClaude: Agent = {
       role: "claude",
       async send(prompt: string): Promise<AgentResponse> {
+        claudeCalls += 1;
         claudePrompt = prompt;
         return { role: "claude", verdict: "approve", content: "Looks fine, standing in for Gemini." };
       },
@@ -288,12 +321,13 @@ describe("pipeline", () => {
 
     await advance(task, a, cfg);
 
-    expect(claudePrompt).toMatch(/standing in/i);
-    expect(task.stage).toBe("review_claude");
-    expect(task.history.some((h) => /Claude is standing in/.test(h.summary))).toBe(true);
+    expect(claudeCalls).toBe(1); // one combined call, not a review_gemini-fallback call followed by a separate review_claude call
+    expect(claudePrompt).toMatch(/in one pass/i);
+    expect(task.stage).toBe("checkpoint_final");
+    expect(task.history.some((h) => /combined round/.test(h.summary))).toBe(true);
   });
 
-  it("labels a fallback rejection as Claude standing in, not Gemini, before Claude's own final ruling takes over", async () => {
+  it("labels a fallback rejection as Claude standing in, and rules on it immediately (no separate review_claude round)", async () => {
     const task = createTask("Needs rework");
     task.stage = "review_gemini";
 
@@ -313,15 +347,58 @@ describe("pipeline", () => {
     const a = agents({ gemini: unavailableGemini, claude: rejectingStandIn });
     const cfg = passingConfig();
 
-    await advance(task, a, cfg); // review_gemini (Claude standing in) -> review_claude
-    expect(task.stage).toBe("review_claude");
-    expect(task.reviewRejections).toBe(0);
-    expect(task.context.reviewFeedback?.[0]).toMatch(/Claude \(standing in for Gemini\) review feedback/);
-
-    await advance(task, a, cfg); // review_claude: same mock agent rejects again -> implementation
+    await advance(task, a, cfg); // review_gemini (Gemini down) -> Claude's combined review+signoff rejects -> implementation
     expect(task.stage).toBe("implementation");
     expect(task.reviewRejections).toBe(1);
-    expect(task.context.reviewFeedback?.[0]).toMatch(/Claude review feedback/);
+    expect(task.context.reviewFeedback?.[0]).toMatch(/Claude \(standing in for Gemini\) review feedback/);
+  });
+
+  it("revises the architecture spec by applying Claude's diff against the exact previous text, instead of a full rewrite", async () => {
+    const task = createTask("New feature");
+    task.stage = "architecture";
+    const current = "# Architecture\n\nFile list:\n- a.ts: does X\n- b.ts: does Y\n";
+    const updated = "# Architecture\n\nFile list:\n- a.ts: does X, validating empty input\n- b.ts: does Y\n";
+    task.context.architectureSpec = current;
+    task.context.reviewFeedback = ["Missing error handling for the empty-input case."];
+
+    let seenPrompt = "";
+    const diffingClaude: Agent = {
+      role: "claude",
+      async send(prompt: string): Promise<AgentResponse> {
+        seenPrompt = prompt;
+        return { role: "claude", content: createPatch("spec", current, updated) };
+      },
+    };
+    const a = agents({ claude: diffingClaude });
+    const cfg = passingConfig();
+
+    await advance(task, a, cfg);
+
+    expect(seenPrompt).toMatch(/unified diff/i);
+    expect(task.context.architectureSpec).toBe(updated);
+    expect(task.stage).toBe("architecture_review");
+    expect(task.history.some((h) => /applied as a diff/.test(h.summary))).toBe(true);
+  });
+
+  it("falls back to using Claude's reply as the full spec when the architecture revision isn't a diff that applies", async () => {
+    const task = createTask("New feature");
+    task.stage = "architecture";
+    task.context.architectureSpec = "old spec";
+    task.context.reviewFeedback = ["Missing error handling for the empty-input case."];
+
+    const proseClaude: Agent = {
+      role: "claude",
+      async send(): Promise<AgentResponse> {
+        return { role: "claude", content: "Here's the fully rewritten guide, addressing the feedback directly." };
+      },
+    };
+    const a = agents({ claude: proseClaude });
+    const cfg = passingConfig();
+
+    await advance(task, a, cfg);
+
+    expect(task.context.architectureSpec).toBe("Here's the fully rewritten guide, addressing the feedback directly.");
+    expect(task.history.some((h) => /sent the full updated guide instead of a diff/.test(h.summary))).toBe(true);
   });
 
   it("loops the architecture spec back to Claude when Gemini has concerns, with no cap on normal rounds", async () => {

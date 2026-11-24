@@ -15,6 +15,8 @@ import { runVerification } from "../verify/runner.js";
 import { newTaskId } from "../store/taskStore.js";
 import { parseFileBlocks, writeFiles } from "../apply/applyFiles.js";
 import { pruneContext } from "./contextPruning.js";
+import { applyArchitectureRevision } from "./archRevision.js";
+import { compressForClaude } from "./compressForClaude.js";
 
 export function createTask(title: string, projectConfig?: ProjectConfig): TaskRecord {
   const now = new Date().toISOString();
@@ -118,10 +120,15 @@ const PROMPTS = {
     "If feedback from a previous round is included below, this is a revision of the brief itself — rewrite it to actually reflect the new direction the feedback describes, replacing anything in the old brief that now contradicts it, not just appending a note.",
   architecture:
     "You are the architecture lead and mentor to the engineer (Muse), who writes all the code — you do NOT write code yourself. " +
-    "Write a precise, step-by-step implementation guide, not just a high-level spec: exact file list with what each one is responsible for, exact function/method signatures, the order to build things in, plain pseudocode for any non-trivial logic, and common mistakes to avoid. " +
-    "Write it the way you'd personally walk a capable but unfamiliar engineer through building this, so there's as little left to guess as possible. " +
-    "If acceptance criteria are listed, show how each one will be met and which test proves it. If upstream handoffs are listed, build on those files and interfaces instead of recreating them. " +
-    "If feedback from a previous round is included below, this is a revision: write a full updated guide that actually changes to address that feedback — don't repeat the previous design unchanged.",
+    "Write a concise implementation guide: file list with what each one is responsible for, the build order, and how each acceptance criterion will be met and which test proves it. " +
+    "Give exact function/method signatures and pseudocode only for the one or two genuinely trickiest parts of the logic — for everything else, a clear one- or two-line description of what a file does is enough; don't spell out the obvious. " +
+    "You'll get a chance to go deep on exactly the part that needs it if Gemini pushes back on this round, so there's no need to over-specify everything up front. " +
+    "If upstream handoffs are listed, build on those files and interfaces instead of recreating them.",
+  architectureRevision:
+    "You are revising the architecture guide above after Gemini's feedback (below). Reply with ONLY a unified diff against the exact guide shown above — no prose before or after, don't restate the whole guide. " +
+    "Go as deep and precise as the fix actually needs — exact function signatures, pseudocode, step-by-step logic for the specific part(s) you're changing, even though the original guide was kept concise; this is exactly the moment to add that depth. " +
+    "Leave everything you're not changing out of the diff entirely. Use this exact unified diff format (--- / +++ header lines, @@ -start,count +start,count @@ hunk headers, a few lines of unchanged context, '-' for removed lines, '+' for added lines):\n" +
+    "---\n+++\n@@ -12,3 +12,5 @@\n unchanged context line\n-old line\n+new line\n+another new line\n unchanged context line",
   architectureReview:
     "REVIEW: You are discussing this architecture spec with Claude before any code gets written — Muse hasn't started yet. " +
     "Read it against the idea brief and the acceptance criteria (every criterion must have a clear way to be met and tested). If it's solid, approve it. If something is missing, ambiguous, risky, or could be designed better, reject and say exactly what to add or change — name the specific section, file, or interface and what you'd write instead, since Claude will revise the spec and you'll read the new version next round. " +
@@ -142,9 +149,11 @@ const PROMPTS = {
     "If feedback from the independent reviewer is included above, you decide for yourself whether it's actually correct before ruling — don't just rubber-stamp it: you may agree with it, or overrule it and approve anyway (say briefly why). " +
     "If you reject — whether because you agree with that feedback or found your own issue — don't just say what's wrong: give precise, step-by-step instructions for exactly how to fix it (which file, which function, what the corrected logic should look like), as if correcting a student's work directly, so the engineer can act on it without guessing. " +
     "You are always the one who makes this call, not the independent reviewer. Approve or reject, with reasons.",
-  reviewGeminiFallback:
-    "REVIEW: Gemini, the usual independent reviewer for this round, is temporarily unavailable, so you are standing in to give that independent review before this reaches your own final sign-off later. " +
-    "Review this implementation against the idea brief, the acceptance criteria and the verification log as a separate check from your eventual sign-off — focus on whether it actually does what was asked, not just whether it compiles. " +
+  reviewClaudeFallback:
+    "REVIEW: Gemini, the usual independent reviewer, is temporarily unavailable — you are doing the whole review yourself this round, both the independent check and your own final sign-off, in one pass (there's no separate second opinion to defer to here, so rule on your own judgment). " +
+    "Review this implementation against the idea brief, the acceptance criteria (each listed criterion must be demonstrably met — name any that isn't), the architecture guide you wrote, and the verification log. " +
+    "If a reference style image and a screenshot of the running implementation are attached, compare them directly — say concretely where the screenshot matches or deviates from the reference's look. " +
+    "This is your own final decision. If you reject, don't just say what's wrong: give precise, step-by-step instructions for exactly how to fix it (which file, which function, what the corrected logic should look like), as if correcting a student's work directly, so the engineer can act on it without guessing. " +
     "Approve or reject, with reasons.",
 };
 
@@ -228,6 +237,27 @@ function exhaustBudget(task: TaskRecord, config: PipelineConfig, reason: string)
   task.stage = "architecture";
 }
 
+/**
+ * Claude's ruling on a review (approve it, or reject with feedback and —
+ * budget allowing — another shot at implementation). Shared by the normal
+ * review_claude stage and the Gemini-down fallback in review_gemini, which
+ * has Claude rule on the spot instead of making a second, separate Claude
+ * call into review_claude right after its own first one.
+ */
+function applyReviewVerdict(task: TaskRecord, config: PipelineConfig, res: AgentResponse, feedbackLabel: string): void {
+  if (res.verdict === "approve") {
+    task.stage = "checkpoint_final";
+    return;
+  }
+  task.reviewRejections += 1;
+  task.context.reviewFeedback = [`${feedbackLabel}:\n${res.content}`];
+  if (task.reviewRejections < config.maxReviewRejections) {
+    task.stage = "implementation";
+  } else {
+    exhaustBudget(task, config, "review kept rejecting");
+  }
+}
+
 /** Terminal stages, or stages that need a human decision before they can proceed. */
 export function isWaitingForHuman(task: TaskRecord): boolean {
   return task.stage === "checkpoint_idea" || task.stage === "checkpoint_final";
@@ -303,9 +333,22 @@ export async function advance(task: TaskRecord, agents: Agents, config: Pipeline
     }
 
     case "architecture": {
-      const res = await agents.claude.send(PROMPTS.architecture, ctx("architecture"), opts);
-      task.context.architectureSpec = res.content;
-      log(task, task.stage, "claude", "Architecture spec written.");
+      const revising = Boolean(task.context.reviewFeedback?.length) && Boolean(task.context.architectureSpec);
+      if (!revising) {
+        const res = await agents.claude.send(PROMPTS.architecture, await compressForClaude(agents.gemini, ctx("architecture"), opts.signal), opts);
+        task.context.architectureSpec = res.content;
+        log(task, task.stage, "claude", "Architecture spec written.");
+      } else {
+        const res = await agents.claude.send(PROMPTS.architectureRevision, await compressForClaude(agents.gemini, ctx("architecture"), opts.signal), opts);
+        const { spec, patched } = applyArchitectureRevision(task.context.architectureSpec!, res.content);
+        task.context.architectureSpec = spec;
+        log(
+          task,
+          task.stage,
+          "claude",
+          patched ? "Architecture spec revised (applied as a diff)." : "Architecture spec revised (Claude sent the full updated guide instead of a diff).",
+        );
+      }
       // Also checked here, not just in ideation: a task can reach
       // architecture for the first time well after ideation (e.g. the
       // visual loop was turned on partway through, it was created from a
@@ -374,52 +417,42 @@ export async function advance(task: TaskRecord, agents: Agents, config: Pipeline
       // Gemini is the independent reviewer for this stage, but its free
       // tier can go down for stretches (rate limits, server overload) —
       // when it's genuinely exhausted its own retry budget (not just a
-      // single blip), Claude stands in for this one round rather than
-      // leaving the task stuck waiting on a service that may not come
-      // back soon. This is a stand-in for a round, not a permanent
-      // reassignment: the next task (or even a later round of this one,
-      // after a loop back through implementation) tries Gemini again.
-      let res: AgentResponse;
-      let reviewer: RoleName;
+      // single blip), Claude stands in rather than leaving the task stuck
+      // waiting on a service that may not come back soon. This is a
+      // stand-in for a round, not a permanent reassignment: the next task
+      // (or even a later round of this one) tries Gemini again.
       try {
-        res = await agents.gemini.send(PROMPTS.reviewGemini, ctx("review_gemini"), opts);
-        reviewer = "gemini";
+        const res = await agents.gemini.send(PROMPTS.reviewGemini, ctx("review_gemini"), opts);
+        log(task, task.stage, "gemini", `Verdict: ${res.verdict ?? "unknown"}.`);
+        // Whatever this independent review's verdict, it goes to Claude next —
+        // nothing here loops back to implementation directly. Claude (the
+        // mentor who wrote the architecture guide) decides for itself whether
+        // the feedback holds up, and is the only one who can actually send the
+        // task back to implementation (see review_claude below).
+        task.context.reviewFeedback = res.verdict === "reject" ? [`Gemini review feedback:\n${res.content}`] : [];
+        task.stage = "review_claude";
+        return task;
       } catch (err) {
         log(
           task,
           task.stage,
           "system",
-          `Gemini review unavailable (${(err as Error).message}) — Claude is standing in for this round's independent review.`,
+          `Gemini review unavailable (${(err as Error).message}) — Claude is doing the independent check and its own final sign-off together in one combined round, instead of two separate Claude calls.`,
         );
-        res = await agents.claude.send(PROMPTS.reviewGeminiFallback, ctx("review_gemini"), opts);
-        reviewer = "claude";
+        // Not run through compressForClaude: Gemini just failed (that's why
+        // we're here), so asking it to compress first would only add its
+        // own retry/backoff delay on top of an already-unavailable service.
+        const res = await agents.claude.send(PROMPTS.reviewClaudeFallback, ctx("review_gemini"), opts);
+        log(task, task.stage, "claude", `Verdict: ${res.verdict ?? "unknown"} (standing in for Gemini).`);
+        applyReviewVerdict(task, config, res, "Claude (standing in for Gemini) review feedback");
+        return task;
       }
-      log(task, task.stage, reviewer, `Verdict: ${res.verdict ?? "unknown"}.`);
-      // Whatever this independent review's verdict, it goes to Claude next —
-      // nothing here loops back to implementation directly. Claude (the
-      // mentor who wrote the architecture guide) decides for itself whether
-      // the feedback holds up, and is the only one who can actually send the
-      // task back to implementation (see review_claude below).
-      const reviewerLabel = reviewer === "gemini" ? "Gemini" : "Claude (standing in for Gemini)";
-      task.context.reviewFeedback = res.verdict === "reject" ? [`${reviewerLabel} review feedback:\n${res.content}`] : [];
-      task.stage = "review_claude";
-      return task;
     }
 
     case "review_claude": {
-      const res = await agents.claude.send(PROMPTS.reviewClaude, ctx("review_claude"), opts);
+      const res = await agents.claude.send(PROMPTS.reviewClaude, await compressForClaude(agents.gemini, ctx("review_claude"), opts.signal), opts);
       log(task, task.stage, "claude", `Verdict: ${res.verdict ?? "unknown"}.`);
-      if (res.verdict === "approve") {
-        task.stage = "checkpoint_final";
-      } else {
-        task.reviewRejections += 1;
-        task.context.reviewFeedback = [`Claude review feedback:\n${res.content}`];
-        if (task.reviewRejections < config.maxReviewRejections) {
-          task.stage = "implementation";
-        } else {
-          exhaustBudget(task, config, "review kept rejecting");
-        }
-      }
+      applyReviewVerdict(task, config, res, "Claude review feedback");
       return task;
     }
 

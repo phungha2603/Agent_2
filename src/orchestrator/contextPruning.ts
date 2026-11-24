@@ -6,7 +6,6 @@ export const PRUNE_LIMITS = {
   implementationDiffHead: 60000,
   /** The previous attempt, shown to the engineer only on a fix round. */
   previousImplementationHead: 30000,
-  previousSpecHead: 20000,
   attachments: 3,
   attachmentChars: 12000,
 };
@@ -55,8 +54,10 @@ export function pruneContext(stage: Stage, ctx: TaskContext): TaskContext {
         ideaBrief: ctx.ideaBrief,
         acceptanceCriteria: ctx.acceptanceCriteria,
         upstream: ctx.upstream,
-        // On a revision, the previous guide is what's being revised.
-        architectureSpec: fixRound ? head(ctx.architectureSpec, PRUNE_LIMITS.previousSpecHead) : undefined,
+        // On a revision, Claude diffs against this exact text, so it is
+        // NOT truncated the way other large fields are here — a diff
+        // against a truncated spec wouldn't apply past the cut.
+        architectureSpec: fixRound ? ctx.architectureSpec : undefined,
         reviewFeedback: ctx.reviewFeedback,
       };
 

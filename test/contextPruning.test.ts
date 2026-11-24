@@ -28,9 +28,9 @@ describe("pruneContext", () => {
     expect(out.upstream).toHaveLength(1);
   });
 
-  it("shows the architect its previous spec only when revising", () => {
+  it("shows the architect its previous spec only when revising, and never truncated — a diff must match the exact text", () => {
     const out = pruneContext("architecture", { ...bigContext(), reviewFeedback: ["fix X"] });
-    expect(out.architectureSpec).toBeTruthy();
+    expect(out.architectureSpec).toHaveLength(10_000);
   });
 
   it("keeps the end of the verification log for reviewers, where the failure is", () => {

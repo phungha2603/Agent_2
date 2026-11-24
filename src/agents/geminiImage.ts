@@ -21,6 +21,9 @@ export function createGeminiImageGenerator(opts: { apiKeys: string[]; model?: st
   const keyPool = createKeyPool(opts.apiKeys);
   return {
     async generate(prompt: string, outPath: string): Promise<string> {
+      // Round-robin dispatch, same reasoning as createGeminiAgent: spread
+      // calls across the pool instead of sticking to one key until it 429s.
+      keyPool.rotate();
       const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent`;
       const data = await withRetry(async () =>
         withKeyRotation(keyPool, async (apiKey) => {
