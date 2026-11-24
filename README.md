@@ -126,6 +126,13 @@ in `.env` as you wire each one up, with these keys:
      Chrome window opens, sign in with your Meta account. The session is
      saved under `.muse-profile/` (or `MUSE_PROFILE_DIR`, if set) and
      reused after that; re-run `muse:login` only if that session expires.
+  4. With more than one Muse account, log in to each separately: run
+     `MUSE_PROFILE_DIR=/path/to/profile2 npm run muse:login` (a fresh
+     directory per account) once per extra account, then set
+     `MUSE_PROFILE_DIRS=/path/to/profile1,/path/to/profile2,/path/to/profile3`
+     in `.env` instead of the single `MUSE_PROFILE_DIR`. Each account gets
+     its own Chrome window and runs chats in parallel with the others —
+     still exactly one at a time *per* account.
 
 ### How code actually lands on disk
 

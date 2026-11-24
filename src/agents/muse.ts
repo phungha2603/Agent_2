@@ -91,6 +91,47 @@ export function createMuseAgent(opts: { serverPath: string; profileDir?: string;
   };
 }
 
+/**
+ * Pools several Muse agents — typically one createMuseAgent per logged-in
+ * account (each its own Chrome profile, created via `npm run muse:login`
+ * with a distinct MUSE_PROFILE_DIR) — so up to `pool.length` chats run at
+ * once, one per account, instead of the single-browser "always one at a
+ * time" limit of a lone createMuseAgent. Pairs with Company's
+ * `museConcurrency` setting, which should match the pool size so the
+ * scheduler actually lets that many calls through.
+ */
+export function createMusePoolAgent(pool: Agent[]): Agent {
+  if (pool.length === 0) throw new Error("createMusePoolAgent requires at least one agent");
+  const idle: number[] = pool.map((_, i) => i);
+  const waiters: ((index: number) => void)[] = [];
+
+  function acquire(): Promise<number> {
+    const next = idle.shift();
+    if (next !== undefined) return Promise.resolve(next);
+    return new Promise((resolve) => waiters.push(resolve));
+  }
+  function release(index: number): void {
+    const waiter = waiters.shift();
+    if (waiter) waiter(index);
+    else idle.push(index);
+  }
+
+  return {
+    role: "muse",
+    async send(prompt: string, context: TaskContext, sendOpts?: SendOptions): Promise<AgentResponse> {
+      const index = await acquire();
+      try {
+        return await pool[index].send(prompt, context, sendOpts);
+      } finally {
+        release(index);
+      }
+    },
+    async close(): Promise<void> {
+      await Promise.all(pool.map((account) => account.close?.()));
+    },
+  };
+}
+
 function processEnvSnapshot(): Record<string, string> {
   const env: Record<string, string> = {};
   for (const [k, v] of Object.entries(process.env)) {

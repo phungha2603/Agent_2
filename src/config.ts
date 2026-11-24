@@ -8,7 +8,7 @@ import { createGeminiAgent } from "./agents/gemini.js";
 import { createGeminiImageGenerator } from "./agents/geminiImage.js";
 import { createClaudeAgent } from "./agents/claude.js";
 import { createClaudeCliAgent } from "./agents/claude-cli.js";
-import { createMuseAgent } from "./agents/muse.js";
+import { createMuseAgent, createMusePoolAgent } from "./agents/muse.js";
 import { screenshotBuildOutput } from "./verify/screenshot.js";
 import type { SchedulerSettings } from "./orchestrator/scheduler.js";
 import type { Price } from "./agents/limited.js";
@@ -30,6 +30,20 @@ function geminiApiKeys(): string[] {
     .map((s) => s.trim())
     .filter(Boolean);
   return pool.length ? pool : [requireEnv("GEMINI_API_KEY")];
+}
+
+/**
+ * MUSE_PROFILE_DIRS="dir1,dir2,dir3" — one Chrome profile per logged-in
+ * Muse account (each created via `npm run muse:login` with that
+ * MUSE_PROFILE_DIR), so that many chats run at once. Falls back to the
+ * single MUSE_PROFILE_DIR (or none, the server's own default profile).
+ */
+function museProfileDirs(): (string | undefined)[] {
+  const pool = (process.env.MUSE_PROFILE_DIRS ?? "")
+    .split(",")
+    .map((s) => s.trim())
+    .filter(Boolean);
+  return pool.length ? pool : [process.env.MUSE_PROFILE_DIR];
 }
 
 function verifyCwd(): string {
@@ -86,11 +100,15 @@ export function buildAgents(): Agents {
 
   const muse =
     provider("MUSE_PROVIDER") === "real"
-      ? createMuseAgent({
-          serverPath: requireEnv("MUSE_MCP_SERVER_PATH"),
-          profileDir: process.env.MUSE_PROFILE_DIR,
-          timeoutSec: process.env.MUSE_TIMEOUT_SEC ? Number(process.env.MUSE_TIMEOUT_SEC) : undefined,
-        })
+      ? createMusePoolAgent(
+          museProfileDirs().map((profileDir) =>
+            createMuseAgent({
+              serverPath: requireEnv("MUSE_MCP_SERVER_PATH"),
+              profileDir,
+              timeoutSec: process.env.MUSE_TIMEOUT_SEC ? Number(process.env.MUSE_TIMEOUT_SEC) : undefined,
+            }),
+          ),
+        )
       : createMockAgent("muse");
 
   return { gemini, claude, muse };
@@ -131,6 +149,7 @@ export function buildSchedulerSettings(): SchedulerSettings {
   return {
     claudeConcurrency: Math.max(1, num("CLAUDE_CONCURRENCY", 2)),
     geminiConcurrency: Math.max(1, num("GEMINI_CONCURRENCY", 2)),
+    museConcurrency: Math.max(1, num("MUSE_CONCURRENCY", museProfileDirs().length)),
     defaultSlotParallel: Math.max(1, num("SLOT_MAX_PARALLEL", 1)),
     slotParallel: parseSlotParallel(process.env.SLOT_PARALLEL_OVERRIDES),
     stageErrorRetries: Math.max(0, num("STAGE_ERROR_RETRIES", 2)),

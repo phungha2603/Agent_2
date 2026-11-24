@@ -29,6 +29,8 @@ import { SLOTS, TIER_LABELS, deriveStatus, loadDashboardState, saveDashboardStat
 export interface SchedulerSettings {
   claudeConcurrency: number;
   geminiConcurrency: number;
+  /** How many Muse accounts (browser profiles) can chat at once — 1 unless a pool is configured. */
+  museConcurrency?: number;
   /** Tasks one slot may have in progress at once, unless overridden per slot. */
   defaultSlotParallel: number;
   slotParallel: Record<string, number>;
@@ -253,7 +255,7 @@ export class Company extends EventEmitter {
     this.engines = {
       claude: new Semaphore(opts.settings.claudeConcurrency),
       gemini: new Semaphore(opts.settings.geminiConcurrency),
-      muse: new Semaphore(1),
+      muse: new Semaphore(Math.max(1, opts.settings.museConcurrency ?? 1)),
       workspace: new Semaphore(1),
     };
     const hooks = {

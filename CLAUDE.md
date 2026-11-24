@@ -20,7 +20,7 @@ Công ty AI: Gemini (ý tưởng, thẩm định) → Claude (architecture, ch�
 | `src/orchestrator/scheduler.ts` (`Company`, ~1.700 dòng) | Hàng đợi từng nhân sự, giới hạn engine, khoá thư mục, bàn giao, thử lại, pause/stop, chỉ thị, cổng duyệt, gán lại, cân tải, timeline, snapshot cho giao diện |
 | `src/orchestrator/planner.ts` | Kế hoạch Goal → Epic → Subtask (Claude soạn, Gemini thẩm định) và biến kế hoạch thành task |
 | `rebalance.ts`, `handoff.ts`, `contextPruning.ts`, `semaphore.ts`, `usageReport.ts` | Đề xuất cân tải · gói bàn giao · cắt ngữ cảnh theo bước · semaphore có tên · báo cáo token |
-| `src/agents/` | `claude-cli.ts` (CLI, chế độ gọn), `claude.ts` (API), `gemini.ts`, `muse.ts` (MCP), `mock.ts`, `limited.ts` (giới hạn engine + ghi từng lượt gọi), `streamParsers.ts` |
+| `src/agents/` | `claude-cli.ts` (CLI, chế độ gọn), `claude.ts` (API), `gemini.ts` (bể key, tự xoay khi 429), `muse.ts` (MCP; `createMusePoolAgent` gộp nhiều tài khoản/profile), `mock.ts`, `limited.ts` (giới hạn engine + ghi từng lượt gọi), `retry.ts` (`withRetry`, bể key dùng chung cho Gemini), `streamParsers.ts` |
 | `src/dashboard/` | `server.ts` (API + SSE), `slots.ts` (10 nhân sự, 3 bậc, trạng thái lưu), `auth.ts`; `public/app.js` (~1.700 dòng), `style.css`, `index.html` |
 | `src/store/` | Ghi file nguyên tử; `data/tasks`, `data/plans`, `data/calls`, `data/dashboard.json` (không commit) |
 
@@ -30,7 +30,7 @@ Công ty AI: Gemini (ý tưởng, thẩm định) → Claude (architecture, ch�
 - Target là ES2022: không có `Array.prototype.findLast`.
 - Không viết comment trừ khi giải thích một lý do khó thấy. Không thêm tính năng ngoài yêu cầu.
 - Mọi ghi file JSON dữ liệu đi qua `writeFileAtomic`. Lỗi của người dùng ném `UserError` (trả 400, không crash).
-- Muse chỉ có 1 trình duyệt: luôn 1 lượt một lần (khoá `muse` riêng). Khoá `workspace` chỉ bao phần ghi file (`applyImplementation`) và build/test ngay sau đó (liên tục, không nhả giữa hai bước) — **không** bao lượt chat với Muse (`draftImplementation`), để một task đang chờ Muse trả lời không chặn task khác ghi file/build.
+- Mỗi tài khoản Muse chỉ có 1 trình duyệt: 1 lượt một lần *trên mỗi tài khoản* (khoá `muse`, giới hạn = số tài khoản trong `MUSE_PROFILE_DIRS`, mặc định 1). Khoá `workspace` chỉ bao phần ghi file (`applyImplementation`) và build/test ngay sau đó (liên tục, không nhả giữa hai bước) — **không** bao lượt chat với Muse (`draftImplementation`), để một task đang chờ Muse trả lời không chặn task khác ghi file/build.
 - Claude CLI mặc định tắt công cụ/MCP/skill (≈3k token nền thay vì ≈37k). Đừng bật lại nếu không cần (`CLAUDE_CLI_TOOLS`).
 - Nhánh làm việc: `claude/eager-ramanujan-ek5fpm`. Chỉ commit/push khi được yêu cầu hoặc đã được cho phép trong phiên.
 

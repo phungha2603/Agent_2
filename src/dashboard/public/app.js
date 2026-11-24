@@ -648,7 +648,7 @@ function renderEngineModal() {
     </div>`;
   openModal(`
     <div class="modal-title">Hàng đợi ${esc(ENGINE_LABEL[name] ?? name)} · ${e.running}/${e.limit} đang chạy${e.waiting ? ` · ${e.waiting} đang chờ` : ""}</div>
-    <div class="muted small">${name === "muse" ? "Muse chỉ có 1 trình duyệt nên luôn chạy từng lượt một." : name === "workspace" ? "Bước viết code + build/test của các task dùng chung thư mục dự án nên chạy lần lượt." : `Tối đa ${e.limit} lượt cùng lúc (đổi trong .env).`} Ưu tiên chỉ đổi thứ tự chờ, không đổi engine — mỗi bước vẫn do đúng vai trò của nó thực hiện.</div>
+    <div class="muted small">${name === "muse" ? (e.limit > 1 ? `Bể ${e.limit} tài khoản Muse — mỗi tài khoản 1 trình duyệt, chạy song song tối đa ${e.limit} lượt.` : "Muse chỉ có 1 trình duyệt nên luôn chạy từng lượt một.") : name === "workspace" ? "Bước ghi file + build/test của các task dùng chung thư mục dự án nên chạy lần lượt (không tính lúc đang chờ Muse trả lời)." : `Tối đa ${e.limit} lượt cùng lúc (đổi trong .env).`} Ưu tiên chỉ đổi thứ tự chờ, không đổi engine — mỗi bước vẫn do đúng vai trò của nó thực hiện.</div>
     <div class="panel-sub">Đang chạy</div>
     ${e.queue.running.map((x, i) => row(x, i, false)).join("") || `<div class="muted small">Không có.</div>`}
     <div class="panel-sub">Đang chờ (theo thứ tự được phục vụ)</div>

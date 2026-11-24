@@ -13,6 +13,10 @@ import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js"
  * the Chrome window open until you've signed in (or it times out) — run it
  * once to create the session under MUSE_PROFILE_DIR, and again later only
  * if that session ever expires.
+ *
+ * For a pool of several Muse accounts (see MUSE_PROFILE_DIRS in config.ts),
+ * run this once per account with a different MUSE_PROFILE_DIR each time,
+ * e.g. `MUSE_PROFILE_DIR=/abs/path/profile-2 npm run muse:login`.
  */
 async function main(): Promise<void> {
   const serverPath = process.env.MUSE_MCP_SERVER_PATH;
