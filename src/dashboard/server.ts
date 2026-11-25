@@ -124,7 +124,9 @@ app.post("/api/slots/:id/gate", route(async (req, res) => ok(res, await company.
 app.post("/api/tasks/:id/decision", route(async (req, res) => {
   const action = str(req.body?.action) ?? (req.body?.approved ? "approve" : "reject");
   if (!["approve", "reject", "revise"].includes(action)) return res.status(400).json({ error: "action phải là approve, reject hoặc revise" });
-  await company.decide(req.params.id, action as "approve" | "reject" | "revise", str(req.body?.feedback));
+  await company.decide(req.params.id, action as "approve" | "reject" | "revise", str(req.body?.feedback), {
+    confirmWarnings: req.body?.confirmWarnings === true,
+  });
   ok(res);
 }));
 app.post("/api/tasks/:id/retry", route(async (req, res) => ok(res, await company.retryTask(req.params.id))));
@@ -167,10 +169,24 @@ app.post("/api/control/stop", route(async (_req, res) => ok(res, await company.s
 app.post("/api/run-all", route(async (req, res) => {
   const goal = (str(req.body?.goal) ?? "").trim();
   if (!goal) return res.status(400).json({ error: "Thiếu mục tiêu." });
-  const plan = await company.startPlan(goal);
+  const plan = await company.startPlan(goal, str(req.body?.projectDir));
   ok(res, { planId: plan.id });
 }));
-app.post("/api/plan/:id/decision", route(async (req, res) => ok(res, await company.decidePlan(req.params.id, Boolean(req.body?.approved), str(req.body?.feedback)))));
+/** { dir?, verifyCommands? } from a request body — commands as a list or as one command per line. */
+function planProject(body: any): { dir?: string; verifyCommands?: string[] } {
+  const dir = str(body?.projectDir);
+  const raw = body?.verifyCommands;
+  const verifyCommands = Array.isArray(raw)
+    ? raw.filter((c: unknown): c is string => typeof c === "string")
+    : typeof raw === "string"
+      ? raw.split("\n")
+      : undefined;
+  return { dir, verifyCommands };
+}
+app.post("/api/plan/:id/project", route(async (req, res) => ok(res, await company.updatePlanProject(req.params.id, planProject(req.body)))));
+app.post("/api/plan/:id/decision", route(async (req, res) =>
+  ok(res, await company.decidePlan(req.params.id, Boolean(req.body?.approved), str(req.body?.feedback), planProject(req.body))),
+));
 app.post("/api/plan/:id/retry", route(async (req, res) => ok(res, await company.retryPlan(req.params.id))));
 app.post("/api/reset", route(async (_req, res) => ok(res, await company.reset())));
 

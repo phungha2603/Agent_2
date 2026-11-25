@@ -17,6 +17,12 @@ export interface VerifyConfig {
  * claim of success is trusted.
  */
 export async function runVerification(config: VerifyConfig): Promise<VerificationResult> {
+  if (!config.commands.length) {
+    return {
+      passed: false,
+      log: "No verification commands are configured for this task — nothing proves the code builds or its tests pass. Set the project's build/test commands on the plan (or VERIFY_COMMANDS for a single task).",
+    };
+  }
   const logs: string[] = [];
   for (const command of config.commands) {
     logs.push(`$ ${command}`);

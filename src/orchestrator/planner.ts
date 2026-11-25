@@ -1,4 +1,7 @@
+import { readdir } from "node:fs/promises";
+import path from "node:path";
 import type { Agent, ProjectConfig, SendOptions, TaskRecord } from "../types.js";
+import { sendReview, VERDICT_INSTRUCTION } from "../agents/verdict.js";
 import { createPlannedTask, trace } from "./pipeline.js";
 
 export interface Department {
@@ -36,6 +39,23 @@ export interface PlanEpic {
 export interface WorkPlan {
   summary: string;
   epics: PlanEpic[];
+  /** Claude's proposal for how to build and test this goal's project; the CEO confirms or edits it. */
+  verifyCommands?: string[];
+}
+
+/**
+ * Where this plan's code lives and how it is verified. Every task the plan
+ * creates runs exactly these commands in exactly this directory — a plan
+ * can't be approved without them, so no task falls back to a global
+ * command that may be testing some other project.
+ */
+export interface PlanProject {
+  dir: string;
+  verifyCommands: string[];
+  /** Set once the CEO edits the commands — a later redraft then keeps them instead of Claude's new proposal. */
+  commandsByCeo?: boolean;
+  /** Vietnamese notes about the directory (e.g. it already holds other files). */
+  warnings: string[];
 }
 
 export type PlanStatus = "drafting" | "awaiting_approval" | "approved" | "failed" | "discarded";
@@ -53,6 +73,7 @@ export interface WorkPlanRecord extends Partial<WorkPlan> {
   unresolvedReview?: string;
   revisionFeedback?: string;
   error?: string;
+  project?: PlanProject;
   /** Tokens/cost spent drafting and reviewing this plan. */
   usage?: { input: number; output: number; costUsd: number };
 }
@@ -63,6 +84,24 @@ export interface PlanLimits {
 }
 
 export const DEFAULT_PLAN_LIMITS: PlanLimits = { maxEpics: 3, maxSubtasks: 8 };
+
+const IGNORED_ENTRIES = new Set([".DS_Store", ".git", ".gitignore", ".gitkeep"]);
+
+/** What the CEO should know about a plan's project directory before approving: does it exist, and what's already in it. */
+export async function projectDirWarnings(dir: string): Promise<string[]> {
+  if (!path.isAbsolute(dir)) return [`"${dir}" không phải đường dẫn tuyệt đối.`];
+  let entries: string[];
+  try {
+    entries = (await readdir(dir)).filter((e) => !IGNORED_ENTRIES.has(e));
+  } catch {
+    return [`Thư mục chưa tồn tại — sẽ được tạo khi Muse ghi file đầu tiên.`];
+  }
+  if (!entries.length) return [];
+  const shown = entries.slice(0, 8).join(", ");
+  return [
+    `Thư mục đã có ${entries.length} mục (${shown}${entries.length > 8 ? ", …" : ""}). Nếu đó là dự án khác, code mới sẽ trộn vào và lệnh kiểm tra có thể chạy nhầm sang code cũ — nên dùng một thư mục riêng.`,
+  ];
+}
 
 export function newPlanId(): string {
   return `plan-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`;
@@ -81,8 +120,9 @@ export function buildPlanPrompt(goal: string, departments: Department[], limits:
     "- dependsOn: ids of subtasks (in any epic) that must finish first because this one consumes their output. No cycles. Leave it empty whenever work can proceed in parallel.",
     "- rationale: one sentence per epic and subtask on why that owner is the right one (their specialty vs. what the work needs). inputs: what the subtask builds on — which part of the goal, which other subtask's output.",
     "- Write titles, descriptions, criteria, rationale and inputs in the same language as the goal.",
+    "- verifyCommands: the shell commands, in order, that build this goal's project and run its tests for real, run from the project's root directory (e.g. \"swift build\", \"swift test\", \"python3 -m pytest -q\", \"npm test\", \"xcodebuild -list -project App.xcodeproj\"). They are the only proof the code works, so they must exercise this goal's own code and its tests — never a placeholder like echo or true.",
     "Reply with ONLY one JSON object, no prose before or after, in exactly this shape:",
-    '{"summary": "...", "epics": [{"id": "E1", "title": "...", "owner": "AG-05", "goal": "...", "rationale": "...", "acceptanceCriteria": ["..."], "subtasks": [{"id": "E1.S1", "title": "...", "owner": "AG-03", "description": "...", "rationale": "...", "inputs": "...", "acceptanceCriteria": ["..."], "dependsOn": []}]}]}',
+    '{"summary": "...", "epics": [{"id": "E1", "title": "...", "owner": "AG-05", "goal": "...", "rationale": "...", "acceptanceCriteria": ["..."], "subtasks": [{"id": "E1.S1", "title": "...", "owner": "AG-03", "description": "...", "rationale": "...", "inputs": "...", "acceptanceCriteria": ["..."], "dependsOn": []}]}], "verifyCommands": ["..."]}',
     "",
     `Company-wide goal: ${goal}`,
   ];
@@ -95,7 +135,9 @@ export function buildPlanPrompt(goal: string, departments: Department[], limits:
 
 const PLAN_REVIEW_PROMPT =
   "REVIEW: You are reviewing the boss's work plan before the CEO sees it and before any team starts. Check that: the epics and subtasks together actually achieve the goal (nothing important missing, nothing off-goal); each subtask is concrete and owned by a fitting specialist; acceptance criteria are specific and testable; dependencies are real and don't serialize work that could run in parallel. " +
-  "Approve if it's sound. Otherwise reject and list exactly what to change (which epic/subtask, what to add/remove/reword).";
+  "Also check verifyCommands: they must really build and test this goal's code (not a placeholder, not some other project). " +
+  "Approve if it's sound. Otherwise reject and list exactly what to change (which epic/subtask, what to add/remove/reword). " +
+  VERDICT_INSTRUCTION;
 
 function extractJson(text: string): string {
   const fenced = text.match(/```(?:json)?\s*\n([\s\S]*?)\n```/);
@@ -211,7 +253,11 @@ export function parsePlan(text: string, departments: Department[], limits: PlanL
   }
   assertAcyclic(new Map(allSubtasks.map((s) => [s.id, s.dependsOn])));
 
-  return { plan: { summary: typeof raw.summary === "string" ? raw.summary.trim() : "", epics }, notes };
+  const verifyCommands = Array.isArray(raw.verifyCommands)
+    ? raw.verifyCommands.filter((c: unknown): c is string => typeof c === "string" && c.trim().length > 0).map((c: string) => c.trim())
+    : [];
+  if (!verifyCommands.length) notes.push("Plan: Claude proposed no verification commands — set them before approving.");
+  return { plan: { summary: typeof raw.summary === "string" ? raw.summary.trim() : "", epics, verifyCommands }, notes };
 }
 
 /** Plain-text rendering of a plan, for the reviewer. */
@@ -224,6 +270,7 @@ export function renderPlan(plan: WorkPlan): string {
       lines.push(...s.acceptanceCriteria.map((c) => `    AC: ${c}`));
     }
   }
+  lines.push("", `verifyCommands: ${plan.verifyCommands?.length ? plan.verifyCommands.join(" && ") : "(none proposed)"}`);
   return lines.join("\n");
 }
 
@@ -267,7 +314,7 @@ export async function draftAndReviewPlan(
     let verdict: "approve" | "reject" | undefined;
     let reviewText = "";
     try {
-      const review = await agents.gemini.send(PLAN_REVIEW_PROMPT, { title: goal, ideaBrief: renderPlan(last.plan) }, opts.send);
+      const review = await sendReview(agents.gemini, PLAN_REVIEW_PROMPT, { title: goal, ideaBrief: renderPlan(last.plan) }, opts.send);
       verdict = review.verdict;
       reviewText = review.content;
     } catch (err) {

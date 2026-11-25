@@ -209,3 +209,31 @@ describe("Company scheduler", () => {
     await expect(c.startPlan("goal two")).rejects.toThrow(/kế hoạch/);
   });
 });
+
+describe("plan project settings", () => {
+  it("runs every task of the plan in the plan's own directory with its own commands, and won't approve without commands", async () => {
+    const { company: c, dir } = await setup();
+    const projectDir = path.join(dir, "vocab-app");
+    const plan = await c.startPlan("Build the vocab app", projectDir);
+    expect(plan.project?.warnings.join(" ")).toMatch(/chưa tồn tại/);
+    await waitFor(async () => (await c.planSnapshot())?.status === "awaiting_approval");
+    expect((await c.planSnapshot())?.project?.verifyCommands).toEqual(["test -s NOTES.md"]); // Claude's proposal
+
+    await c.updatePlanProject(plan.id, { verifyCommands: [" ", ""] });
+    await expect(c.decidePlan(plan.id, true)).rejects.toThrow(/chưa có lệnh kiểm tra/);
+    await expect(c.updatePlanProject(plan.id, { dir: "relative/path" })).rejects.toThrow(/tuyệt đối/);
+
+    await c.decidePlan(plan.id, true, undefined, { verifyCommands: ["test -s NOTES.md", "true"] });
+    const tasks = await allTasks(c);
+    const detail = await c.taskDetail(tasks[0].id);
+    expect(detail.task.projectConfig).toMatchObject({ verifyCwd: projectDir, verifyCommands: ["test -s NOTES.md", "true"] });
+  });
+
+  it("warns when the project directory already holds other files", async () => {
+    const { company: c, dir } = await setup();
+    const { writeFileSync } = await import("node:fs");
+    writeFileSync(path.join(dir, "factorial.py"), "x = 1\n");
+    const plan = await c.startPlan("goal", dir);
+    expect(plan.project?.warnings.join(" ")).toMatch(/factorial\.py/);
+  });
+});

@@ -128,6 +128,59 @@ async function post(url, body) {
 function truncate(text, max) {
   return text.length <= max ? text : `${text.slice(0, max)}…`;
 }
+function findTaskSnapshot(taskId) {
+  for (const slot of state.slots.values()) {
+    const t = slot.tasks?.find((x) => x.id === taskId);
+    if (t) return t;
+  }
+  return state.drawer.detail?.snapshot?.id === taskId ? state.drawer.detail.snapshot : null;
+}
+
+function redAlerts(t) {
+  return t && t.stage === "checkpoint_final" ? (t.alerts ?? []).filter((a) => a.level === "warn").map((a) => a.text) : [];
+}
+
+/** The warnings gathered during this task's run: red ones block a one-click ship. */
+function alertsBlock(t) {
+  const alerts = t?.alerts ?? [];
+  if (!alerts.length) return "";
+  return alerts
+    .map((a) => `<div class="feedback-box ${a.level === "warn" ? "is-error" : "alert-info"}">${a.level === "warn" ? "⚠" : "ℹ"} ${esc(a.text)}</div>`)
+    .join("");
+}
+
+function shipWarningNote(t) {
+  const n = redAlerts(t).length;
+  return n ? `<div class="gate-note ship-warn">⚠ Có ${n} cảnh báo đỏ — bấm Duyệt sẽ phải xác nhận thêm một lần.</div>` : "";
+}
+
+/** Where the plan's code goes and how it's verified — editable in the plan panel, a summary in the inbox. */
+function planProjectBlock(plan, editable) {
+  const p = plan.project ?? { dir: "", verifyCommands: [], warnings: [] };
+  const warnings = (p.warnings ?? []).map((w) => `<div class="feedback-box is-error">⚠ ${esc(w)}</div>`).join("");
+  const missing = !p.verifyCommands?.length ? `<div class="feedback-box is-error">⚠ Chưa có lệnh kiểm tra — không duyệt được cho tới khi điền.</div>` : "";
+  if (!editable) {
+    return `<div class="plan-project small"><div>📁 <code>${esc(p.dir || "(chưa chọn)")}</code></div><div>🧪 ${p.verifyCommands?.length ? p.verifyCommands.map((c) => `<code>${esc(c)}</code>`).join(" → ") : "<em>chưa có lệnh</em>"}</div>${warnings}${missing}</div>`;
+  }
+  return `<div class="plan-project">
+    <label class="panel-sub">Thư mục dự án (Muse ghi code vào đây, lệnh kiểm tra chạy ở đây)</label>
+    <input class="feedback-input" data-plan-dir="${esc(plan.id)}" value="${esc(p.dir)}" placeholder="/đường/dẫn/tuyệt/đối" />
+    <label class="panel-sub">Lệnh kiểm tra (build/test thật của dự án này) — mỗi dòng một lệnh${p.commandsByCeo ? "" : ", Claude đề xuất"}</label>
+    <textarea class="feedback-input" rows="3" data-plan-cmds="${esc(plan.id)}" placeholder="ví dụ: swift build&#10;swift test">${esc((p.verifyCommands ?? []).join("\n"))}</textarea>
+    ${warnings}${missing}
+    <div class="row-inline"><button class="btn btn-small-inline" data-action="plan-project-save" data-plan="${esc(plan.id)}">Lưu thư mục & lệnh</button></div>
+  </div>`;
+}
+
+function planProjectInputs(planId) {
+  const dir = document.querySelector(`[data-plan-dir="${CSS.escape(planId)}"]`);
+  const cmds = document.querySelector(`[data-plan-cmds="${CSS.escape(planId)}"]`);
+  const out = {};
+  if (dir) out.projectDir = dir.value.trim();
+  if (cmds) out.verifyCommands = cmds.value;
+  return out;
+}
+
 function details(id, summary, inner, cls = "") {
   return `<details class="${cls}" data-open-id="${esc(id)}"${state.open.has(id) ? " open" : ""}><summary>${summary}</summary>${inner}</details>`;
 }
@@ -308,6 +361,7 @@ function taskBody(slot, t) {
     ${ac}
     <div class="logs">${logs}</div>
     ${t.lastError ? `<div class="feedback-box is-error">⚠ ${esc(t.lastError)}</div>` : ""}
+    ${alertsBlock(t)}
     ${!t.waitingForYou && t.lastFeedback ? `<div class="feedback-box reject-hint">💬 ${esc(truncate(t.lastFeedback, 220))}</div>${t.lastFeedback.length > 220 ? details(`fb:${t.id}`, "Xem toàn bộ phản hồi", `<div class="feedback-box">${esc(t.lastFeedback)}</div>`) : ""}` : ""}`;
 }
 
@@ -319,6 +373,7 @@ function taskActions(t) {
     return `
       ${box ? `<div class="checkpoint-box">${esc(box)}</div>` : ""}
       ${final && t.gated ? `<div class="gate-note">🔒 Cổng duyệt: kết quả chỉ bàn giao cho bước sau khi bạn duyệt.</div>` : ""}
+      ${final ? shipWarningNote(t) : ""}
       <input class="feedback-input" placeholder="${final ? "Yêu cầu sửa / lý do từ chối (tuỳ chọn)" : "Lý do từ chối (tuỳ chọn)"}" data-feedback-for="${esc(t.id)}" />
       <div class="decision-row">
         <button class="btn btn-approve" data-action="approve" data-task="${esc(t.id)}">Duyệt</button>
@@ -488,7 +543,7 @@ function renderPlanPanel() {
       )
       .join("")}</div>`;
   }
-  const sig = `${plan.id}|${plan.status}`;
+  const sig = `${plan.id}|${plan.status}|${JSON.stringify(plan.project ?? null)}`;
   const prev = panel.querySelector('[data-part="plan-actions"]');
   const keep = prev && prev.dataset.sig === sig ? prev : null;
   panel.innerHTML = `
@@ -504,7 +559,8 @@ function renderPlanPanel() {
     actions.dataset.sig = sig;
     actions.innerHTML =
       plan.status === "awaiting_approval"
-        ? `<input class="feedback-input" placeholder="Feedback nếu từ chối (Sếp sẽ lập lại theo ý này)" data-plan-feedback="${esc(plan.id)}" />
+        ? `${planProjectBlock(plan, true)}
+           <input class="feedback-input" placeholder="Feedback nếu từ chối (Sếp sẽ lập lại theo ý này)" data-plan-feedback="${esc(plan.id)}" />
            <div class="decision-row"><button class="btn btn-approve" data-action="plan-approve" data-plan="${esc(plan.id)}">Duyệt kế hoạch — giao việc</button><button class="btn btn-reject" data-action="plan-reject" data-plan="${esc(plan.id)}">Từ chối & lập lại</button></div>`
         : "";
   }
@@ -737,7 +793,7 @@ function inboxWaitingItem({ slot, t }, snoozed) {
   const final = t.stage === "checkpoint_final";
   const r = t.review;
   const body = final
-    ? `<div class="rv-chips">${verdictChip(r.verification, "Build/test")}${verdictChip(r.gemini, r.geminiStandIn ? "Claude (thay Gemini)" : "Gemini")}${verdictChip(r.claude, "Claude chốt")}${t.acceptanceCriteria.length ? `<span class="rv-chip na">${t.acceptanceCriteria.length} tiêu chí</span>` : ""}${t.gated ? `<span class="rv-chip gate">🔒 cổng duyệt</span>` : ""}</div>${t.lastFeedback ? details(`rvfb:${t.id}`, "Phản hồi gần nhất", `<div class="feedback-box">${esc(t.lastFeedback)}</div>`) : ""}`
+    ? `<div class="rv-chips">${verdictChip(r.verification, "Build/test")}${verdictChip(r.gemini, r.geminiStandIn ? "Claude (thay Gemini)" : "Gemini")}${verdictChip(r.claude, "Claude chốt")}${t.acceptanceCriteria.length ? `<span class="rv-chip na">${t.acceptanceCriteria.length} tiêu chí</span>` : ""}${t.gated ? `<span class="rv-chip gate">🔒 cổng duyệt</span>` : ""}</div>${alertsBlock(t)}${t.lastFeedback ? details(`rvfb:${t.id}`, "Phản hồi gần nhất", `<div class="feedback-box">${esc(t.lastFeedback)}</div>`) : ""}`
     : `<div class="rv-brief">${esc((t.checkpointBrief || "").slice(0, 420))}${(t.checkpointBrief || "").length > 420 ? "…" : ""}</div>`;
   return `
     <div class="rv-item">
@@ -789,6 +845,7 @@ function renderInbox() {
     if (d.planWaiting) {
       html += `<div class="rv-item rv-plan"><div class="rv-head"><span class="owner lead">AG-01</span> <span class="qstate q-waiting_you">Duyệt kế hoạch</span></div><div class="rv-title">${esc(state.plan.goal)}</div>
         <div class="rv-brief">${esc(state.plan.summary ?? "")} · ${state.plan.epics?.length ?? 0} epic, ${(state.plan.epics ?? []).reduce((n, e) => n + e.subtasks.length, 0)} subtask${state.plan.unresolvedReview ? " · ⚠ Gemini còn ý kiến" : ""}</div>
+        ${planProjectBlock(state.plan, false)}
         <textarea rows="1" data-keep="rv:plan" data-plan-feedback="${esc(state.plan.id)}" placeholder="Feedback nếu từ chối (Sếp sẽ lập lại theo ý này)"></textarea>
         <div class="decision-row"><button class="btn btn-approve" data-action="plan-approve" data-plan="${esc(state.plan.id)}">Duyệt kế hoạch</button><button class="btn btn-reject" data-action="plan-reject" data-plan="${esc(state.plan.id)}">Từ chối & lập lại</button><button class="btn btn-ghost" data-action="goto-panel" data-target="plan-panel">Xem cây việc</button></div></div>`;
     }
@@ -1253,6 +1310,7 @@ function drawerOverview(d) {
   const decision = s.waitingForYou
     ? `<div class="drawer-section"><div class="panel-sub">Quyết định của bạn</div>
         ${s.checkpointBrief ? `<div class="checkpoint-box">${esc(s.checkpointBrief)}</div>` : ""}
+        ${task.stage === "checkpoint_final" ? shipWarningNote(s) : ""}
         <textarea data-keep="decision-fb" data-feedback-for="${esc(task.id)}" rows="2" placeholder="Yêu cầu sửa / lý do từ chối (tuỳ chọn)"></textarea>
         <div class="decision-row"><button class="btn btn-approve" data-action="approve" data-task="${esc(task.id)}">Duyệt</button>${task.stage === "checkpoint_final" ? `<button class="btn btn-revise" data-action="revise" data-task="${esc(task.id)}">Yêu cầu sửa</button>` : ""}<button class="btn btn-reject" data-action="reject" data-task="${esc(task.id)}">Từ chối</button></div></div>`
     : "";
@@ -1260,6 +1318,7 @@ function drawerOverview(d) {
   return `
     ${decision}
     ${s.lastError ? `<div class="feedback-box is-error">⚠ ${esc(s.lastError)}</div><button class="btn btn-small btn-retry" data-action="retry" data-task="${esc(task.id)}">↻ Thử lại</button>` : ""}
+    ${alertsBlock(s)}
     ${s.queueState === "rejected" ? `<button class="btn btn-small btn-retry" data-action="retry" data-task="${esc(task.id)}">↻ Thử lại với ngân sách mới</button>` : ""}
     <div class="drawer-section kpis">
       <div><b>${s.totals.runs}</b><span>lượt chạy</span></div>
@@ -1493,7 +1552,9 @@ document.addEventListener("click", async (e) => {
         toast("Ghi rõ cần sửa gì vào ô phản hồi trước khi bấm Yêu cầu sửa.");
         return;
       }
-      if (await post(`/api/tasks/${encodeURIComponent(ds.task)}/decision`, { action, feedback: fb })) refreshDrawer();
+      const warns = action === "approve" ? redAlerts(findTaskSnapshot(ds.task)) : [];
+      if (warns.length && !confirm(`Kết quả này có ${warns.length} cảnh báo đỏ:\n\n- ${warns.join("\n- ")}\n\nVẫn ship?`)) return;
+      if (await post(`/api/tasks/${encodeURIComponent(ds.task)}/decision`, { action, feedback: fb, confirmWarnings: warns.length > 0 })) refreshDrawer();
     }
     if (action === "retry") (await post(`/api/tasks/${encodeURIComponent(ds.task)}/retry`)) && refreshDrawer();
     if (action === "prioritize") (await post(`/api/tasks/${encodeURIComponent(ds.task)}/move`, { toSlot: ds.slot, position: "top" })) && toast("Đã đưa lên đầu hàng đợi.");
@@ -1530,7 +1591,10 @@ document.addEventListener("click", async (e) => {
     }
     if (action === "plan-approve" || action === "plan-reject") {
       const fb = [...document.querySelectorAll(`[data-plan-feedback="${CSS.escape(ds.plan)}"]`)].map((x) => x.value).find((v) => v.trim()) ?? "";
-      await post(`/api/plan/${encodeURIComponent(ds.plan)}/decision`, { approved: action === "plan-approve", feedback: fb });
+      await post(`/api/plan/${encodeURIComponent(ds.plan)}/decision`, { approved: action === "plan-approve", feedback: fb, ...planProjectInputs(ds.plan) });
+    }
+    if (action === "plan-project-save") {
+      if (await post(`/api/plan/${encodeURIComponent(ds.plan)}/project`, planProjectInputs(ds.plan))) toast("Đã lưu thư mục & lệnh kiểm tra.");
     }
     if (action === "plan-retry") await post(`/api/plan/${encodeURIComponent(ds.plan)}/retry`);
     if (action === "rebalance") {
@@ -1631,7 +1695,9 @@ document.addEventListener("change", (e) => {
 $("#run-all-btn").addEventListener("click", async () => {
   const goal = goalInput.value.trim();
   if (!goal) return toast("Nhập mục tiêu chung cho cả công ty trước đã.");
-  if (await post("/api/run-all", { goal })) toast("Đã giao mục tiêu cho Sếp — đang lập cây công việc.");
+  const projectDir = $("#project-dir-input").value.trim();
+  if (!projectDir) return toast("Nhập thư mục dự án (đường dẫn tuyệt đối) — nơi code của mục tiêu này được ghi và kiểm tra.");
+  if (await post("/api/run-all", { goal, projectDir })) toast("Đã giao mục tiêu cho Sếp — đang lập cây công việc.");
 });
 $("#pause-btn").addEventListener("click", async () => {
   await post(state.control.paused ? "/api/control/resume" : "/api/control/pause");
@@ -1674,6 +1740,11 @@ function setView(view) {
 function applyStatus(data) {
   state.slots = new Map(data.slots.map((s) => [s.id, s]));
   state.plan = data.plan;
+  const dirInput = $("#project-dir-input");
+  if (dirInput && !dirInput.value && !dirInput.dataset.filled && data.settings?.defaultProjectDir) {
+    dirInput.value = data.settings.defaultProjectDir;
+    dirInput.dataset.filled = "1";
+  }
   state.engines = data.engines;
   state.telemetry = data.telemetry;
   state.insights = data.insights;

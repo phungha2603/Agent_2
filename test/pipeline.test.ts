@@ -101,13 +101,13 @@ describe("pipeline", () => {
       role: "muse",
       async send(): Promise<AgentResponse> {
         museCalls += 1;
-        return { role: "muse", content: "FILE: a.txt\nhello" };
+        return { role: "muse", content: "FILE: a.txt\n```\nhello\n```" };
       },
     };
 
     await draftImplementation(task, agents({ muse: countingMuse }));
     expect(museCalls).toBe(1);
-    expect(task.context.implementationDiff).toBe("FILE: a.txt\nhello");
+    expect(task.context.implementationDiff).toBe("FILE: a.txt\n```\nhello\n```");
     expect(task.implementationAttempts).toBe(1);
     expect(task.stage).toBe("implementation"); // not advanced yet — nothing written
     expect(() => readFileSync(path.join(cfg.verify.cwd, "a.txt"), "utf8")).toThrow(); // disk untouched
@@ -115,7 +115,7 @@ describe("pipeline", () => {
     await applyImplementation(task, cfg);
     expect(museCalls).toBe(1); // the write never re-asks Muse
     expect(task.stage).toBe("verification");
-    expect(readFileSync(path.join(cfg.verify.cwd, "a.txt"), "utf8")).toBe("hello");
+    expect(readFileSync(path.join(cfg.verify.cwd, "a.txt"), "utf8")).toBe("hello\n");
   });
 
   it("never reaches done when verification keeps failing — it gives up instead", async () => {

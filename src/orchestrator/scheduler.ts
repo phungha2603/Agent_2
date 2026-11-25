@@ -18,7 +18,17 @@ import {
   type PipelineConfig,
 } from "./pipeline.js";
 import { buildHandoff, reachedHandoffPoint, type HandoffPoint } from "./handoff.js";
-import { draftAndReviewPlan, materializePlan, newPlanId, type Department, type PlanLimits, type WorkPlan, type WorkPlanRecord } from "./planner.js";
+import path from "node:path";
+import {
+  draftAndReviewPlan,
+  materializePlan,
+  newPlanId,
+  projectDirWarnings,
+  type Department,
+  type PlanLimits,
+  type WorkPlan,
+  type WorkPlanRecord,
+} from "./planner.js";
 import { parseFileBlocks } from "../apply/applyFiles.js";
 import { buildRebalancePrompt, parseRebalance, type LoadSlot, type RebalanceProposal } from "./rebalance.js";
 import { loadTask, saveTask, taskExists } from "../store/taskStore.js";
@@ -109,6 +119,8 @@ export interface TaskSnapshot {
   /** How many Claude↔Gemini architecture rounds and review rejections this task has gone through so far. */
   architectureRounds: number;
   reviewRejections: number;
+  /** Warnings for the CEO; "warn" ones make shipping ask for a second confirmation. */
+  alerts: { level: "warn" | "info"; text: string }[];
 }
 
 export interface SlotSnapshot {
@@ -219,6 +231,12 @@ class UserError extends Error {}
  * in parallel; implementation+verification is serialized across tasks
  * because they all write into, and build, the same VERIFY_CWD.
  */
+/** Red warnings on a result waiting for final approval — shipping it needs an explicit second confirmation. */
+export function shipWarnings(task: TaskRecord): string[] {
+  if (task.stage !== "checkpoint_final") return [];
+  return (task.alerts ?? []).filter((a) => a.level === "warn").map((a) => a.text);
+}
+
 export class Company extends EventEmitter {
   readonly engines: Record<EngineName, Semaphore>;
   private readonly agents: Agents;
@@ -369,12 +387,21 @@ export class Company extends EventEmitter {
   }
 
   /** approve / reject (redesign from ideation) / revise (back to implementation with the CEO's change request). */
-  async decide(taskId: string, action: boolean | "approve" | "reject" | "revise", feedback?: string): Promise<void> {
+  async decide(
+    taskId: string,
+    action: boolean | "approve" | "reject" | "revise",
+    feedback?: string,
+    opts: { confirmWarnings?: boolean } = {},
+  ): Promise<void> {
     const act = action === true ? "approve" : action === false ? "reject" : action;
     if (this.workers.has(taskId)) throw new UserError("Task đang chạy.");
     const task = await this.load(taskId);
     if (!task) throw new UserError(`Không tìm thấy task ${taskId}.`);
     if (!isWaitingForHuman(task)) throw new UserError(`Task không ở điểm chờ duyệt (stage: ${task.stage}).`);
+    const warnings = shipWarnings(task);
+    if (act === "approve" && warnings.length && !opts.confirmWarnings) {
+      throw new UserError(`Task có ${warnings.length} cảnh báo đỏ — xem và xác nhận trước khi ship:\n- ${warnings.join("\n- ")}`);
+    }
     const hadHandoff = Boolean(task.handoff);
     const gated = this.isGated(task);
 
@@ -396,13 +423,14 @@ export class Company extends EventEmitter {
   }
 
   /** The CEO approving every task currently waiting at a checkpoint in one go. Returns how many were approved. */
+  /** Approves everything waiting — except results with red warnings, which need their own look. */
   async approveAllWaiting(): Promise<number> {
     let approved = 0;
     for (const ids of Object.values(this.state.slots)) {
       for (const id of [...ids]) {
         if (this.workers.has(id)) continue;
         const task = await this.load(id);
-        if (task && isWaitingForHuman(task)) {
+        if (task && isWaitingForHuman(task) && !shipWarnings(task).length) {
           await this.decide(id, "approve");
           approved++;
         }
@@ -534,13 +562,22 @@ export class Company extends EventEmitter {
     return { taskId: target.id, created };
   }
 
-  async startPlan(goal: string): Promise<WorkPlanRecord> {
+  async startPlan(goal: string, projectDir?: string): Promise<WorkPlanRecord> {
     const current = await this.activePlan();
     if (current && (current.status === "drafting" || current.status === "awaiting_approval")) {
       throw new UserError("Đang có một kế hoạch đang lập hoặc chờ duyệt — hãy quyết kế hoạch đó trước.");
     }
+    const dir = projectDir?.trim() || this.defaultProjectDir();
+    if (dir && !path.isAbsolute(dir)) throw new UserError(`Thư mục dự án phải là đường dẫn tuyệt đối (bắt đầu bằng /): "${dir}".`);
     const now = nowIso();
-    const plan: WorkPlanRecord = { id: newPlanId(), goal: goal.trim(), status: "drafting", createdAt: now, updatedAt: now };
+    const plan: WorkPlanRecord = {
+      id: newPlanId(),
+      goal: goal.trim(),
+      status: "drafting",
+      createdAt: now,
+      updatedAt: now,
+      project: { dir, verifyCommands: [], warnings: dir ? await projectDirWarnings(dir) : ["Chưa chọn thư mục dự án."] },
+    };
     await savePlan(plan);
     await this.mutateState((s) => (s.activePlanId = plan.id));
     this.emitPlan();
@@ -548,11 +585,47 @@ export class Company extends EventEmitter {
     return plan;
   }
 
-  async decidePlan(planId: string, approved: boolean, feedback?: string): Promise<void> {
+  private defaultProjectDir(): string {
+    return this.projectConfig()?.verifyCwd || this.pipeline.verify.cwd || "";
+  }
+
+  /** The CEO sets or corrects where the plan's code lives and how it's verified, before approving. */
+  async updatePlanProject(planId: string, update: { dir?: string; verifyCommands?: string[] }): Promise<WorkPlanRecord> {
+    const plan = await loadPlan(planId);
+    if (!plan || (plan.status !== "awaiting_approval" && plan.status !== "drafting")) {
+      throw new UserError("Chỉ sửa được thư mục / lệnh kiểm tra khi kế hoạch đang lập hoặc chờ duyệt.");
+    }
+    const project = plan.project ?? { dir: "", verifyCommands: [], warnings: [] };
+    if (update.dir !== undefined) {
+      const dir = update.dir.trim();
+      if (!path.isAbsolute(dir)) throw new UserError(`Thư mục dự án phải là đường dẫn tuyệt đối (bắt đầu bằng /): "${dir}".`);
+      project.dir = dir;
+      project.warnings = await projectDirWarnings(dir);
+    }
+    if (update.verifyCommands !== undefined) {
+      project.verifyCommands = update.verifyCommands.map((c) => c.trim()).filter(Boolean);
+      project.commandsByCeo = true;
+    }
+    plan.project = project;
+    plan.updatedAt = nowIso();
+    await savePlan(plan);
+    this.emitPlan();
+    return plan;
+  }
+
+  async decidePlan(planId: string, approved: boolean, feedback?: string, project?: { dir?: string; verifyCommands?: string[] }): Promise<void> {
+    if (project && (project.dir !== undefined || project.verifyCommands !== undefined)) await this.updatePlanProject(planId, project);
     const plan = await loadPlan(planId);
     if (!plan || plan.status !== "awaiting_approval") throw new UserError("Kế hoạch không ở trạng thái chờ duyệt.");
     if (approved) {
-      const tasks = materializePlan(plan, this.projectConfig());
+      const dir = plan.project?.dir ?? "";
+      const commands = plan.project?.verifyCommands ?? [];
+      if (!dir) throw new UserError("Kế hoạch chưa có thư mục dự án — điền thư mục rồi mới duyệt.");
+      if (!commands.length) {
+        throw new UserError("Kế hoạch chưa có lệnh kiểm tra (build/test) — điền lệnh rồi mới duyệt, nếu không sẽ không có gì chứng minh code chạy được.");
+      }
+      const base = this.projectConfig();
+      const tasks = materializePlan(plan, { ...base, verifyCwd: dir, verifyCommands: commands });
       for (const t of tasks) await saveTask(t);
       plan.status = "approved";
       await savePlan(plan);
@@ -1027,7 +1100,7 @@ export class Company extends EventEmitter {
       insights: await this.insights(idx),
       control: this.control(),
       rebalance: this.rebalanceSnapshot(),
-      settings: { handoffOn: this.settings.handoffOn, stageErrorRetries: this.settings.stageErrorRetries, maxAutoRecoveries: this.pipeline.maxAutoRecoveries ?? 0 },
+      settings: { defaultProjectDir: this.defaultProjectDir(), handoffOn: this.settings.handoffOn, stageErrorRetries: this.settings.stageErrorRetries, maxAutoRecoveries: this.pipeline.maxAutoRecoveries ?? 0 },
     };
   }
 
@@ -1200,6 +1273,10 @@ export class Company extends EventEmitter {
       await draftImplementation(task, this.agents, hooks);
       await this.withEngine("workspace", task.id, async () => {
         await applyImplementation(task, this.pipeline);
+        // A refused attempt (no files, or files that failed the pre-write
+        // checks) stays at implementation or is out of budget — nothing was
+        // written, so there is nothing to verify.
+        if (task.stage !== "verification") return;
         // Verify while still holding the workspace, so no other task's
         // files land between this task's write and its build.
         this.finishRun(task, "ok");
@@ -1385,7 +1462,10 @@ export class Company extends EventEmitter {
           this.emitPlan();
         },
       });
+      const project = plan.project ?? { dir: this.defaultProjectDir(), verifyCommands: [], warnings: [] };
+      if (!project.commandsByCeo) project.verifyCommands = res.plan.verifyCommands ?? [];
       Object.assign(plan, {
+        project,
         summary: res.plan.summary,
         epics: res.plan.epics,
         notes: res.notes,
@@ -1659,6 +1739,7 @@ export class Company extends EventEmitter {
       checkpointBrief: task.stage === "checkpoint_idea" ? task.context.ideaBrief : undefined,
       lastFeedback: task.context.reviewFeedback?.length ? task.context.reviewFeedback.join("\n").slice(0, 1500) : undefined,
       lastError: task.lastError ? `${task.lastError.stage}: ${task.lastError.message}`.slice(0, 1500) : undefined,
+      alerts: (task.alerts ?? []).map((a) => ({ level: a.level, text: a.text })),
       logs: task.history.slice(-4).map((h) => ({ at: hhmm(h.at), text: h.summary })),
       acceptanceCriteria: task.context.acceptanceCriteria ?? [],
       deps: { total: deps.total, ready: deps.handoffs.length, waitingOn: deps.waitingOn, blockedBy: deps.blockedBy },

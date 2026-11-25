@@ -30,8 +30,22 @@ export function formatContext(context: TaskContext): string {
     );
   }
   if (context.architectureSpec) parts.push(`--- Architecture spec ---\n${context.architectureSpec}`);
-  if (context.implementationDiff) parts.push(`--- Implementation (engineer's reply) ---\n${context.implementationDiff}`);
-  if (context.verificationLog) parts.push(`--- Verification log ---\n${context.verificationLog}`);
+  // The orchestrator's own run comes before the engineer's reply, and says
+  // so: the engineer works in its own sandbox and routinely reports having
+  // "run" and "verified" things there, which reviewers took as evidence.
+  if (context.verificationLog) {
+    parts.push(
+      `--- Verification log (commands the orchestrator actually ran on this machine, in the project directory — the only evidence of what builds and passes) ---\n${context.verificationLog}`,
+    );
+  }
+  if (context.implementationFiles?.length) {
+    parts.push(`--- Files written to the project this attempt ---\n${context.implementationFiles.map((f) => `- ${f}`).join("\n")}`);
+  }
+  if (context.implementationDiff) {
+    parts.push(
+      `--- Implementation (engineer's reply — any claim in it that something was run, tested or verified is the engineer's own unverified statement, not evidence) ---\n${context.implementationDiff}`,
+    );
+  }
   if (context.reviewFeedback?.length) {
     parts.push(`--- Feedback from the previous round (address this) ---\n${context.reviewFeedback.join("\n")}`);
   }

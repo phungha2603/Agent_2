@@ -3,6 +3,7 @@ import { formatContext } from "./context.js";
 import { readImageParts } from "./imageParts.js";
 import { HttpStatusError, createKeyPool, withKeyRotation, withRetry } from "./retry.js";
 import { SseDecoder, geminiChunkText, geminiUsageOf } from "./streamParsers.js";
+import { verdictFor } from "./verdict.js";
 
 const DEFAULT_MODEL = "gemini-2.5-pro";
 
@@ -85,9 +86,7 @@ export function createGeminiAgent(opts: { apiKeys: string[]; model?: string }): 
         return withKeyRotation(keyPool, requestWithKey);
       });
 
-      const verdict = prompt.startsWith("REVIEW:")
-        ? (/\breject\b/i.test(text) ? "reject" : "approve")
-        : undefined;
+      const verdict = verdictFor(prompt, text);
       return { role: "gemini", content: text, verdict, usage };
     },
   };

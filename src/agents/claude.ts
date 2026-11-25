@@ -2,6 +2,7 @@ import type { Agent, AgentResponse, SendOptions, TaskContext, Usage } from "../t
 import { formatContext } from "./context.js";
 import { HttpStatusError, withRetry } from "./retry.js";
 import { SseDecoder, anthropicChunkText, anthropicInputTokens, anthropicStreamUsage } from "./streamParsers.js";
+import { verdictFor } from "./verdict.js";
 
 const DEFAULT_MODEL = "claude-sonnet-5";
 // Architecture guides are meant to be step-by-step and exhaustive; 2048
@@ -65,9 +66,7 @@ export function createClaudeAgent(opts: { apiKey: string; model?: string }): Age
         }
         return { text: full, usage: u };
       });
-      const verdict = prompt.startsWith("REVIEW:")
-        ? (/\breject\b/i.test(text) ? "reject" : "approve")
-        : undefined;
+      const verdict = verdictFor(prompt, text);
       return { role: "claude", content: text, verdict, usage };
     },
   };

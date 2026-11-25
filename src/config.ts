@@ -50,8 +50,12 @@ function verifyCwd(): string {
   return process.env.VERIFY_CWD ?? process.cwd();
 }
 
+/** Empty when unset: a placeholder command that always "passes" is how unrelated work got verified. */
 function verifyCommands(): string[] {
-  return (process.env.VERIFY_COMMANDS ?? "echo 'no verification command configured'").split(",").map((s) => s.trim());
+  return (process.env.VERIFY_COMMANDS ?? "")
+    .split(",")
+    .map((s) => s.trim())
+    .filter(Boolean);
 }
 
 const VISUAL_DATA_DIR = path.resolve(process.cwd(), "data/visual");

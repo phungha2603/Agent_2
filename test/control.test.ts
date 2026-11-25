@@ -330,7 +330,12 @@ describe("engine queues and checkpoint waits", () => {
     expect(snap.review).toEqual({ verification: "passed", gemini: "approve", geminiStandIn: false, claude: "approve" });
     expect(snap.waitingSince).toBeTruthy();
 
-    await c.decide(id, "approve");
+    // Its verify command is a bare `true`, which never touches the file Muse
+    // wrote: that's a red warning, so shipping needs an explicit confirmation.
+    expect(snap.alerts.map((a: any) => a.level)).toContain("warn");
+    await expect(c.decide(id, "approve")).rejects.toThrow(/cảnh báo đỏ/);
+    expect(await c.approveAllWaiting()).toBe(0); // bulk approval skips results with red warnings
+    await c.decide(id, "approve", undefined, { confirmWarnings: true });
     const runs = (await c.taskDetail(id)).task.runs!.filter((r: any) => r.human);
     expect(runs.map((r: any) => [r.stage, r.decision, Boolean(r.endedAt)])).toEqual([
       ["checkpoint_idea", "approve", true],

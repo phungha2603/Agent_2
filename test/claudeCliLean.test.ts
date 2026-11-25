@@ -18,7 +18,7 @@ process.stdin.on("end", () => {
     process.stderr.write("error: unknown option '--tools'\\n");
     process.exit(1);
   }
-  console.log(JSON.stringify({ type: "result", subtype: "success", is_error: false, result: JSON.stringify(args) }));
+  console.log(JSON.stringify({ type: "result", subtype: "success", is_error: false, result: JSON.stringify(args.concat(["CWD=" + process.cwd()])) }));
 });
 `,
   );
@@ -42,6 +42,16 @@ describe("Claude CLI lean mode", () => {
     const full = await argsOf(createClaudeCliAgent({ command: fakeClaude(), tools: "default" }));
     expect(full).not.toContain("--tools");
     expect(full).not.toContain("--strict-mcp-config");
+  });
+
+  it("lets one call read the task's own project: per-call tools and working directory win over the agent's defaults", async () => {
+    const project = mkdtempSync(path.join(tmpdir(), "project-"));
+    const agent = createClaudeCliAgent({ command: fakeClaude(), cwd: tmpdir() });
+    const args = JSON.parse((await agent.send("x", { title: "t" }, { tools: "Read,Grep,Glob", cwd: project })).content) as string[];
+    expect(args[args.indexOf("--tools") + 1]).toBe("Read,Grep,Glob");
+    expect(args.at(-1)).toMatch(new RegExp(`CWD=.*${path.basename(project)}$`));
+    const plain = await argsOf(agent); // the next call without options is back to the lean default
+    expect(plain[plain.indexOf("--tools") + 1]).toBe("");
   });
 
   it("falls back to the full CLI, once, when an old CLI doesn't know the flags", async () => {

@@ -102,18 +102,39 @@ export function createMuseAgent(opts: { serverPath: string; profileDir?: string;
       // ({ reply, messages, threadUrl, ... }) as one JSON-stringified text
       // block, so the actual chat reply is nested inside it — unwrap it,
       // falling back to the raw text if it isn't JSON shaped that way.
-      let reply = rawText;
+      let parsed: any;
       try {
-        const parsed = JSON.parse(rawText);
-        if (parsed && typeof parsed.reply === "string") {
-          reply = parsed.reply;
-        }
+        parsed = JSON.parse(rawText);
       } catch {
         // Not JSON (e.g. an error string) — use rawText as-is.
       }
-      return { role: "muse", content: reply };
+      if (!parsed || typeof parsed.reply !== "string") return { role: "muse", content: rawText };
+      return { role: "muse", content: museReplyOrThrow(parsed, timeoutSec) };
     },
   };
+}
+
+/**
+ * The reply text, only if it is the Markdown Muse wrote. Text read off the
+ * rendered chat page ("rendered-text", or an older Muse-Chat-MCP that
+ * doesn't say) has already lost `#` comments, indentation and `__names__`,
+ * and writing it to disk as code is how projects got corrupted — so that is
+ * an error, never a reply. A timed-out reply is cut off mid-file, so it is
+ * one too.
+ */
+export function museReplyOrThrow(parsed: { reply: string; replyFormat?: string; timedOut?: boolean; error?: string }, timeoutSec: number): string {
+  if (parsed.timedOut) {
+    throw new Error(`Muse did not finish replying within ${timeoutSec}s (MUSE_TIMEOUT_SEC) — the partial reply was discarded.`);
+  }
+  if (!parsed.reply.trim() && parsed.error) throw new Error(`Muse reported an error: ${parsed.error}`);
+  if (parsed.replyFormat !== "markdown-copy" && parsed.replyFormat !== "markdown-dom") {
+    throw new Error(
+      parsed.replyFormat
+        ? `Muse-Chat-MCP could only read the reply as rendered page text (${parsed.replyFormat}), not as Markdown — refusing to use it as code.`
+        : "Muse-Chat-MCP did not say how it read the reply (no replyFormat) — it is an older version that returns rendered page text, which corrupts code. Update it to the branch that reads replies as Markdown.",
+    );
+  }
+  return parsed.reply;
 }
 
 /**

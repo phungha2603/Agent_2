@@ -37,6 +37,10 @@ export interface SendOptions {
   taskId?: string;
   /** Aborts the call in flight (Stop). */
   signal?: AbortSignal;
+  /** The project directory this call is about — where an agent that can read files runs. */
+  cwd?: string;
+  /** Tool list for this call only (Claude CLI), e.g. "Read,Grep,Glob"; unset = the agent's own setting. */
+  tools?: string;
 }
 
 export interface Agent {
@@ -147,6 +151,20 @@ export interface TraceEntry {
   text: string;
 }
 
+/**
+ * Something the CEO should know before shipping, shown on the card and in
+ * the final approval box. "warn" ones make Ship ask for a second
+ * confirmation. One per kind — a newer one of the same kind replaces it.
+ */
+export interface TaskAlert {
+  kind: "no_files" | "files_rejected" | "files_broken" | "verify_coverage" | "verify_unconfigured" | "spec_rewritten" | "gemini_down";
+  level: "warn" | "info";
+  at: string;
+  stage: Stage;
+  /** Vietnamese, for the dashboard. */
+  text: string;
+}
+
 export interface TaskError {
   at: string;
   stage: Stage;
@@ -186,6 +204,8 @@ export interface TaskRecord {
   stageStartedAt?: string;
   runs?: StageRun[];
   trace?: TraceEntry[];
+  /** Warnings for the CEO gathered during the current run (cleared when a checkpoint sends the task on). */
+  alerts?: TaskAlert[];
   /** A CEO directive asking to redo the work, applied once the stage currently running finishes. */
   redoRequested?: string;
 }

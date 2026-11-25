@@ -3,6 +3,8 @@ import type { Agent, AgentResponse, RoleName, SendOptions, TaskContext } from ".
 /** A deterministic plan for dry runs: 3 epics, 6 subtasks, a few dependencies. */
 export const MOCK_PLAN = {
   summary: "Mock plan: data pipeline and model, content, and a quality/release track.",
+  // The mock engineer writes NOTES.md, so this really checks what it wrote.
+  verifyCommands: ["test -s NOTES.md"],
   epics: [
     {
       id: "E1",
@@ -68,7 +70,7 @@ export function createMockAgent(role: RoleName): Agent {
     switch (role) {
       case "gemini":
         if (prompt.startsWith("REVIEW:")) {
-          return { role, verdict: "approve", content: "Gemini review: looks consistent with the brief." };
+          return { role, verdict: "approve", content: "Gemini review: looks consistent with the brief.\nVERDICT: APPROVE" };
         }
         return { role, content: `Idea brief for "${context.title}": goals, target users, and a rough scope outline.` };
       case "claude":
@@ -79,9 +81,16 @@ export function createMockAgent(role: RoleName): Agent {
           return { role, content: JSON.stringify(mockRebalance(prompt)) };
         }
         if (prompt.startsWith("REVIEW:")) {
-          return { role, verdict: "approve", content: "Claude sign-off: architecture followed, no blocking concerns." };
+          return { role, verdict: "approve", content: "Claude sign-off: architecture followed, no blocking concerns.\nVERDICT: APPROVE" };
         }
-        return { role, content: `Architecture spec for "${context.title}": modules, data flow, and interfaces Muse should implement (no code).` };
+        return {
+          role,
+          content:
+            `Architecture spec for "${context.title}" (mock).\n\n` +
+            "Files: NOTES.md — a short implementation note naming the task.\n" +
+            "Build order: write NOTES.md, then run the plan's verification commands.\n" +
+            "Acceptance: each criterion is checked against NOTES.md by the verification step; no other files are needed for this dry run.",
+        };
       case "muse":
         return { role, content: `FILE: NOTES.md\n\`\`\`md\n# ${context.title}\n\nMock implementation note.\n\`\`\`\n` };
       default:

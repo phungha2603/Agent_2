@@ -11,7 +11,7 @@ const DEPTS: Department[] = [
   ...["AG-03", "AG-04", "AG-06", "AG-07", "AG-09", "AG-10"].map((id) => ({ id, name: `Staff ${id}`, tier: 3 as const })),
 ];
 
-const plan = (epics: unknown[]) => JSON.stringify({ summary: "s", epics });
+const plan = (epics: unknown[]) => JSON.stringify({ summary: "s", epics, verifyCommands: ["npm test"] });
 const sub = (id: string, owner: string, dependsOn: string[] = []) => ({ id, title: id, owner, description: "d", acceptanceCriteria: ["c"], dependsOn });
 const epic = (id: string, owner: string, subtasks: unknown[]) => ({ id, title: id, owner, goal: "g", acceptanceCriteria: ["ec"], subtasks });
 

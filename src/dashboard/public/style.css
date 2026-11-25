@@ -306,6 +306,10 @@ pre.live {
 .feedback-box.is-error { border-color: var(--red); color: #ffb4b4; }
 .feedback-box.reject-hint { border-color: var(--gold); color: var(--text); max-height: none; }
 .gate-note { font-size: 11px; color: var(--gold); margin: 4px 0; }
+.gate-note.ship-warn { color: var(--red); font-weight: 600; }
+.feedback-box.alert-info { border-color: var(--card-border); color: var(--text-dim); }
+.plan-project { display: flex; flex-direction: column; gap: 4px; margin: 6px 0; }
+.plan-project code { word-break: break-all; }
 .qstate.round-badge { border-color: var(--gold); color: var(--gold); }
 
 .decision-row { display: flex; gap: 6px; margin-top: 8px; }

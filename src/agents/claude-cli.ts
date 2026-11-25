@@ -2,6 +2,7 @@ import { spawn } from "node:child_process";
 import type { Agent, AgentResponse, SendOptions, TaskContext, Usage } from "../types.js";
 import { formatContext } from "./context.js";
 import { LineDecoder, parseClaudeCliLine } from "./streamParsers.js";
+import { verdictFor } from "./verdict.js";
 
 class StreamFlagsUnsupported extends Error {}
 class LeanFlagsUnsupported extends Error {}
@@ -107,10 +108,15 @@ export function createClaudeCliAgent(
   const toolsSetting = opts.tools ?? "";
   // An old CLI that doesn't know these flags falls back to the full CLI instead of failing every call.
   let lean = toolsSetting !== "default";
-  const leanArgs = () =>
-    lean ? ["--tools", toolsSetting, "--strict-mcp-config", "--mcp-config", '{"mcpServers":{}}', "--disable-slash-commands"] : [];
+  const leanArgs = (tools: string) =>
+    lean ? ["--tools", tools, "--strict-mcp-config", "--mcp-config", '{"mcpServers":{}}', "--disable-slash-commands"] : [];
 
-  async function runStreaming(input: string, onChunk?: (t: string) => void, signal?: AbortSignal): Promise<{ text: string; usage?: Usage }> {
+  interface CallSetup {
+    cwd?: string;
+    tools: string;
+  }
+
+  async function runStreaming(input: string, call: CallSetup, onChunk?: (t: string) => void, signal?: AbortSignal): Promise<{ text: string; usage?: Usage }> {
     const lines = new LineDecoder();
     let partial = "";
     let assistant = "";
@@ -132,9 +138,9 @@ export function createClaudeCliAgent(
     };
     const proc = await runCli(
       bin,
-      ["-p", "--output-format", "stream-json", "--verbose", "--include-partial-messages", ...modelArgs, ...leanArgs()],
+      ["-p", "--output-format", "stream-json", "--verbose", "--include-partial-messages", ...modelArgs, ...leanArgs(call.tools)],
       input,
-      opts.cwd,
+      call.cwd,
       timeoutMs,
       (chunk) => lines.push(chunk).forEach(handle),
       signal,
@@ -149,8 +155,8 @@ export function createClaudeCliAgent(
     return { text: (result?.text || assistant || partial).trim(), usage: result?.usage };
   }
 
-  async function runPlain(input: string, onChunk?: (t: string) => void, signal?: AbortSignal): Promise<{ text: string; usage?: Usage }> {
-    const proc = await runCli(bin, ["-p", ...modelArgs, ...leanArgs()], input, opts.cwd, timeoutMs, undefined, signal);
+  async function runPlain(input: string, call: CallSetup, onChunk?: (t: string) => void, signal?: AbortSignal): Promise<{ text: string; usage?: Usage }> {
+    const proc = await runCli(bin, ["-p", ...modelArgs, ...leanArgs(call.tools)], input, call.cwd, timeoutMs, undefined, signal);
     if (proc.code !== 0) {
       if (lean && /unknown option[^\n]*(--tools|--strict-mcp-config|--mcp-config|--disable-slash-commands)/i.test(proc.stderr)) throw new LeanFlagsUnsupported(proc.stderr);
       throw new Error(`claude CLI exited with code ${proc.code}: ${proc.stderr.slice(-2000)}`);
@@ -165,17 +171,19 @@ export function createClaudeCliAgent(
     async send(prompt: string, context: TaskContext, sendOpts?: SendOptions): Promise<AgentResponse> {
       // With tools enabled ("Read,Grep,Glob" or "default"), headless
       // `claude -p` can check the actual project on disk — but only if it's
-      // run from that project's directory, which is why cwd is VERIFY_CWD.
+      // run from that project's directory: the task's own one when the call
+      // names it, else the configured default.
       const input = `${prompt}\n\n${formatContext(context)}`;
       const signal = sendOpts?.signal;
+      const call: CallSetup = { cwd: sendOpts?.cwd ?? opts.cwd, tools: sendOpts?.tools ?? toolsSetting };
       const attempt = async (): Promise<{ text: string; usage?: Usage }> => {
-        if (!streaming) return runPlain(input, sendOpts?.onChunk, signal);
+        if (!streaming) return runPlain(input, call, sendOpts?.onChunk, signal);
         try {
-          return await runStreaming(input, sendOpts?.onChunk, signal);
+          return await runStreaming(input, call, sendOpts?.onChunk, signal);
         } catch (err) {
           if (!(err instanceof StreamFlagsUnsupported)) throw err;
           streaming = false;
-          return runPlain(input, sendOpts?.onChunk, signal);
+          return runPlain(input, call, sendOpts?.onChunk, signal);
         }
       };
       let out: { text: string; usage?: Usage };
@@ -186,9 +194,7 @@ export function createClaudeCliAgent(
         lean = false;
         out = await attempt();
       }
-      const verdict = prompt.startsWith("REVIEW:")
-        ? (/\breject\b/i.test(out.text) ? "reject" : "approve")
-        : undefined;
+      const verdict = verdictFor(prompt, out.text);
       return { role: "claude", content: out.text, verdict, usage: out.usage };
     },
   };
