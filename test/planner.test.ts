@@ -46,6 +46,22 @@ describe("parsePlan", () => {
 });
 
 describe("draftAndReviewPlan", () => {
+  it("tells Claude it has no tools when it tries to run one instead of planning", async () => {
+    const prompts: string[] = [];
+    let n = 0;
+    const claude: Agent = {
+      role: "claude",
+      async send(prompt: string): Promise<AgentResponse> {
+        prompts.push(prompt);
+        return n++ === 0 ? { role: "claude", content: "I'll inspect the files first.\n\n**Tool: bash**\n```\nls -la /project\n```" } : { role: "claude", content: JSON.stringify(MOCK_PLAN) };
+      },
+    };
+    const res = await draftAndReviewPlan({ claude, gemini: createMockAgent("gemini") }, "Fix the app", DEPTS, { maxRounds: 2 });
+    expect(res.plan.epics).toHaveLength(3);
+    expect(prompts[0]).toMatch(/no tools in this step/);
+    expect(prompts[1]).toMatch(/tried to run a tool or command/);
+  });
+
   it("feeds Gemini's rejection back to Claude for a revised plan", async () => {
     const prompts: string[] = [];
     const claude: Agent = {

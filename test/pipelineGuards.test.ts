@@ -114,6 +114,9 @@ describe("architecture guards", () => {
     expect(specProblem(FAKE_TOOL, { requireLength: true })).toMatch(/tool call/);
     expect(specProblem("I'll look at the files first.", { requireLength: true })).toMatch(/characters/);
     expect(specProblem(GUIDE, { requireLength: true })).toBeUndefined();
+    // The shapes Claude actually wrote in the VocabApp run.
+    expect(specProblem("I'll inspect first.\n\n**Tool: bash**\n\nInput: ...", { requireLength: false })).toMatch(/tool call/);
+    expect(specProblem("I'll inspect first.\n\n**1 tool use**\n\nls -la", { requireLength: false })).toMatch(/tool call/);
   });
 
   it("asks Claude again instead of handing an empty spec to Gemini, in the task's project with read-only tools", async () => {

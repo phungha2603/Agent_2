@@ -137,7 +137,8 @@ const MIN_SPEC_CHARS = 200;
 /** Extra tries Claude gets when its architecture reply isn't a usable guide, before the stage errors out. */
 const SPEC_RETRIES = 2;
 /** A tool call written out as text — what Claude produces when it wants a tool it can't run. */
-const FAKE_TOOL_CALL_RE = /<\/?(?:function_calls|invoke|tool_use|xai:function_call)\b|<parameter name=|<param name=/i;
+export const FAKE_TOOL_CALL_RE =
+  /<\/?(?:function_calls|invoke|tool_use|xai:function_call)\b|<parameter name=|<param name=|^\s*\*\*Tool: \w+\*\*|^\s*\*\*\d+ tool uses?\*\*/im;
 
 const PROMPTS = {
   ideation:

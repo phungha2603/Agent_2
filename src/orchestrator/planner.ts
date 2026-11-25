@@ -2,7 +2,7 @@ import { readdir } from "node:fs/promises";
 import path from "node:path";
 import type { Agent, ProjectConfig, SendOptions, TaskRecord } from "../types.js";
 import { sendReview, VERDICT_INSTRUCTION } from "../agents/verdict.js";
-import { createPlannedTask, trace } from "./pipeline.js";
+import { createPlannedTask, FAKE_TOOL_CALL_RE, trace } from "./pipeline.js";
 
 export interface Department {
   id: string;
@@ -121,6 +121,7 @@ export function buildPlanPrompt(goal: string, departments: Department[], limits:
     "- rationale: one sentence per epic and subtask on why that owner is the right one (their specialty vs. what the work needs). inputs: what the subtask builds on — which part of the goal, which other subtask's output.",
     "- Write titles, descriptions, criteria, rationale and inputs in the same language as the goal.",
     "- verifyCommands: the shell commands, in order, that build this goal's project and run its tests for real, run from the project's root directory (e.g. \"swift build\", \"swift test\", \"python3 -m pytest -q\", \"npm test\", \"xcodebuild -list -project App.xcodeproj\"). They are the only proof the code works, so they must exercise this goal's own code and its tests — never a placeholder like echo or true.",
+    "You have no tools in this step and cannot read any files: plan from the goal text alone. If the goal says files must be read or inspected, that is work for the tasks — each task's architecture step can open the project's files — so put it into their descriptions instead of trying to do it now.",
     "Reply with ONLY one JSON object, no prose before or after, in exactly this shape:",
     '{"summary": "...", "epics": [{"id": "E1", "title": "...", "owner": "AG-05", "goal": "...", "rationale": "...", "acceptanceCriteria": ["..."], "subtasks": [{"id": "E1.S1", "title": "...", "owner": "AG-03", "description": "...", "rationale": "...", "inputs": "...", "acceptanceCriteria": ["..."], "dependsOn": []}]}], "verifyCommands": ["..."]}',
     "",
@@ -303,6 +304,11 @@ export async function draftAndReviewPlan(
     opts.onRound?.(round, "draft");
     const prompt = buildPlanPrompt(goal, departments, limits, feedback ? { previous, feedback } : undefined);
     const draft = await agents.claude.send(prompt, { title: goal }, opts.send);
+    if (FAKE_TOOL_CALL_RE.test(draft.content)) {
+      feedback =
+        "Your previous reply tried to run a tool or command. You have no tools in this step and cannot read files — plan from the goal text alone, and leave any file reading to the tasks' architecture step. Reply with only the JSON object in the required shape.";
+      continue;
+    }
     try {
       last = parsePlan(draft.content, departments, limits);
     } catch (err) {
