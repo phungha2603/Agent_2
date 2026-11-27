@@ -2,12 +2,14 @@
 
 Node 22 + TypeScript (ESM, `tsx`), Express + SSE, giao diện thuần JS. Trả lời và viết chữ giao diện bằng tiếng Việt; mã, tên biến, commit bằng tiếng Anh.
 
-Luồng: Gemini (ý tưởng, thẩm định) → Claude (architecture, chốt cuối) → Muse (viết code, qua MCP) → build/test thật → CEO duyệt. `done` chỉ đạt ở `resolveCheckpoint`.
+Luồng: Gemini (ý tưởng, thẩm định) → Claude (architecture, chốt cuối) → Muse (viết code, qua MCP) → build/test thật + kiểm tra theo vai trò → CEO duyệt. `done` chỉ đạt ở `resolveCheckpoint`.
+
+Công ty 16 vị trí / 5 khối (`src/org/roles.ts`): AG-01 Sếp; trưởng nhóm AG-05 Kỹ thuật, AG-11 Dữ liệu & AI, AG-08 Chất lượng & Phát hành, AG-12 Sản phẩm & Tăng trưởng; AG-01…10 giữ mã cũ, AG-11…16 mới. Mỗi vị trí có `playbooks/AG-xx.md` được chèn vào prompt của task thuộc vị trí đó.
 
 ## Lệnh
 
 - `npx tsc -p . --noEmit` — kiểm tra kiểu (phải sạch)
-- `npx vitest run test/<file>.test.ts` — chạy file liên quan; cả bộ (`npx vitest run`, ~210 test) chỉ trước khi commit, và chỉ commit khi nó qua
+- `npx vitest run test/<file>.test.ts` — chạy file liên quan; cả bộ (`npx vitest run`, ~232 test) chỉ trước khi commit, và chỉ commit khi nó qua
 - `node --check src/dashboard/public/app.js` — cú pháp giao diện
 - `MOCK_DELAY_MS=1200 npm run dashboard` — chạy thử bằng agent giả (provider = mock)
 - `npm run usage` — token theo bước/engine/task · `npm run muse:accounts` — tình trạng các tài khoản Muse
@@ -17,12 +19,13 @@ Luồng: Gemini (ý tưởng, thẩm định) → Claude (architecture, chốt c
 | Nơi | Vai trò |
 |---|---|
 | `orchestrator/pipeline.ts` | Máy trạng thái 1 task, prompt ở `PROMPTS`. Các chốt chặn: spec phải kết thúc bằng `FILES:`; file ngoài danh sách, không có rào code hoặc hỏng → lượt thất bại, không ghi gì |
-| `orchestrator/scheduler.ts` (`Company`, ~1.900 dòng) | Hàng đợi, giới hạn engine, khoá `workspace`, bàn giao, thử lại, chỉ thị, cổng duyệt, tự duyệt (`afterWorker`), git (`recordInGit`), thông báo, snapshot UI |
+| `orchestrator/scheduler.ts` (`Company`, ~2.200 dòng) | Hàng đợi, giới hạn engine, khoá `workspace`, bàn giao, thử lại, chỉ thị, cổng duyệt, tự duyệt (`afterWorker`), git (`recordInGit`), thông báo, snapshot UI |
 | `orchestrator/planner.ts` | Kế hoạch Goal → Epic → Subtask; `project` riêng mỗi kế hoạch (thư mục — để trống thì tự tạo trong `PROJECTS_ROOT`, git init khi duyệt, tuỳ chọn repo GitHub riêng qua `gh` —, lệnh nền + lệnh riêng từng task, `handoffOn`, `autoApprove`, `skipClaudeReviewWhenGreen`) |
 | `orchestrator/` khác | `projectFiles` (đọc sẵn file liên quan cho Claude/Muse) · `quota` (hết hạn mức → chờ giờ reset) · `contextPruning` · `compressForClaude` · `archRevision` · `handoff` · `rebalance` |
+| `org/` | `roles.ts` (vị trí, khối, `modelTier`, `checks`, cổng duyệt mặc định) · `playbooks.ts` (đọc `playbooks/*.md`, mỗi bước nhận mục riêng: `STAGE_SECTIONS`) · `lessons.ts` (bài học ở `data/lessons.json`; task ship sau khi bị trả về → đề xuất chờ CEO duyệt) · `runtime.ts` (`RoleSupport` gắn vào `PipelineConfig.roles`) |
 | `agents/` | `claude-cli.ts` (chế độ gọn; `tools`/`maxTurns`/`model` theo từng lượt) · `verdict.ts` (chỉ đọc dòng `VERDICT:`) · `muse.ts` (chỉ nhận markdown; bể gom profile theo người dùng Muse) · `gemini.ts` + `retry.ts` (bể key) · `mock.ts` |
-| `verify/` | `workspace` (kiểm tra trong bản sao `data/workspaces/`, ghi vào dự án khi qua) · `fileChecks` (cú pháp, chữ đã render) · `survey` (quét dự án cho planner) · `gitProject` · `failureDigest` · `runner` (có timeout) |
-| `dashboard/` | `server.ts` (API + SSE), `notify.ts` (thông báo macOS), `slots.ts`, `public/app.js` (~1.900 dòng) |
+| `verify/` | `roleChecks` (secrets/stubs → trượt kiểm tra; tests/ios_destination → cảnh báo đỏ; chỉ xét file vừa ghi) · `workspace` (kiểm tra trong bản sao `data/workspaces/`, ghi vào dự án khi qua) · `fileChecks` (cú pháp, chữ đã render) · `survey` (quét dự án cho planner) · `gitProject` · `failureDigest` · `runner` (có timeout) |
+| `dashboard/` | `server.ts` (API + SSE; `/api/roles/:id`, `/api/lessons/:id/:decision`, `/api/scoreboard`), `notify.ts` (thông báo macOS), `slots.ts` (`SLOTS` sinh từ `ROLES`), `public/app.js` (~2.600 dòng: sơ đồ cây theo khối, ngăn playbook, tab "Năng lực vị trí", theme sáng/tối), `public/style.css` (~1.300 dòng; các lớp sau ghi đè lớp trước, màu đi qua biến CSS) |
 | `integrations/contentSeo.ts` | Tab "Auto Content SEO": chạy dự án Python có sẵn (`CONTENTSEO_DIR`) qua `scripts/run_once.py` của nó (một lượt mỗi lúc), bật/tắt bot Telegram, lịch sử ở `data/contentseo/runs.json` |
 | `store/` | Ghi file nguyên tử vào `data/` (không commit) |
 
@@ -33,7 +36,13 @@ Luồng: Gemini (ý tưởng, thẩm định) → Claude (architecture, chốt c
 - Comment chỉ để giải thích lý do khó thấy. Không thêm tính năng ngoài yêu cầu.
 - Bước Claude review không có công cụ; architecture có `Read,Grep,Glob` + `--max-turns`. Đừng bật lại công cụ ở chỗ khác (mỗi file mở là một lượt gửi lại toàn bộ ngữ cảnh).
 - Khoá `workspace` bao phần ghi + kiểm tra, không bao lượt chat Muse. Profile Muse cùng người dùng không bao giờ chạy song song.
-- Nhánh: `claude/eager-ramanujan-ek5fpm`. Chỉ commit/push khi được yêu cầu.
+- Playbook/vai trò luôn **nối vào cuối** prompt (`withRole`), trước dòng `VERDICT_INSTRUCTION`: agent giả, `verdict.ts` và test nhận diện loại lời gọi bằng chữ đầu prompt (`REVIEW:`, `PLAN:`, `REBALANCE:`). Task không có `slotId` hợp lệ chạy y như trước.
+- Thêm/đổi vị trí: sửa `ROLES` + tạo `playbooks/AG-xx.md` với đúng các tiêu đề `## Năng lực / Khi thiết kế / Khi viết code / Khi review / Không làm / Bài học` (`test/roles.test.ts` kiểm tra). Không đổi mã vị trí cũ: hàng đợi, task, cổng duyệt lưu theo mã.
+- Model theo vai trò: `CLAUDE_MODEL_STRONG` (thiết kế + review), `CLAUDE_MODEL_LIGHT` (chỉ thiết kế); `ROLE_PLAYBOOKS=0` tắt toàn bộ phần vai trò.
+- Kiểm tra theo vai trò không được ép điều Muse không làm được (file ngoài dòng `FILES:`) → loại đó chỉ là cảnh báo, không làm trượt.
+- `index()` chỉ gồm task đang nằm trong hàng đợi; báo cáo toàn bộ lịch sử dùng `listAllTasks()`.
+- Chụp giao diện: dùng Playwright trong `node_modules` (`chromium.launch({ executablePath: Chrome })`); `chrome --headless --screenshot` không chạy timer nên đường nối SVG không hiện.
+- Nhánh làm việc: `claude/eager-ramanujan-ek5fpm`, PR vào `main`. Chỉ commit/push khi được yêu cầu.
 
 ## Tiết kiệm token
 
