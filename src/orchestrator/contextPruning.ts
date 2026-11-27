@@ -62,6 +62,7 @@ export function pruneContext(stage: Stage, ctx: TaskContext): TaskContext {
         // NOT truncated the way other large fields are here — a diff
         // against a truncated spec wouldn't apply past the cut.
         architectureSpec: fixRound ? ctx.architectureSpec : undefined,
+        projectFiles: ctx.projectFiles,
         reviewFeedback: ctx.reviewFeedback,
       };
 
@@ -81,6 +82,7 @@ export function pruneContext(stage: Stage, ctx: TaskContext): TaskContext {
         acceptanceCriteria: ctx.acceptanceCriteria,
         upstream: ctx.upstream,
         architectureSpec: ctx.architectureSpec,
+        projectFiles: ctx.projectFiles,
         implementationDiff: fixRound ? head(ctx.implementationDiff, PRUNE_LIMITS.previousImplementationHead) : undefined,
         reviewFeedback: ctx.reviewFeedback,
       };

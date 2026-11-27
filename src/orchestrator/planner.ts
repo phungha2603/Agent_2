@@ -68,6 +68,12 @@ export interface PlanProject {
    * building on an unapproved fix spreads its mistakes.
    */
   handoffOn?: "checkpoint_final" | "done";
+  /**
+   * Results with no red warning, approved by the reviewers, ship without
+   * waiting for the CEO; red-warning ones still wait. Off unless the CEO
+   * turns it on for the plan.
+   */
+  autoApprove?: boolean;
 }
 
 /** Every verification command in a plan: the baseline, plus each epic's and subtask's own. */

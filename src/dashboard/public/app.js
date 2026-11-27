@@ -166,7 +166,7 @@ function planProjectBlock(plan, editable) {
   const warnings = [...(p.warnings ?? []), ...(p.commandWarnings ?? [])].map((w) => `<div class="feedback-box is-error">⚠ ${esc(w)}</div>`).join("");
   const missing = !p.verifyCommands?.length ? `<div class="feedback-box is-error">⚠ Chưa có lệnh kiểm tra — không duyệt được cho tới khi điền.</div>` : "";
   if (!editable) {
-    return `<div class="plan-project small"><div>📁 <code>${esc(p.dir || "(chưa chọn)")}</code></div><div>🧪 ${p.verifyCommands?.length ? p.verifyCommands.map((c) => `<code>${esc(c)}</code>`).join(" → ") : "<em>chưa có lệnh</em>"}</div>${warnings}${missing}</div>`;
+    return `<div class="plan-project small"><div>📁 <code>${esc(p.dir || "(chưa chọn)")}</code>${p.autoApprove ? ` · <span class="why">⚡ tự duyệt khi xanh</span>` : ""}</div><div>🧪 ${p.verifyCommands?.length ? p.verifyCommands.map((c) => `<code>${esc(c)}</code>`).join(" → ") : "<em>chưa có lệnh</em>"}</div>${warnings}${missing}</div>`;
   }
   return `<div class="plan-project">
     <label class="panel-sub">Thư mục dự án (Muse ghi code vào đây, lệnh kiểm tra chạy ở đây)</label>
@@ -179,6 +179,7 @@ function planProjectBlock(plan, editable) {
       <option value="done"${p.handoffOn === "done" ? " selected" : ""}>Chỉ sau khi tôi duyệt task trước (an toàn — nên dùng khi sửa dự án có sẵn)</option>
       <option value="checkpoint_final"${p.handoffOn === "checkpoint_final" ? " selected" : ""}>Ngay khi task trước chờ duyệt (nhanh hơn)</option>
     </select>
+    <label class="check"><input type="checkbox" data-plan-autoapprove="${esc(plan.id)}"${p.autoApprove ? " checked" : ""} /> Tự duyệt task khi mọi thứ xanh (qua kiểm tra, Gemini & Claude đều duyệt, không cảnh báo đỏ) — task có cảnh báo vẫn chờ bạn; dự án có git thì mỗi task là một commit, hoàn tác được</label>
     <div class="row-inline"><button class="btn btn-small-inline" data-action="plan-project-save" data-plan="${esc(plan.id)}">Lưu thư mục & lệnh</button></div>
   </div>`;
 }
@@ -191,6 +192,8 @@ function planProjectInputs(planId) {
   if (cmds) out.verifyCommands = cmds.value;
   const handoff = document.querySelector(`[data-plan-handoff="${CSS.escape(planId)}"]`);
   if (handoff) out.handoffOn = handoff.value;
+  const auto = document.querySelector(`[data-plan-autoapprove="${CSS.escape(planId)}"]`);
+  if (auto) out.autoApprove = auto.checked;
   return out;
 }
 

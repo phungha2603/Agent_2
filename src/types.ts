@@ -41,6 +41,12 @@ export interface SendOptions {
   cwd?: string;
   /** Tool list for this call only (Claude CLI), e.g. "Read,Grep,Glob"; unset = the agent's own setting. */
   tools?: string;
+  /**
+   * Cap on agentic turns for a call that has tools (Claude CLI --max-turns).
+   * Each file the model opens is another turn that re-sends the whole
+   * context — the reason a ~4k-token prompt cost ~286k input tokens.
+   */
+  maxTurns?: number;
 }
 
 export interface Agent {
@@ -86,6 +92,8 @@ export interface TaskContext {
   /** Material the CEO forwarded to this task from another agent's output. */
   attachments?: { title: string; from: string; content: string }[];
   architectureSpec?: string;
+  /** Current contents of the project files this task is about, read from disk just before the call. */
+  projectFiles?: { path: string; content: string; truncated?: boolean }[];
   implementationDiff?: string;
   implementationFiles?: string[];
   verificationLog?: string;
@@ -126,6 +134,8 @@ export interface ProjectConfig {
   buildDir?: string;
   /** When dependents may start: once this task reaches the final checkpoint, or only once the CEO approved it. Unset = company setting. */
   handoffOn?: "checkpoint_final" | "done";
+  /** Ship the result without waiting for the CEO when everything is green (no red warning; reviewers approved). */
+  autoApprove?: boolean;
   screenshotWaitMs?: number;
 }
 

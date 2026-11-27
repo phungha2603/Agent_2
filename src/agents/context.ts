@@ -33,6 +33,13 @@ export function formatContext(context: TaskContext): string {
     );
   }
   if (context.architectureSpec) parts.push(`--- Architecture spec ---\n${context.architectureSpec}`);
+  if (context.projectFiles?.length) {
+    parts.push(
+      `--- Current contents of the project files this task is about (read from disk just now) ---\n${context.projectFiles
+        .map((f) => `FILE ON DISK: ${f.path}${f.truncated ? " (truncated)" : ""}\n\`\`\`\`\n${f.content}\n\`\`\`\``)
+        .join("\n\n")}`,
+    );
+  }
   // The orchestrator's own run comes before the engineer's reply, and says
   // so: the engineer works in its own sandbox and routinely reports having
   // "run" and "verified" things there, which reviewers took as evidence.

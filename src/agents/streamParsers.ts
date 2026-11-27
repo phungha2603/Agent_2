@@ -101,7 +101,7 @@ export interface ClaudeCliEvent {
   /** Text of a completed assistant turn — a fallback when there are no partial deltas. */
   assistantText?: string;
   /** The final result line, with the usage and (API-equivalent) cost the CLI reports. */
-  result?: { text: string; isError: boolean; usage?: Usage };
+  result?: { text: string; isError: boolean; usage?: Usage; subtype?: string };
 }
 
 /** One line of `claude -p --output-format stream-json --verbose [--include-partial-messages]`. */
@@ -132,7 +132,7 @@ export function parseClaudeCliLine(line: string): ClaudeCliEvent {
           costUsd: typeof obj.total_cost_usd === "number" ? obj.total_cost_usd : undefined,
         }
       : undefined;
-    return { result: { text: typeof obj.result === "string" ? obj.result : "", isError, usage } };
+    return { result: { text: typeof obj.result === "string" ? obj.result : "", isError, usage, subtype: typeof obj.subtype === "string" ? obj.subtype : undefined } };
   }
   return {};
 }

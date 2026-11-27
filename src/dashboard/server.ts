@@ -3,6 +3,7 @@ import { fileURLToPath } from "node:url";
 import express, { type NextFunction, type Request, type Response } from "express";
 import { Company, isUserError } from "../orchestrator/scheduler.js";
 import { buildAgents, buildPipelineConfig, buildProjectConfigSnapshot, buildSchedulerSettings } from "../config.js";
+import { createMacNotifier } from "./notify.js";
 import { basicAuth, isLoopback } from "./auth.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -31,6 +32,7 @@ const company = new Company({
   pipeline: buildPipelineConfig(),
   settings: buildSchedulerSettings(),
   projectConfig: buildProjectConfigSnapshot,
+  notify: createMacNotifier(),
 });
 
 const app = express();
@@ -173,7 +175,7 @@ app.post("/api/run-all", route(async (req, res) => {
   ok(res, { planId: plan.id });
 }));
 /** { dir?, verifyCommands? } from a request body — commands as a list or as one command per line. */
-function planProject(body: any): { dir?: string; verifyCommands?: string[]; handoffOn?: "done" | "checkpoint_final" } {
+function planProject(body: any): { dir?: string; verifyCommands?: string[]; handoffOn?: "done" | "checkpoint_final"; autoApprove?: boolean } {
   const dir = str(body?.projectDir);
   const raw = body?.verifyCommands;
   const verifyCommands = Array.isArray(raw)
@@ -183,7 +185,8 @@ function planProject(body: any): { dir?: string; verifyCommands?: string[]; hand
       : undefined;
   const handoff = str(body?.handoffOn);
   const handoffOn = handoff === "done" || handoff === "checkpoint_final" ? handoff : undefined;
-  return { dir, verifyCommands, handoffOn };
+  const autoApprove = typeof body?.autoApprove === "boolean" ? body.autoApprove : undefined;
+  return { dir, verifyCommands, handoffOn, autoApprove };
 }
 app.post("/api/plan/:id/project", route(async (req, res) => ok(res, await company.updatePlanProject(req.params.id, planProject(req.body)))));
 app.post("/api/plan/:id/decision", route(async (req, res) =>

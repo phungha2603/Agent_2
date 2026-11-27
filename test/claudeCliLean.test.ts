@@ -62,3 +62,32 @@ describe("Claude CLI lean mode", () => {
     expect(await argsOf(agent)).not.toContain("--tools"); // and it stays off, no repeated failing attempt
   });
 });
+
+describe("Claude CLI turn budget", () => {
+  it("passes --max-turns only to a call that has tools, and reports running out as MaxTurnsReached", async () => {
+    const { MaxTurnsReached } = await import("../src/agents/claude-cli.js");
+    const file = path.join(mkdtempSync(path.join(tmpdir(), "fake-claude-turns-")), "claude");
+    writeFileSync(
+      file,
+      `#!/usr/bin/env node
+const args = process.argv.slice(2);
+process.stdin.resume(); process.stdin.on("data", () => {});
+process.stdin.on("end", () => {
+  const i = args.indexOf("--max-turns");
+  if (i !== -1 && args[i + 1] === "1") {
+    console.log(JSON.stringify({ type: "result", subtype: "error_max_turns", is_error: true, num_turns: 2 }));
+    return;
+  }
+  console.log(JSON.stringify({ type: "result", subtype: "success", is_error: false, result: JSON.stringify(args) }));
+});
+`,
+    );
+    chmodSync(file, 0o755);
+    const agent = createClaudeCliAgent({ command: file });
+    const withTools = JSON.parse((await agent.send("x", { title: "t" }, { tools: "Read", maxTurns: 8 })).content) as string[];
+    expect(withTools[withTools.indexOf("--max-turns") + 1]).toBe("8");
+    const noTools = JSON.parse((await agent.send("x", { title: "t" }, { tools: "", maxTurns: 8 })).content) as string[];
+    expect(noTools).not.toContain("--max-turns");
+    await expect(agent.send("x", { title: "t" }, { tools: "Read", maxTurns: 1 })).rejects.toBeInstanceOf(MaxTurnsReached);
+  });
+});

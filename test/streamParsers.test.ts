@@ -66,7 +66,7 @@ describe("parseClaudeCliLine", () => {
     const events = real.map(parseClaudeCliLine);
     expect(events.map((e) => e.delta).filter(Boolean)).toEqual(["OK"]);
     expect(events[3].assistantText).toBe("OK");
-    expect(events[5].result).toEqual({ text: "OK", isError: false });
+    expect(events[5].result).toMatchObject({ text: "OK", isError: false, subtype: "success" });
     expect(events[0]).toEqual({});
   });
 

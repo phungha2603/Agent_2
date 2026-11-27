@@ -5,6 +5,8 @@ import { LineDecoder, parseClaudeCliLine } from "./streamParsers.js";
 import { verdictFor } from "./verdict.js";
 
 class StreamFlagsUnsupported extends Error {}
+/** The call used up its --max-turns budget (reading files) before answering; there is no answer text. */
+export class MaxTurnsReached extends Error {}
 class LeanFlagsUnsupported extends Error {}
 
 interface ProcessResult {
@@ -114,14 +116,16 @@ export function createClaudeCliAgent(
   interface CallSetup {
     cwd?: string;
     tools: string;
+    maxTurns?: number;
   }
+  const turnArgs = (call: CallSetup) => (lean && call.tools && call.maxTurns ? ["--max-turns", String(call.maxTurns)] : []);
 
   async function runStreaming(input: string, call: CallSetup, onChunk?: (t: string) => void, signal?: AbortSignal): Promise<{ text: string; usage?: Usage }> {
     const lines = new LineDecoder();
     let partial = "";
     let assistant = "";
     let sawDelta = false;
-    let result: { text: string; isError: boolean; usage?: Usage } | undefined;
+    let result: { text: string; isError: boolean; usage?: Usage; subtype?: string } | undefined;
     const handle = (line: string): void => {
       const ev = parseClaudeCliLine(line);
       if (ev.delta) {
@@ -138,7 +142,7 @@ export function createClaudeCliAgent(
     };
     const proc = await runCli(
       bin,
-      ["-p", "--output-format", "stream-json", "--verbose", "--include-partial-messages", ...modelArgs, ...leanArgs(call.tools)],
+      ["-p", "--output-format", "stream-json", "--verbose", "--include-partial-messages", ...modelArgs, ...leanArgs(call.tools), ...turnArgs(call)],
       input,
       call.cwd,
       timeoutMs,
@@ -151,13 +155,17 @@ export function createClaudeCliAgent(
       if (/unknown option|output-format|include-partial-messages|--verbose/i.test(proc.stderr)) throw new StreamFlagsUnsupported(proc.stderr);
       throw new Error(`claude CLI exited with code ${proc.code}: ${proc.stderr.slice(-2000)}`);
     }
+    if (result?.subtype === "error_max_turns") throw new MaxTurnsReached(`claude CLI used up its ${call.maxTurns} turns before answering`);
     if (result?.isError) throw new Error(`claude CLI reported an error: ${result.text.slice(0, 2000)}`);
     return { text: (result?.text || assistant || partial).trim(), usage: result?.usage };
   }
 
   async function runPlain(input: string, call: CallSetup, onChunk?: (t: string) => void, signal?: AbortSignal): Promise<{ text: string; usage?: Usage }> {
-    const proc = await runCli(bin, ["-p", ...modelArgs, ...leanArgs(call.tools)], input, call.cwd, timeoutMs, undefined, signal);
+    const proc = await runCli(bin, ["-p", ...modelArgs, ...leanArgs(call.tools), ...turnArgs(call)], input, call.cwd, timeoutMs, undefined, signal);
     if (proc.code !== 0) {
+      if (call.maxTurns && /max(imum)?[ _-]?turns/i.test(`${proc.stdout}\n${proc.stderr}`)) {
+        throw new MaxTurnsReached(`claude CLI used up its ${call.maxTurns} turns before answering`);
+      }
       if (lean && /unknown option[^\n]*(--tools|--strict-mcp-config|--mcp-config|--disable-slash-commands)/i.test(proc.stderr)) throw new LeanFlagsUnsupported(proc.stderr);
       throw new Error(`claude CLI exited with code ${proc.code}: ${proc.stderr.slice(-2000)}`);
     }
@@ -175,7 +183,7 @@ export function createClaudeCliAgent(
       // names it, else the configured default.
       const input = `${prompt}\n\n${formatContext(context)}`;
       const signal = sendOpts?.signal;
-      const call: CallSetup = { cwd: sendOpts?.cwd ?? opts.cwd, tools: sendOpts?.tools ?? toolsSetting };
+      const call: CallSetup = { cwd: sendOpts?.cwd ?? opts.cwd, tools: sendOpts?.tools ?? toolsSetting, maxTurns: sendOpts?.maxTurns };
       const attempt = async (): Promise<{ text: string; usage?: Usage }> => {
         if (!streaming) return runPlain(input, call, sendOpts?.onChunk, signal);
         try {

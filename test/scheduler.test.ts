@@ -40,7 +40,7 @@ function tracker() {
   return { active, peak, calls };
 }
 
-async function setup(overrides: { gemini?: Agent; claude?: Agent; slotParallel?: Record<string, number> } = {}) {
+async function setup(overrides: { gemini?: Agent; claude?: Agent; slotParallel?: Record<string, number>; notify?: (title: string, body: string) => void } = {}) {
   const dir = mkdtempSync(path.join(tmpdir(), "scheduler-test-"));
   process.chdir(dir);
   vi.resetModules();
@@ -73,6 +73,7 @@ async function setup(overrides: { gemini?: Agent; claude?: Agent; slotParallel?:
       muse: instrumented("muse", 10),
     },
     pipeline: { verify: { cwd: dir, commands: ["true"] }, maxImplementationAttempts: 3, maxReviewRejections: 3, maxAutoRecoveries: 1 },
+    notify: overrides.notify,
     settings: {
       claudeConcurrency: 2,
       geminiConcurrency: 2,
@@ -238,5 +239,36 @@ describe("plan project settings", () => {
     expect(plan.project?.warnings.join(" ")).toMatch(/factorial\.py/);
     // Repairing an existing project: dependents wait for the CEO's approval by default.
     expect(plan.project?.handoffOn).toBe("done");
+  });
+});
+
+
+describe("auto-approve and notifications", () => {
+  it("ships green results by itself, keeps red-warning ones for the CEO, and says when the plan is finished", async () => {
+    const notes: string[] = [];
+    const { company: c, dir } = await setup({ notify: (title) => notes.push(title) });
+    await c.setGate("AG-08", false);
+    await c.setGate("AG-10", false);
+    const plan = await c.startPlan("Ship it", path.join(dir, "green"));
+    await waitFor(async () => (await c.planSnapshot())?.status === "awaiting_approval");
+    expect(notes).toContain("Kế hoạch chờ duyệt");
+    // The mock plan's own commands check NOTES.md, which the mock engineer writes: no red warning anywhere.
+    await c.decidePlan(plan.id, true, undefined, { autoApprove: true, handoffOn: "checkpoint_final" });
+    await waitFor(async () => (await allTasks(c)).length === 9 && (await allTasks(c)).every((x: any) => x.queueState === "done"), 20000);
+    const t = (await allTasks(c))[0];
+    expect((await c.taskDetail(t.id)).task.trace?.some((e: any) => /Auto-approved/.test(e.text))).toBe(true);
+    await waitFor(() => notes.includes("Kế hoạch hoàn tất"));
+  });
+
+  it("still waits for the CEO when a result has a red warning", async () => {
+    const notes: string[] = [];
+    const { company: c, dir } = await setup({ notify: (title) => notes.push(title) });
+    const plan = await c.startPlan("Ship it", path.join(dir, "red"));
+    await waitFor(async () => (await c.planSnapshot())?.status === "awaiting_approval");
+    // A bare `true` exercises nothing the task wrote -> red coverage warning on every result.
+    await c.decidePlan(plan.id, true, undefined, { autoApprove: true, verifyCommands: ["true"], handoffOn: "checkpoint_final" });
+    await waitFor(async () => (await allTasks(c)).some((x: any) => x.queueState === "waiting_you"));
+    expect((await allTasks(c)).filter((x: any) => x.queueState === "done")).toHaveLength(0);
+    await waitFor(() => notes.some((n) => n.startsWith("Chờ bạn duyệt · 1 cảnh báo đỏ")));
   });
 });

@@ -22,6 +22,7 @@ import { execFile } from "node:child_process";
 import { hhmm as clockTime, quotaResumeAt } from "./quota.js";
 import { formatSurvey, surveyProject } from "../verify/survey.js";
 import { commitTaskFiles, discardTaskFiles, isGitRepo } from "../verify/gitProject.js";
+import type { Notifier } from "../dashboard/notify.js";
 import path from "node:path";
 import {
   allPlanCommands,
@@ -66,6 +67,8 @@ export interface CompanyOptions {
   pipeline: PipelineConfig;
   settings: SchedulerSettings;
   projectConfig?: () => ProjectConfig | undefined;
+  /** Desktop notifications for the CEO (checkpoints, errors, finished plans). */
+  notify?: Notifier;
 }
 
 export interface Activity {
@@ -250,6 +253,7 @@ export class Company extends EventEmitter {
   private readonly pipeline: PipelineConfig;
   private readonly settings: SchedulerSettings;
   private readonly projectConfig: () => ProjectConfig | undefined;
+  private readonly notify: Notifier;
   private state: DashboardState = { slots: {}, activePlanId: null, gates: {}, directives: [], paused: false };
   private readonly workers = new Map<string, Worker>();
   /** In-memory task objects for running workers — the source of truth while they run. */
@@ -279,6 +283,7 @@ export class Company extends EventEmitter {
     this.pipeline = opts.pipeline;
     this.settings = opts.settings;
     this.projectConfig = opts.projectConfig ?? (() => undefined);
+    this.notify = opts.notify ?? (() => {});
     this.engines = {
       claude: new Semaphore(opts.settings.claudeConcurrency),
       gemini: new Semaphore(opts.settings.geminiConcurrency),
@@ -419,6 +424,7 @@ export class Company extends EventEmitter {
     if (act === "revise") requestRevision(task, feedback ?? "");
     else resolveCheckpoint(task, act === "approve", feedback?.trim() || undefined);
     if (finalCheckpoint) await this.recordInGit(task, act === "approve");
+    if (finalCheckpoint && act === "approve") void this.notifyIfPlanFinished(task).catch(() => {});
 
     if (act === "approve") {
       if (task.stage === "done") trace(task, "CEO", "gate", gated ? "Approved at the approval gate — result handed off." : "Approved and shipped.");
@@ -689,7 +695,7 @@ export class Company extends EventEmitter {
   /** The CEO sets or corrects where the plan's code lives and how it's verified, before approving. */
   async updatePlanProject(
     planId: string,
-    update: { dir?: string; verifyCommands?: string[]; handoffOn?: "checkpoint_final" | "done" },
+    update: { dir?: string; verifyCommands?: string[]; handoffOn?: "checkpoint_final" | "done"; autoApprove?: boolean },
   ): Promise<WorkPlanRecord> {
     const plan = await loadPlan(planId);
     if (!plan || (plan.status !== "awaiting_approval" && plan.status !== "drafting")) {
@@ -707,6 +713,7 @@ export class Company extends EventEmitter {
       project.commandsByCeo = true;
     }
     if (update.handoffOn === "done" || update.handoffOn === "checkpoint_final") project.handoffOn = update.handoffOn;
+    if (typeof update.autoApprove === "boolean") project.autoApprove = update.autoApprove;
     project.commandWarnings = commandWarnings(allPlanCommands(project.verifyCommands, plan.epics));
     plan.project = project;
     plan.updatedAt = nowIso();
@@ -719,9 +726,9 @@ export class Company extends EventEmitter {
     planId: string,
     approved: boolean,
     feedback?: string,
-    project?: { dir?: string; verifyCommands?: string[]; handoffOn?: "checkpoint_final" | "done" },
+    project?: { dir?: string; verifyCommands?: string[]; handoffOn?: "checkpoint_final" | "done"; autoApprove?: boolean },
   ): Promise<void> {
-    if (project && (project.dir !== undefined || project.verifyCommands !== undefined || project.handoffOn !== undefined)) {
+    if (project && Object.values(project).some((v) => v !== undefined)) {
       await this.updatePlanProject(planId, project);
     }
     const plan = await loadPlan(planId);
@@ -734,7 +741,7 @@ export class Company extends EventEmitter {
         throw new UserError("Kế hoạch chưa có lệnh kiểm tra (build/test) — điền lệnh rồi mới duyệt, nếu không sẽ không có gì chứng minh code chạy được.");
       }
       const base = this.projectConfig();
-      const tasks = materializePlan(plan, { ...base, verifyCwd: dir, verifyCommands: commands, handoffOn: plan.project?.handoffOn });
+      const tasks = materializePlan(plan, { ...base, verifyCwd: dir, verifyCommands: commands, handoffOn: plan.project?.handoffOn, autoApprove: plan.project?.autoApprove === true });
       for (const t of tasks) await saveTask(t);
       plan.status = "approved";
       await savePlan(plan);
@@ -1293,6 +1300,7 @@ export class Company extends EventEmitter {
       if (task.planRef) this.emitPlan();
       this.emit("engines");
       this.pump();
+      void this.afterWorker(task.id, w.slotId).catch((err) => console.error(`afterWorker ${task.id}: ${(err as Error).message}`));
     }
   }
 
@@ -1415,6 +1423,43 @@ export class Company extends EventEmitter {
       return;
     }
     await this.withEngine("workspace", task.id, () => advance(task, this.agents, this.pipeline, hooks));
+  }
+
+  /**
+   * Where a task's run stopped, once its worker is gone: auto-ship it if the
+   * plan allows that and everything is green, otherwise tell the CEO what
+   * needs them.
+   */
+  private async afterWorker(taskId: string, slotId: string): Promise<void> {
+    const task = await this.load(taskId);
+    if (!task || this.workers.has(taskId)) return;
+    const who = `${slotId} ${task.context.title}`;
+    if (task.stage === "checkpoint_final" && task.projectConfig?.autoApprove && !shipWarnings(task).length && !task.lastError) {
+      trace(task, "System", "gate", "Auto-approved: verification passed, the reviewers approved, and there is no red warning.");
+      await saveTask(task);
+      await this.decide(taskId, "approve");
+      this.notify("Đã tự duyệt", who);
+      await this.notifyIfPlanFinished(task);
+      return;
+    }
+    if (task.lastError) {
+      this.notify(task.lastError.resumeAt ? "Tạm dừng vì hết hạn mức" : "Task bị dừng vì lỗi", `${who} — ${task.lastError.message.slice(0, 120)}`);
+    } else if (task.stage === "rejected") {
+      this.notify("Task bị từ chối", `${who} — đã hết lượt thử`);
+    } else if (isWaitingForHuman(task)) {
+      const red = shipWarnings(task).length;
+      this.notify(red ? `Chờ bạn duyệt · ${red} cảnh báo đỏ` : "Chờ bạn duyệt", who);
+    }
+  }
+
+  /** One notification when the last task of a plan is done. */
+  private async notifyIfPlanFinished(task: TaskRecord): Promise<void> {
+    const planId = task.planRef?.planId;
+    if (!planId) return;
+    const plan = await loadPlan(planId);
+    const ids = (plan?.epics ?? []).flatMap((e) => [e.taskId, ...e.subtasks.map((s) => s.taskId)]).filter(Boolean) as string[];
+    for (const id of ids) if ((await this.load(id))?.stage !== "done") return;
+    this.notify("Kế hoạch hoàn tất", plan!.goal.slice(0, 160));
   }
 
   private async afterStage(task: TaskRecord): Promise<void> {
@@ -1609,6 +1654,8 @@ export class Company extends EventEmitter {
     if (usage) plan.usage = { ...usage };
     if (this.state.activePlanId !== plan.id) plan.status = "discarded"; // reset while drafting
     await savePlan(plan);
+    if (plan.status === "awaiting_approval") this.notify("Kế hoạch chờ duyệt", plan.goal.slice(0, 160));
+    else if (plan.status === "failed") this.notify("Lập kế hoạch thất bại", (plan.error ?? plan.goal).slice(0, 160));
     this.emitPlan();
   }
 

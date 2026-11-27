@@ -207,3 +207,37 @@ describe("files the engineer may write", () => {
     expect(task.context.reviewFeedback?.[0]).toMatch(/test\.yml[\s\S]*not on the guide's FILES: line/);
   });
 });
+
+describe("token budget for Claude", () => {
+  it("includes the named files' current contents, retries without tools when the turn budget runs out, and reviews without tools", async () => {
+    const { MaxTurnsReached } = await import("../src/agents/claude-cli.js");
+    const c = cfg();
+    writeFileSync(path.join(c.verify.cwd, "validate.py"), "print('current')\n");
+    const calls: { prompt: string; opts?: SendOptions; ctx: TaskContext }[] = [];
+    let first = true;
+    const claude: Agent = {
+      role: "claude",
+      async send(prompt: string, ctx: TaskContext, opts?: SendOptions): Promise<AgentResponse> {
+        calls.push({ prompt, opts, ctx });
+        if (first && opts?.tools) {
+          first = false;
+          throw new MaxTurnsReached("used up");
+        }
+        const content = prompt.startsWith("REVIEW:") ? "ok\nVERDICT: APPROVE" : "Guide.\n" + "- validate.py: keep it, add the SDKROOT check.\n".repeat(5) + "FILES: validate.py";
+        return { role: "claude", content, verdict: verdictFor(prompt, content) };
+      },
+    };
+    const task = createTask("Fix validate.py");
+    task.stage = "architecture";
+    task.context.ideaBrief = "Add an SDKROOT check to validate.py";
+    await advance(task, agents({ claude }), c);
+    expect(calls[0].opts).toMatchObject({ tools: "Read,Grep,Glob", maxTurns: 8 });
+    expect(calls[0].ctx.projectFiles).toEqual([{ path: "validate.py", content: "print('current')\n" }]);
+    expect(calls[1].opts?.tools).toBe(""); // redone without tools
+    expect(task.stage).toBe("architecture_review");
+
+    task.stage = "review_claude";
+    await advance(task, agents({ claude }), c);
+    expect(calls.at(-1)!.opts?.tools).toBe("");
+  });
+});

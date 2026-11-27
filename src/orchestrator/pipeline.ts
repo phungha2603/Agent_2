@@ -23,6 +23,8 @@ import { sendReview, VERDICT_INSTRUCTION } from "../agents/verdict.js";
 import { pruneContext } from "./contextPruning.js";
 import { applyArchitectureRevision } from "./archRevision.js";
 import { compressForClaude } from "./compressForClaude.js";
+import { collectProjectFiles } from "./projectFiles.js";
+import { MaxTurnsReached } from "../agents/claude-cli.js";
 
 export function createTask(title: string, projectConfig?: ProjectConfig): TaskRecord {
   const now = new Date().toISOString();
@@ -134,8 +136,14 @@ export function trace(task: TaskRecord, by: string, kind: TraceEntry["kind"], te
 const READ_ONLY_TOOLS = "Read,Grep,Glob";
 
 const READ_FILES_NOTE =
-  "You can open the project's actual files with the Read, Grep and Glob tools (your working directory is the project) — use them when the real contents matter. " +
+  "The current contents of the project files this task names are included below. You can open other project files with the Read, Grep and Glob tools (your working directory is the project), but each file you open costs a full round trip — open only what you genuinely need and isn't already included. " +
   "If those tools are not available to you, everything you need is in this message: never write out a tool call as text.";
+
+const NO_TOOLS_NOTE =
+  "You have no tools in this step: judge from what is in this message — the diff, the verification log the orchestrator ran, and the context. Never write out a tool call as text. ";
+
+/** Turn budget for Claude's file-reading architecture calls; on reaching it, the call is redone without tools. */
+const ARCH_MAX_TURNS = Number(process.env.CLAUDE_CLI_MAX_TURNS) || 8;
 
 const CEO_REQUESTS_RULE =
   "If CEO requests or CEO directives are listed above, go through every one of them: for each, say whether it is done and point at the evidence (which file, what it now contains). If any one is not done, reject — however good the rest is. ";
@@ -209,8 +217,8 @@ const PROMPTS = {
     "You are always the one who makes this call, not the independent reviewer. " +
     EVIDENCE_RULE +
     CEO_REQUESTS_RULE +
-    READ_FILES_NOTE +
-    " Approve or reject, with reasons. " +
+    NO_TOOLS_NOTE +
+    "Approve or reject, with reasons. " +
     VERDICT_INSTRUCTION,
   reviewClaudeFallback:
     "REVIEW: Gemini, the usual independent reviewer, is temporarily unavailable — you are doing the whole review yourself this round, both the independent check and your own final sign-off, in one pass (there's no separate second opinion to defer to here, so rule on your own judgment). " +
@@ -219,8 +227,8 @@ const PROMPTS = {
     "This is your own final decision. If you reject, don't just say what's wrong: give precise, step-by-step instructions for exactly how to fix it (which file, which function, what the corrected logic should look like), as if correcting a student's work directly, so the engineer can act on it without guessing. " +
     EVIDENCE_RULE +
     CEO_REQUESTS_RULE +
-    READ_FILES_NOTE +
-    " Approve or reject, with reasons. " +
+    NO_TOOLS_NOTE +
+    "Approve or reject, with reasons. " +
     VERDICT_INSTRUCTION,
 };
 
@@ -304,9 +312,18 @@ export function fileAllowed(file: string, patterns: string[]): boolean {
   });
 }
 
-/** Options for Claude's file-reading calls: the task's own project directory, read-only tools. */
+/** Options for Claude's file-reading calls: the task's own project directory, read-only tools, a turn budget. */
 function claudeReadOpts(task: TaskRecord, config: PipelineConfig, opts: SendOptions): SendOptions {
-  return { ...opts, cwd: resolveVerify(task, config).cwd, tools: READ_ONLY_TOOLS };
+  return { ...opts, cwd: resolveVerify(task, config).cwd, tools: READ_ONLY_TOOLS, maxTurns: ARCH_MAX_TURNS };
+}
+
+/**
+ * Review calls get no tools: the diff, the orchestrator's own verification
+ * log and the automatic on-disk check are the evidence, and file browsing
+ * multiplied a review's input tokens many times over (one review: 814k).
+ */
+function claudeReviewOpts(task: TaskRecord, config: PipelineConfig, opts: SendOptions): SendOptions {
+  return { ...opts, cwd: resolveVerify(task, config).cwd, tools: "" };
 }
 
 export function log(task: TaskRecord, stage: Stage, by: RoleName, summary: string): void {
@@ -398,6 +415,9 @@ export async function draftImplementation(task: TaskRecord, agents: Agents, hook
   const feedback = task.context.reviewFeedback?.length
     ? `\n\nAddress this feedback from the previous attempt:\n${task.context.reviewFeedback.join("\n")}`
     : "";
+  // The engineer can't read the project: give it the current contents of
+  // the files it may write, instead of letting it rebuild them from memory.
+  task.context.projectFiles = await collectProjectFiles(task, task.projectConfig?.verifyCwd, allowedFilesFrom(task.context.architectureSpec) ?? []);
   const res = await agents.muse.send(PROMPTS.implementation + feedback, pruneContext("implementation", task.context), opts);
   task.context.implementationDiff = res.content;
   task.implementationAttempts += 1;
@@ -547,7 +567,23 @@ export async function advance(task: TaskRecord, agents: Agents, config: Pipeline
     case "architecture": {
       const revising = Boolean(task.context.reviewFeedback?.length) && Boolean(task.context.architectureSpec);
       const claudeOpts = claudeReadOpts(task, config, opts);
+      task.context.projectFiles = await collectProjectFiles(task, resolveVerify(task, config).cwd, allowedFilesFrom(task.context.architectureSpec) ?? []);
       const archContext = await compressForClaude(agents.gemini, ctx("architecture"), opts.signal);
+      // Out of turns while reading files means no answer at all: ask once
+      // more without tools, from the file contents already included.
+      const sendArch = async (prompt: string): Promise<AgentResponse> => {
+        try {
+          return await agents.claude.send(prompt, archContext, claudeOpts);
+        } catch (err) {
+          if (!(err instanceof MaxTurnsReached)) throw err;
+          log(task, task.stage, "system", `Claude used its ${ARCH_MAX_TURNS}-turn file-reading budget without answering — asking again without tools, from the included file contents.`);
+          return agents.claude.send(
+            `${prompt}\n\nYour file-reading budget for this step is used up: write the complete answer now from what is in this message.`,
+            archContext,
+            { ...claudeOpts, tools: "", maxTurns: undefined },
+          );
+        }
+      };
       // Retries a reply that isn't a usable guide (a fake tool call, or a
       // one-line "I'll check the files first") instead of passing it on as
       // the spec — that once gave Muse an empty guide to build from.
@@ -555,7 +591,7 @@ export async function advance(task: TaskRecord, agents: Agents, config: Pipeline
         let problem: string | undefined;
         for (let attempt = 0; attempt <= SPEC_RETRIES; attempt++) {
           const note = problem ? `\n\nYour previous reply could not be used: ${problem}. Reply with the complete guide itself this time.` : "";
-          const res = await agents.claude.send(prompt + note, archContext, claudeOpts);
+          const res = await sendArch(prompt + note);
           problem = specProblem(res.content, { requireLength });
           if (!problem) {
             if (attempt > 0) {
@@ -722,7 +758,7 @@ export async function advance(task: TaskRecord, agents: Agents, config: Pipeline
           "warn",
           `Gemini không review được (${(err as Error).message.slice(0, 160)}) — chỉ có Claude review, không có ý kiến độc lập thứ hai.`,
         );
-        const res = await sendReview(agents.claude, PROMPTS.reviewClaudeFallback, ctx("review_gemini"), claudeReadOpts(task, config, opts));
+        const res = await sendReview(agents.claude, PROMPTS.reviewClaudeFallback, ctx("review_gemini"), claudeReviewOpts(task, config, opts));
         log(task, task.stage, "claude", `Verdict: ${res.verdict} (standing in for Gemini).`);
         applyReviewVerdict(task, config, res, "Claude (standing in for Gemini) review feedback");
         return task;
@@ -734,7 +770,7 @@ export async function advance(task: TaskRecord, agents: Agents, config: Pipeline
         agents.claude,
         PROMPTS.reviewClaude,
         await compressForClaude(agents.gemini, ctx("review_claude"), opts.signal),
-        claudeReadOpts(task, config, opts),
+        claudeReviewOpts(task, config, opts),
       );
       log(task, task.stage, "claude", `Verdict: ${res.verdict}.`);
       applyReviewVerdict(task, config, res, "Claude review feedback");
