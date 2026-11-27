@@ -3,7 +3,11 @@ import type { Agent, TaskContext } from "../types.js";
 /** Below this, compressing isn't worth an extra Gemini round-trip. */
 const COMPRESS_THRESHOLD_CHARS = 4000;
 
-const COMPRESSIBLE_FIELDS = ["verificationLog", "implementationDiff", "reviewFeedback"] as const;
+// The verification log is the reviewer's only proof the code ran, so it is
+// trimmed by code (keeping the evidence lines verbatim), never summarized:
+// Gemini's summaries dropped test names and counts, and the review then
+// rejected work that had actually passed.
+const COMPRESSIBLE_FIELDS = ["implementationDiff", "reviewFeedback"] as const;
 type CompressibleField = (typeof COMPRESSIBLE_FIELDS)[number];
 
 /**
@@ -19,6 +23,9 @@ type CompressibleField = (typeof COMPRESSIBLE_FIELDS)[number];
  * blocked on this.
  */
 export async function compressForClaude(gemini: Agent, context: TaskContext, signal?: AbortSignal): Promise<TaskContext> {
+  if (typeof context.verificationLog === "string" && context.verificationLog.length > COMPRESS_THRESHOLD_CHARS) {
+    context = { ...context, verificationLog: condenseVerificationLog(context.verificationLog, context.implementationFiles ?? []) };
+  }
   const candidates: { field: CompressibleField; text: string }[] = [];
   for (const field of COMPRESSIBLE_FIELDS) {
     const raw = context[field];
@@ -50,4 +57,60 @@ export async function compressForClaude(gemini: Agent, context: TaskContext, sig
     else compressed[field] = summary;
   }
   return compressed;
+}
+
+const KEY_LINE = [
+  /^\$ /, // the command itself
+  /^== .* ==$/, // the orchestrator's own check headers
+  /^FAILED\b/,
+  /^(OK|FAILED|PASSED)\b/,
+  /^Ran \d+ tests?\b/,
+  /\b\d+ (passed|failed|errors?|skipped|tests?)\b/i,
+  /^(FAIL|ERROR):/,
+];
+// The runner's own "FAILED:" line or a test runner's failure header — not any
+// "error" text, which passing tests print on purpose when testing error paths.
+const FAILURE = /^FAILED\b|^(FAIL|ERROR): /m;
+const SMALL_SECTION_CHARS = 1500;
+const FAILURE_TAIL_LINES = 80;
+
+/**
+ * Shortens a verification log without rewording it: per command, small or
+ * failing output is kept (a failure's tail in full), and long passing output
+ * keeps only its evidence lines — commands, counts, OK/FAILED, check headers
+ * and every line naming a file written this attempt.
+ */
+export function condenseVerificationLog(log: string, writtenFiles: string[]): string {
+  const names = writtenFiles
+    .map((f) => f.split("/").pop()?.replace(/\.[^.]+$/, "") ?? "")
+    .filter((n) => n.length >= 3);
+  const isKey = (line: string) => KEY_LINE.some((re) => re.test(line)) || names.some((n) => line.includes(n));
+
+  const sections: string[][] = [[]];
+  for (const line of log.split("\n")) {
+    if (line.startsWith("$ ") && sections[sections.length - 1].length) sections.push([]);
+    sections[sections.length - 1].push(line);
+  }
+  return sections
+    .map((lines) => {
+      const text = lines.join("\n");
+      if (text.length <= SMALL_SECTION_CHARS) return text;
+      const failed = FAILURE.test(text);
+      const tailStart = failed ? Math.max(0, lines.length - FAILURE_TAIL_LINES) : lines.length;
+      const kept: string[] = [];
+      let omitted = 0;
+      const flush = () => {
+        if (omitted) kept.push(`… (${omitted} line(s) omitted)`);
+        omitted = 0;
+      };
+      lines.forEach((line, i) => {
+        if (i >= tailStart || isKey(line)) {
+          flush();
+          kept.push(line);
+        } else omitted++;
+      });
+      flush();
+      return kept.join("\n");
+    })
+    .join("\n");
 }

@@ -204,18 +204,18 @@ describe("pipeline", () => {
     expect(seen?.ideaBrief).toBeUndefined();
   });
 
-  it("has Gemini compress a large verification log before Claude's final review, instead of sending the raw log", async () => {
+  it("trims a large verification log by code before Claude's final review — Gemini never rewrites it", async () => {
     const task = createTask("Needs rework");
     task.stage = "review_claude";
-    const bigLog = "L".repeat(5000) + "\nTHE ACTUAL FAILURE";
+    const passing = Array.from({ length: 300 }, (_, i) => `test_${i} (t.T.test_${i}) ... ok`);
+    const bigLog = ["$ python3 -m unittest -v", ...passing, "Ran 300 tests in 1.0s", "", "OK"].join("\n");
     task.context.implementationDiff = "diff";
     task.context.verificationLog = bigLog;
 
-    const summarizingGemini: Agent = {
+    const silentGemini: Agent = {
       role: "gemini",
-      async send(prompt: string): Promise<AgentResponse> {
-        expect(prompt).toContain("=== verificationLog ===");
-        return { role: "gemini", content: "=== verificationLog ===\nFailed: THE ACTUAL FAILURE, in short." };
+      async send(): Promise<AgentResponse> {
+        throw new Error("the log must not be sent to Gemini");
       },
     };
     let seenLog: string | undefined;
@@ -227,10 +227,12 @@ describe("pipeline", () => {
       },
     };
 
-    const a = agents({ gemini: summarizingGemini, claude: capturingClaude });
+    const a = agents({ gemini: silentGemini, claude: capturingClaude });
     await advance(task, a, passingConfig());
 
-    expect(seenLog).toBe("Failed: THE ACTUAL FAILURE, in short.");
+    expect(seenLog!.length).toBeLessThan(bigLog.length / 10);
+    expect(seenLog).toContain("Ran 300 tests in 1.0s");
+    expect(task.context.verificationLog).toBe(bigLog); // only Claude's copy is trimmed
     expect(task.stage).toBe("checkpoint_final");
   });
 
