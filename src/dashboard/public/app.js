@@ -87,8 +87,15 @@ const state = {
   orgDensity: localStorage.getItem("dash-org-density") === "detailed" ? "detailed" : "compact",
   /** Which tab the org view's side column shows: the plan tree or hand-offs & bottlenecks. */
   sideTab: "plan",
-  /** leadId -> staff ids, worked out from who hands work to whom (see computeTeams). */
+  /** leadId -> staff ids (see computeTeams). */
   teams: new Map(),
+  /** The company's teams as the server defines them: { id, name, leadId, mission }. */
+  teamsDef: [],
+  /** Lesson counts per role: { pending: {slotId: n}, accepted: {slotId: n} }. */
+  lessons: { pending: {}, accepted: {} },
+  /** The role panel (playbook + lessons) — which role, which tab, what the server sent. */
+  role: { slotId: null, tab: "playbook", detail: null },
+  scoreboard: null,
 };
 
 // ---------- utils ----------
@@ -296,6 +303,7 @@ function renderTelemetry() {
   pauseBtn.classList.toggle("btn-resume", state.control.paused);
   renderDoneBanner();
   renderComposer();
+  renderCeoNode();
 }
 
 function renderCompanyDirectives() {
@@ -560,6 +568,7 @@ function updateCard(slot) {
   card.dataset.state = st.kind;
   card.querySelector('[data-part="tools"]').innerHTML = `
     ${slot.isBoss ? `<span class="gate on" title="Kế hoạch của Sếp luôn chờ bạn duyệt">🔒</span>` : `<button class="gate ${slot.gated ? "on" : ""}" data-action="gate" data-slot="${slot.id}" data-enabled="${slot.gated ? "0" : "1"}" title="${slot.gated ? "Cổng duyệt đang BẬT: kết quả chỉ bàn giao sau khi bạn duyệt. Bấm để tắt." : "Cổng duyệt đang tắt: bàn giao ngay khi Claude đã duyệt. Bấm để bật."}">${slot.gated ? "🔒" : "🔓"}</button>`}
+    <button class="pin playbook-btn" data-action="role-open" data-slot="${slot.id}" title="Playbook & bài học của ${slot.id}${state.lessons.pending[slot.id] ? ` — ${state.lessons.pending[slot.id]} bài học chờ duyệt` : ""}">📘${state.lessons.pending[slot.id] ? `<span class="lesson-dot">${state.lessons.pending[slot.id]}</span>` : ""}</button>
     <button class="pin ${state.focusSlot === slot.id ? "on" : ""}" data-action="focus" data-slot="${slot.id}" title="${state.focusSlot === slot.id ? "Bỏ tập trung" : `Tập trung vào ${slot.id}: làm mờ nhân sự không liên quan, hiện đường nối`}">🎯</button>
     <span class="parallel" title="Số task đang chạy / tối đa">${slot.counts.running}/${slot.parallel}</span>`;
   card.querySelector('[data-part="state"]').innerHTML = `
@@ -625,6 +634,14 @@ function applyFilter(card, slot) {
  */
 function computeTeams() {
   const slots = [...state.slots.values()];
+  // The server defines the teams: each lead manages the staff of its team.
+  const defined = (state.teamsDef ?? []).filter((t) => t.leadId && state.slots.has(t.leadId));
+  if (defined.length) {
+    const teams = new Map(defined.map((t) => [t.leadId, slots.filter((s) => s.team === t.id && s.tier === 3).map((s) => s.id)]));
+    const placed = new Set([...teams.values()].flat());
+    return { teams, loose: slots.filter((s) => s.tier === 3 && !placed.has(s.id)).map((s) => s.id) };
+  }
+  // Older servers without teams: infer them from who hands work to whom.
   const leads = slots.filter((s) => s.tier === 2);
   const staff = slots.filter((s) => s.tier === 3);
   const teams = new Map(leads.map((l) => [l.id, []]));
@@ -667,16 +684,31 @@ function computeTeams() {
   return { teams, loose: [] };
 }
 
+/** You, above the boss: what is waiting for your decision right now. */
+function renderCeoNode() {
+  const el = $("#ceo-node");
+  if (!el) return;
+  const waiting = state.telemetry?.counts.waitingYou ?? 0;
+  const planWaiting = state.plan?.status === "awaiting_approval" ? 1 : 0;
+  const n = waiting + planWaiting;
+  el.innerHTML = `<span class="ceo-avatar">CEO</span><div class="ceo-text"><b>Bạn — CEO</b><span>Duyệt kế hoạch, chốt kết quả, ra chỉ thị</span></div>${
+    n ? `<button class="ceo-wait" data-action="inbox-open" data-tab="waiting">✋ ${n} chờ bạn</button>` : `<span class="ceo-idle">Không có gì chờ duyệt</span>`
+  }`;
+}
+
 function renderOrg() {
   const slots = [...state.slots.values()];
   const { teams, loose } = computeTeams();
   state.teams = teams;
   const card = (id) => (state.slots.get(id) ? cardSkeleton(state.slots.get(id)) : "");
-  $("#row-1").innerHTML = slots.filter((s) => s.tier === 1).map(cardSkeleton).join("");
+  $("#row-0").innerHTML = `<div class="ceo-node" id="ceo-node"></div>`;
+  $("#row-1").innerHTML = `<div class="boss-row"><span></span>${slots.filter((s) => s.tier === 1).map(cardSkeleton).join("")}<div class="auditor" title="Gemini thẩm định độc lập: phản biện kế hoạch của Sếp, bản thiết kế của từng task và kết quả code trước khi Claude ký duyệt">
+    <span class="auditor-icon">⚖</span><div><b>Gemini</b><span>Thẩm định độc lập</span></div></div></div>`;
+  renderCeoNode();
   const row2 = $("#row-2");
   row2.style.setProperty("--teams", Math.max(1, teams.size));
   row2.innerHTML = [...teams]
-    .map(([lead, members]) => `<div class="team" data-team="${esc(lead)}"><div class="team-lead">${card(lead)}</div><div class="team-members">${members.map(card).join("")}</div></div>`)
+    .map(([lead, members]) => `<div class="team" data-team="${esc(lead)}"><div class="team-name">${esc(state.slots.get(lead)?.teamName ?? "")}</div><div class="team-lead">${card(lead)}</div><div class="team-members">${members.map(card).join("")}</div></div>`)
     .join("");
   const extra = [...loose, ...slots.filter((s) => ![1, 2, 3].includes(s.tier)).map((s) => s.id)];
   $("#row-3").innerHTML = extra.length ? `<div class="loose-head">Chưa xếp nhóm</div><div class="loose-grid">${extra.map(card).join("")}</div>` : "";
@@ -740,7 +772,7 @@ function renderTeamSummary(lead) {
   const problems = sum("problems");
   const tasks = people.reduce((n, p) => n + p.tasks.length, 0);
   const done = people.reduce((n, p) => n + p.tasks.filter((t) => t.queueState === "done").length, 0);
-  el.innerHTML = `<span class="ts-size">Nhóm ${people.length} người</span><span>✓ ${done}/${tasks}</span>${running ? `<span class="q-running">▶ ${running} đang chạy</span>` : ""}${waiting ? `<span class="q-waiting_you">✋ ${waiting} chờ duyệt</span>` : ""}${problems ? `<span class="q-error">⚠ ${problems} lỗi</span>` : ""}`;
+  el.innerHTML = `<span class="ts-size">${esc(lead.teamName ?? "Nhóm")} · ${people.length} người</span><span>✓ ${done}/${tasks}</span>${running ? `<span class="q-running">▶ ${running} đang chạy</span>` : ""}${waiting ? `<span class="q-waiting_you">✋ ${waiting} chờ duyệt</span>` : ""}${problems ? `<span class="q-error">⚠ ${problems} lỗi</span>` : ""}`;
 }
 
 /** A staff update changes its lead's team summary too. */
@@ -1213,6 +1245,12 @@ function drawEdges() {
   // reporting lines: boss → each lead (elbow), lead → members (a spine in the team's left gutter)
   const bossEl = $("#row-1 .card");
   const boss = bossEl ? rect(bossEl.dataset.slot) : null;
+  const ceoEl = $("#ceo-node");
+  if (ceoEl && boss) {
+    const r = ceoEl.getBoundingClientRect();
+    const cx = r.left - box.left + r.width / 2;
+    addPath(`M${cx},${r.bottom - box.top} V${boss.y}`, "tree-line tree-ceo");
+  }
   for (const team of $$("#row-2 .team")) {
     const lead = rect(team.dataset.team);
     if (!lead) continue;
@@ -1864,6 +1902,14 @@ document.addEventListener("click", async (e) => {
       state.composer.manual = true;
       renderComposer();
       return goalInput.focus();
+    case "role-open":
+      e.stopPropagation();
+      return openRole(ds.slot, ds.tab);
+    case "role-close":
+      return closeRole();
+    case "role-tab":
+      state.role.tab = ds.tab;
+      return renderRoleDrawer();
     case "org-density":
       state.orgDensity = ds.value;
       localStorage.setItem("dash-org-density", ds.value);
@@ -1977,6 +2023,19 @@ document.addEventListener("click", async (e) => {
       if (res) toast(`Đã áp dụng ${res.applied} đề xuất${res.skipped ? `, bỏ qua ${res.skipped} (xem ghi chú)` : ""}.`);
     }
     if (action === "rebalance-dismiss") await post("/api/rebalance/dismiss");
+    if (action === "lesson-accept" || action === "lesson-dismiss" || action === "lesson-remove") {
+      const text = $(`[data-lesson-text="${CSS.escape(ds.id)}"]`)?.value;
+      if (await post(`/api/lessons/${encodeURIComponent(ds.id)}/${action.slice(7)}`, { text })) {
+        toast(action === "lesson-accept" ? "Đã duyệt bài học — áp dụng cho các task sau của vị trí này." : action === "lesson-dismiss" ? "Đã bỏ qua đề xuất." : "Đã xoá bài học.");
+      }
+    }
+    if (action === "lesson-add") {
+      const input = $("#lesson-new");
+      if (await post(`/api/roles/${encodeURIComponent(ds.slot)}/lessons`, { text: input?.value ?? "" })) {
+        if (input) input.value = "";
+        toast("Đã thêm bài học.");
+      }
+    }
     if (action === "promote") (await post(`/api/engines/${encodeURIComponent(ds.engine)}/promote`, { id: ds.id })) && toast("Đã đưa lượt này lên đầu hàng đợi.");
   } finally {
     btn.disabled = false;
@@ -2033,6 +2092,7 @@ document.addEventListener("drop", async (e) => {
 document.addEventListener("keydown", (e) => {
   if (e.key !== "Escape") return;
   if (!$("#modal").hidden) closeModal();
+  else if (!$("#role-drawer").hidden) closeRole();
   else if (!$("#drawer").hidden) closeDrawer();
   else if (state.inbox.open) {
     state.inbox.open = false;
@@ -2040,6 +2100,7 @@ document.addEventListener("keydown", (e) => {
   } else if (state.focusSlot) setFocus(null);
 });
 $("#drawer-backdrop").addEventListener("click", closeDrawer);
+$("#role-backdrop").addEventListener("click", () => closeRole());
 $("#inbox-backdrop").addEventListener("click", () => {
   state.inbox.open = false;
   renderInbox();
@@ -2105,13 +2166,14 @@ $("#company-steer").addEventListener("keydown", (e) => e.key === "Enter" && $("#
 function setView(view) {
   state.view = view;
   $$(".tab[data-view]").forEach((b) => b.classList.toggle("active", b.dataset.view === view));
-  for (const v of ["org", "flow", "timeline", "artifacts", "seo"]) $(`#view-${v}`).hidden = v !== view;
-  $("#filters").classList.toggle("hidden-filters", view === "artifacts" || view === "seo");
+  for (const v of ["org", "flow", "timeline", "roles", "artifacts", "seo"]) $(`#view-${v}`).hidden = v !== view;
+  $("#filters").classList.toggle("hidden-filters", view === "artifacts" || view === "seo" || view === "roles");
   $("#g-tip").hidden = true;
   if (view === "org") scheduleEdges();
   if (view === "flow") renderFlowView();
   if (view === "timeline") loadTimeline();
   if (view === "artifacts") loadArtifacts();
+  if (view === "roles") loadScoreboard();
   if (view === "seo") loadSeo();
 }
 
@@ -2209,10 +2271,167 @@ function renderSeo() {
     : `<div class="muted">Chưa có lượt nào.</div>`;
 }
 
+// ---------- roles: playbook drawer & scoreboard ----------
+const MODEL_TIER = { light: ["Nhẹ", "Kiến trúc dùng CLAUDE_MODEL_LIGHT nếu đã đặt"], standard: ["Chuẩn", "Dùng model mặc định"], strong: ["Mạnh", "Kiến trúc và review dùng CLAUDE_MODEL_STRONG nếu đã đặt"] };
+const CHECK_LABEL = { secrets: "Quét secret", tests: "Bắt buộc có test", stubs: "Cấm code giả", ios_destination: "Build iOS đúng simulator" };
+
+function renderLessonBadges() {
+  const n = Object.values(state.lessons.pending ?? {}).reduce((a, b) => a + b, 0);
+  const badge = $("#lessons-tab-badge");
+  badge.hidden = !n;
+  badge.textContent = String(n);
+  badge.title = `${n} bài học chờ bạn duyệt`;
+}
+
+/** Just enough Markdown for a playbook: headings, quotes, bullets, inline code and bold. */
+function miniMarkdown(md) {
+  const inline = (t) => esc(t).replace(/`([^`]+)`/g, "<code>$1</code>").replace(/\*\*([^*]+)\*\*/g, "<b>$1</b>");
+  const out = [];
+  let list = false;
+  for (const line of md.split("\n")) {
+    const bullet = /^\s*[-*]\s+(.*)$/.exec(line);
+    if (bullet) {
+      if (!list) out.push("<ul>");
+      list = true;
+      out.push(`<li>${inline(bullet[1])}</li>`);
+      continue;
+    }
+    if (list) out.push("</ul>");
+    list = false;
+    if (/^#\s/.test(line)) out.push(`<h3>${inline(line.replace(/^#\s+/, ""))}</h3>`);
+    else if (/^##\s/.test(line)) out.push(`<h4>${inline(line.replace(/^##\s+/, ""))}</h4>`);
+    else if (/^>\s?/.test(line)) out.push(`<blockquote>${inline(line.replace(/^>\s?/, ""))}</blockquote>`);
+    else if (line.trim()) out.push(`<p>${inline(line)}</p>`);
+  }
+  if (list) out.push("</ul>");
+  return out.join("");
+}
+
+async function openRole(slotId, tab) {
+  state.role = { slotId, tab: tab ?? (state.lessons.pending[slotId] ? "lessons" : "playbook"), detail: null };
+  $("#role-drawer").hidden = false;
+  $("#role-backdrop").hidden = false;
+  $("#role-drawer").innerHTML = `<div class="drawer-loading muted">Đang tải playbook…</div>`;
+  await loadRole(slotId);
+}
+function closeRole() {
+  state.role = { slotId: null, tab: "playbook", detail: null };
+  $("#role-drawer").hidden = true;
+  $("#role-backdrop").hidden = true;
+}
+async function loadRole(slotId) {
+  const res = await fetch(`/api/roles/${encodeURIComponent(slotId)}`);
+  if (!res.ok) return toast("Không tải được playbook.");
+  if (state.role.slotId !== slotId) return;
+  state.role.detail = await res.json();
+  renderRoleDrawer();
+}
+
+function renderRoleDrawer() {
+  const d = state.role.detail;
+  if (!d) return;
+  const r = d.role;
+  const pending = d.lessons.filter((l) => l.status === "pending");
+  const accepted = d.lessons.filter((l) => l.status === "accepted");
+  const [tierName, tierTip] = MODEL_TIER[r.modelTier] ?? MODEL_TIER.standard;
+  const tab = (id, label) => `<button class="tab${state.role.tab === id ? " active" : ""}" data-action="role-tab" data-tab="${id}">${label}</button>`;
+  const body =
+    state.role.tab === "playbook"
+      ? `<div class="pb-note muted small">Nội dung này được chèn vào prompt của mọi task thuộc ${esc(r.id)}: mỗi bước nhận đúng phần của mình. Sửa file <code>${esc(d.playbookPath)}</code> để thay đổi — áp dụng ngay từ bước kế tiếp.</div>
+         <div class="playbook">${miniMarkdown(d.playbook || "_Chưa có playbook._")}</div>`
+      : `<div class="pb-note muted small">Khi một task của vị trí này được ship sau khi bị trả về, hệ thống đề xuất một bài học từ các phản hồi. Bạn sửa thành quy tắc chung rồi duyệt; bài học đã duyệt được chèn vào prompt cùng mục "Bài học" của playbook.</div>
+         <div class="panel-sub">Chờ bạn duyệt (${pending.length})</div>
+         ${pending.length ? pending.map((l) => `
+           <div class="lesson pending">
+             ${l.source ? `<div class="muted small">Từ task: ${esc(l.source.title)} · ${esc(fmtTime(l.createdAt))}</div>` : ""}
+             <textarea rows="5" data-lesson-text="${esc(l.id)}">${esc(l.text)}</textarea>
+             <div class="decision-row"><button class="btn btn-approve" data-action="lesson-accept" data-id="${esc(l.id)}">Duyệt bài học</button><button class="btn btn-ghost" data-action="lesson-dismiss" data-id="${esc(l.id)}">Bỏ qua</button></div>
+           </div>`).join("") : `<div class="muted small">Không có đề xuất nào.</div>`}
+         <div class="panel-sub">Đã áp dụng (${accepted.length})</div>
+         ${accepted.length ? accepted.map((l) => `<div class="lesson"><div>${esc(l.text)}</div><button class="mini" data-action="lesson-remove" data-id="${esc(l.id)}" title="Xoá bài học này">Xoá</button></div>`).join("") : `<div class="muted small">Chưa có bài học nào ngoài playbook.</div>`}
+         <div class="panel-sub">Thêm bài học</div>
+         <textarea id="lesson-new" rows="3" placeholder="Ví dụ: Model dùng trong List/ForEach phải Identifiable với id ổn định."></textarea>
+         <div class="row-inline"><button class="btn btn-small-inline" data-action="lesson-add" data-slot="${esc(r.id)}">Thêm</button></div>`;
+  $("#role-drawer").innerHTML = `
+    <div class="drawer-head">
+      <span class="avatar tier-${r.tier}" style="--h:${(Number(r.id.replace(/\D/g, "")) * 47 + 190) % 360};--p:100">${esc(initials(r.name))}</span>
+      <div>
+        <div class="muted small">${esc(r.teamName)} · ${esc(r.tierLabel)} · ${esc(r.id)}</div>
+        <div class="drawer-title">${esc(r.name.replace(/^AI /, ""))}</div>
+        <div class="muted small">${esc(r.summary)}</div>
+        <div class="role-chips">
+          <span class="rv-chip" title="${esc(tierTip)}">Model: ${tierName}</span>
+          ${r.checks.map((c) => `<span class="rv-chip gate" title="Chạy ở bước kiểm tra cho mọi task của vị trí này">✓ ${esc(CHECK_LABEL[c] ?? c)}</span>`).join("")}
+          ${r.gated ? `<span class="rv-chip">🔒 Cổng duyệt</span>` : ""}
+        </div>
+      </div>
+      <button class="btn btn-ghost btn-square" data-action="role-close" title="Đóng (Esc)">✕</button>
+    </div>
+    <div class="drawer-tabs">${tab("playbook", "Playbook")}${tab("lessons", `Bài học${pending.length ? ` <span class="side-badge">${pending.length}</span>` : ""}`)}</div>
+    <div class="drawer-body">${body}</div>`;
+}
+
+async function loadScoreboard() {
+  const res = await fetch("/api/scoreboard");
+  if (!res.ok) return;
+  state.scoreboard = await res.json();
+  renderRolesView();
+}
+
+function renderRolesView() {
+  const el = $("#view-roles");
+  const sb = state.scoreboard;
+  if (!sb) {
+    el.innerHTML = `<div class="muted">Đang tải…</div>`;
+    return;
+  }
+  const byId = new Map(sb.roles.map((r) => [r.slotId, r]));
+  const teams = state.teamsDef.length ? state.teamsDef : [{ id: null, name: "Tất cả" }];
+  const pct = (a, b) => (b ? Math.round((a / b) * 100) : null);
+  const rateCell = (row) => {
+    const p = pct(row.firstPass, row.done);
+    if (p === null) return `<span class="muted">—</span>`;
+    const cls = row.done < 3 ? "few" : p >= 70 ? "good" : p >= 40 ? "mid" : "low";
+    return `<div class="rate ${cls}" title="${row.firstPass}/${row.done} task xong mà không bị review từ chối, không lỗi kiểm tra, không bị CEO trả về${row.done < 3 ? " — còn ít dữ liệu" : ""}"><div class="rate-bar"><i style="width:${p}%"></i></div><b>${p}%</b></div>`;
+  };
+  const rows = (teamId) =>
+    [...state.slots.values()]
+      .filter((s) => teamId === null || s.team === teamId)
+      .sort((a, b) => a.tier - b.tier)
+      .map((s) => {
+        const r = byId.get(s.id) ?? { tasks: 0, done: 0, rejected: 0, firstPass: 0, archRejects: 0, reviewRejects: 0, verifyFails: 0, ceoSendBacks: 0, roleCheckFails: 0, costUsd: 0, activeMs: 0 };
+        const [tierName, tierTip] = MODEL_TIER[s.modelTier] ?? MODEL_TIER.standard;
+        const pend = state.lessons.pending[s.id] ?? 0;
+        const acc = state.lessons.accepted[s.id] ?? 0;
+        return `<tr>
+          <td><div class="sb-role">${avatar(s)}<div><b>${esc(s.name.replace(/^AI /, ""))}</b><span class="muted small">${esc(s.id)} · ${esc(s.tierLabel)}</span></div></div></td>
+          <td><span class="rv-chip model-${s.modelTier}" title="${esc(tierTip)}">${tierName}</span></td>
+          <td class="sb-checks">${s.checks.length ? s.checks.map((c) => `<span class="rv-chip gate">${esc(CHECK_LABEL[c] ?? c)}</span>`).join("") : `<span class="muted small">—</span>`}</td>
+          <td class="num">${r.done}<span class="muted">/${r.tasks}</span>${r.rejected ? ` <span class="q-error" title="Bị loại hẳn">· ${r.rejected} loại</span>` : ""}</td>
+          <td>${rateCell(r)}</td>
+          <td class="num" title="Thiết kế bị Gemini phản biện / review từ chối / lệnh kiểm tra thất bại / CEO trả về / kiểm tra vai trò trượt">${r.archRejects} · ${r.reviewRejects} · ${r.verifyFails} · ${r.ceoSendBacks}${r.roleCheckFails ? ` · <span class="q-error">${r.roleCheckFails}</span>` : ""}</td>
+          <td class="num">${fmtCost(r.costUsd)}<div class="muted small">${fmtDur(r.activeMs)}</div></td>
+          <td class="num">${acc}${pend ? ` <span class="side-badge" title="${pend} chờ duyệt">${pend}</span>` : ""}</td>
+          <td><button class="btn btn-small-inline" data-action="role-open" data-slot="${esc(s.id)}"${pend ? ' data-tab="lessons"' : ""}>📘 Playbook</button></td>
+        </tr>`;
+      })
+      .join("");
+  el.innerHTML = `
+    <div class="view-intro">Mỗi vị trí có một playbook riêng (năng lực, cách thiết kế, cách viết code, cách review, bài học) được chèn vào prompt của mọi task thuộc vị trí đó, cùng các bài kiểm tra riêng chạy ở bước kiểm tra.
+      Số liệu lấy từ <b>${sb.taskCount}</b> task${sb.since ? ` kể từ ${esc(new Date(sb.since).toLocaleDateString("vi-VN"))}` : ""}, kể cả task cũ trước khi có playbook.</div>
+    <div class="sb-wrap"><table class="sb-table">
+      <thead><tr><th>Vị trí</th><th>Model</th><th>Kiểm tra riêng</th><th class="num">Xong / tổng</th><th>Qua ngay lần đầu</th><th class="num" title="Thiết kế bị phản biện · review từ chối · kiểm tra thất bại · CEO trả về">Bị trả về<br><span class="muted small">TK · RV · KT · CEO</span></th><th class="num">Chi phí</th><th class="num">Bài học</th><th></th></tr></thead>
+      ${teams.map((t) => `<tbody><tr class="sb-team"><td colspan="9">${esc(t.name)}${t.description ? ` <span class="muted small">— ${esc(t.description)}</span>` : ""}</td></tr>${rows(t.id)}</tbody>`).join("")}
+    </table></div>`;
+}
+
 // ---------- data ----------
 function applyStatus(data) {
   state.slots = new Map(data.slots.map((s) => [s.id, s]));
   state.plan = data.plan;
+  state.teamsDef = data.teams ?? [];
+  state.lessons = data.lessons ?? { pending: {}, accepted: {} };
+  renderLessonBadges();
   const dirInput = $("#project-dir-input");
   state.projectsRoot = data.settings?.projectsRoot || null;
   const gh = $("#opt-github");
@@ -2319,6 +2538,13 @@ function connect() {
     state.control = JSON.parse(e.data);
     renderTelemetry();
     renderCompanyDirectives();
+  });
+  es.addEventListener("lessons", (e) => {
+    state.lessons = JSON.parse(e.data) ?? { pending: {}, accepted: {} };
+    renderLessonBadges();
+    for (const slot of state.slots.values()) updateCard(slot);
+    if (state.role.slotId) loadRole(state.role.slotId);
+    if (state.view === "roles") loadScoreboard();
   });
   es.addEventListener("contentseo", (e) => {
     state.seo = JSON.parse(e.data);

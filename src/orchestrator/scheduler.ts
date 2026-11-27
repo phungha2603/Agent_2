@@ -39,9 +39,12 @@ import {
 } from "./planner.js";
 import { parseFileBlocks } from "../apply/applyFiles.js";
 import { buildRebalancePrompt, parseRebalance, type LoadSlot, type RebalanceProposal } from "./rebalance.js";
-import { loadTask, saveTask, taskExists } from "../store/taskStore.js";
+import { listAllTasks, loadTask, saveTask, taskExists } from "../store/taskStore.js";
 import { loadPlan, savePlan } from "../store/planStore.js";
 import { appendCall, readCalls } from "../store/callLogStore.js";
+import { ROLES, TEAMS, roleById, teamById, type ModelTier, type RoleCheck, type TeamId } from "../org/roles.js";
+import { formatGuidance, loadPlaybook } from "../org/playbooks.js";
+import { acceptedLessons, addLesson, decideLesson, loadLessons, proposeLessonFrom, type Lesson } from "../org/lessons.js";
 import { SLOTS, TIER_LABELS, deriveStatus, loadDashboardState, saveDashboardState, type DashboardState, type Directive } from "../dashboard/slots.js";
 
 export interface SchedulerSettings {
@@ -145,6 +148,12 @@ export interface SlotSnapshot {
   icon: string;
   tier: 1 | 2 | 3;
   tierLabel: string;
+  /** The team this role belongs to, its display name, and the role's specialty. */
+  team: TeamId;
+  teamName: string;
+  summary: string;
+  modelTier: ModelTier;
+  checks: RoleCheck[];
   isBoss: boolean;
   parallel: number;
   gated: boolean;
@@ -178,6 +187,27 @@ export interface Telemetry {
   costUsd: number;
   costPartial: boolean;
   tokensEstimated: boolean;
+}
+
+export interface RoleScore {
+  slotId: string;
+  tasks: number;
+  done: number;
+  rejected: number;
+  /** Shipped without a review rejection, a failed verification or a CEO send-back. */
+  firstPass: number;
+  archRejects: number;
+  reviewRejects: number;
+  verifyFails: number;
+  ceoSendBacks: number;
+  roleCheckFails: number;
+  tokens: number;
+  costUsd: number;
+  activeMs: number;
+}
+
+function emptyScore(slotId: string): RoleScore {
+  return { slotId, tasks: 0, done: 0, rejected: 0, firstPass: 0, archRejects: 0, reviewRejects: 0, verifyFails: 0, ceoSendBacks: 0, roleCheckFails: 0, tokens: 0, costUsd: 0, activeMs: 0 };
 }
 
 export interface Insights {
@@ -214,7 +244,7 @@ interface DependencyState {
 
 type Index = Map<string, TaskRecord>;
 
-const DEPARTMENTS: Department[] = SLOTS.map((s) => ({ id: s.id, name: s.name, tier: s.tier }));
+const DEPARTMENTS: Department[] = ROLES.map((r) => ({ id: r.id, name: r.name, tier: r.tier, team: teamById(r.team)?.name, teamMission: teamById(r.team)?.mission, summary: r.summary }));
 const BOSS_ID = SLOTS.find((s) => s.tier === 1)!.id;
 const LIVE_TAIL_CHARS = 2000;
 const LIVE_FLUSH_MS = 250;
@@ -438,6 +468,12 @@ export class Company extends EventEmitter {
     else resolveCheckpoint(task, act === "approve", feedback?.trim() || undefined);
     if (finalCheckpoint) await this.recordInGit(task, act === "approve");
     if (finalCheckpoint && act === "approve") void this.notifyIfPlanFinished(task).catch(() => {});
+    if (finalCheckpoint && act === "approve" && task.stage === "done") {
+      // A task that needed corrections leaves its role a lesson for the CEO to review.
+      void proposeLessonFrom(task)
+        .then((l) => l && this.emit("lessons"))
+        .catch(() => {});
+    }
 
     if (act === "approve") {
       if (task.stage === "done") trace(task, "CEO", "gate", gated ? "Approved at the approval gate — result handed off." : "Approved and shipped.");
@@ -967,6 +1003,7 @@ export class Company extends EventEmitter {
         id: slot.id,
         name: slot.name,
         tier: slot.tier,
+        team: teamById(slot.team)?.name,
         parallel: snap.parallel,
         running: snap.counts.running,
         queued: snap.counts.queued,
@@ -1072,6 +1109,11 @@ export class Company extends EventEmitter {
       icon: slot.icon,
       tier: slot.tier,
       tierLabel: TIER_LABELS[slot.tier],
+      team: slot.team,
+      teamName: teamById(slot.team)?.name ?? slot.team,
+      summary: roleById(slot.id)?.summary ?? "",
+      modelTier: roleById(slot.id)?.modelTier ?? "standard",
+      checks: roleById(slot.id)?.checks ?? [],
       isBoss: slot.tier === 1,
       parallel: this.parallelFor(slot.id),
       gated: Boolean(this.state.gates[slot.id]),
@@ -1327,8 +1369,87 @@ export class Company extends EventEmitter {
       insights: await this.insights(idx),
       control: this.control(),
       rebalance: this.rebalanceSnapshot(),
+      teams: TEAMS,
+      lessons: await this.lessonsSummary(),
       settings: { githubAvailable: this.githubAvailable, projectsRoot: this.projectsRoot ?? null, defaultProjectDir: this.projectsRoot ? "" : this.defaultProjectDir(), handoffOn: this.settings.handoffOn, stageErrorRetries: this.settings.stageErrorRetries, maxAutoRecoveries: this.pipeline.maxAutoRecoveries ?? 0 },
     };
+  }
+
+  // ---------- roles: lessons, playbooks, scoreboard ----------
+
+  /** Pending and accepted lesson counts per role, for the chart's badges and the scoreboard. */
+  async lessonsSummary(): Promise<{ pending: Record<string, number>; accepted: Record<string, number> }> {
+    const pending: Record<string, number> = {};
+    const accepted: Record<string, number> = {};
+    for (const l of await loadLessons()) {
+      if (l.status === "pending") pending[l.slotId] = (pending[l.slotId] ?? 0) + 1;
+      if (l.status === "accepted") accepted[l.slotId] = (accepted[l.slotId] ?? 0) + 1;
+    }
+    return { pending, accepted };
+  }
+
+  /** A role's playbook file and its lessons, for the dashboard's role panel. */
+  async roleDetail(slotId: string): Promise<{ role: SlotSnapshot; playbook: string; playbookPath: string; lessons: Lesson[] }> {
+    if (!roleById(slotId)) throw new UserError(`Không có vị trí ${slotId}.`);
+    const pb = await loadPlaybook(slotId);
+    return {
+      role: await this.slotSnapshot(slotId),
+      playbook: pb?.raw ?? "",
+      playbookPath: `playbooks/${slotId}.md`,
+      lessons: (await loadLessons()).filter((l) => l.slotId === slotId && l.status !== "dismissed").sort((a, b) => b.createdAt.localeCompare(a.createdAt)),
+    };
+  }
+
+  async addRoleLesson(slotId: string, text: string): Promise<Lesson | undefined> {
+    if (!roleById(slotId)) throw new UserError(`Không có vị trí ${slotId}.`);
+    if (!text.trim()) throw new UserError("Nhập nội dung bài học.");
+    const lesson = await addLesson(slotId, text, "accepted");
+    this.emit("lessons");
+    return lesson;
+  }
+
+  async decideRoleLesson(id: string, decision: "accept" | "dismiss" | "remove", text?: string): Promise<Lesson | undefined> {
+    try {
+      const lesson = await decideLesson(id, decision, text);
+      this.emit("lessons");
+      return lesson;
+    } catch (err) {
+      throw new UserError((err as Error).message);
+    }
+  }
+
+  /**
+   * How each role has performed over every task it ever owned (not just the
+   * ones still in a queue): how often its work passed first time, how many
+   * send-backs it needed, and what it cost. Read from each task's history, so
+   * tasks from before roles had playbooks count too.
+   */
+  async scoreboard(): Promise<{ roles: RoleScore[]; since: string | null; taskCount: number }> {
+    const tasks = (await listAllTasks()).filter((t) => t.slotId);
+    const rows = new Map<string, RoleScore>(ROLES.map((r) => [r.id, emptyScore(r.id)]));
+    for (const t of tasks) {
+      const row = rows.get(t.slotId!) ?? rows.set(t.slotId!, emptyScore(t.slotId!)).get(t.slotId!)!;
+      const rejects = (stages: Stage[]) => t.history.filter((h) => stages.includes(h.stage) && /^Verdict: reject/i.test(h.summary)).length;
+      const archRejects = rejects(["architecture_review"]);
+      const reviewRejects = rejects(["review_gemini", "review_claude"]);
+      const verifyFails = t.history.filter((h) => h.summary === "Verification FAILED.").length;
+      const ceoSendBacks = t.history.filter((h) => h.by === "ceo" && /^(Revision requested|Sent back)/.test(h.summary)).length;
+      const runs = t.runs ?? [];
+      row.tasks++;
+      if (t.stage === "done") row.done++;
+      else if (t.stage === "rejected") row.rejected++;
+      if (t.stage === "done" && !reviewRejects && !verifyFails && !ceoSendBacks) row.firstPass++;
+      row.archRejects += archRejects;
+      row.reviewRejects += reviewRejects;
+      row.verifyFails += verifyFails;
+      row.ceoSendBacks += ceoSendBacks;
+      row.roleCheckFails += (t.feedbackLog ?? []).filter((f) => f.kind === "role_check").length;
+      row.tokens += runs.reduce((n, r) => n + r.inputTokens + r.outputTokens, 0);
+      row.costUsd += runs.reduce((n, r) => n + r.costUsd, 0);
+      row.activeMs += runs.reduce((n, r) => n + Math.max(0, ms(r.startedAt, r.endedAt) - r.waitMs), 0);
+    }
+    const since = tasks.map((t) => t.createdAt).sort()[0] ?? null;
+    return { roles: [...rows.values()], since, taskCount: tasks.length };
   }
 
   // ---------- scheduling ----------
@@ -1510,7 +1631,7 @@ export class Company extends EventEmitter {
       // Ask Muse for the diff first, without holding the workspace lock —
       // only the disk write and the build/test that follows need it
       // exclusive, not the (potentially long) chat call itself.
-      await draftImplementation(task, this.agents, hooks);
+      await draftImplementation(task, this.agents, hooks, this.pipeline);
       await this.withEngine("workspace", task.id, async () => {
         await applyImplementation(task, this.pipeline);
         // A refused attempt (no files, or files that failed the pre-write
@@ -1722,6 +1843,16 @@ export class Company extends EventEmitter {
     return map;
   }
 
+  /** The boss's planning playbook plus its accepted lessons; planning goes on without it if the file is missing. */
+  private async bossPlaybook(): Promise<string | undefined> {
+    try {
+      const [pb, lessons] = await Promise.all([loadPlaybook(BOSS_ID), acceptedLessons(BOSS_ID)]);
+      return formatGuidance(BOSS_ID, pb, "architecture", lessons);
+    } catch {
+      return undefined;
+    }
+  }
+
   private async generatePlan(plan: WorkPlanRecord, revision?: { feedback: string; previous?: WorkPlan }): Promise<void> {
     const key = `plan:${plan.id}`;
     this.planPhase = "Claude is drafting";
@@ -1734,6 +1865,7 @@ export class Company extends EventEmitter {
         previous: revision?.previous,
         environment: await this.machineEnvironment(),
         survey: await this.projectSurvey(plan),
+        playbook: await this.bossPlaybook(),
         send: { taskId: key, onChunk: (t) => this.onChunk(key, t), signal: this.planController.signal, model: this.settings.planModel },
         onRound: (round, phase) => {
           this.planPhase = phase === "draft" ? `Round ${round}: Claude is drafting` : `Round ${round}: Gemini is reviewing`;

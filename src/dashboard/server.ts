@@ -59,6 +59,8 @@ const str = (v: unknown) => (typeof v === "string" ? v : undefined);
 
 app.get("/api/status", route(async (_req, res) => res.json(await company.statusSnapshot())));
 app.get("/api/timeline", route(async (_req, res) => res.json(await company.timeline())));
+app.get("/api/scoreboard", route(async (_req, res) => res.json(await company.scoreboard())));
+app.get("/api/roles/:id", route(async (req, res) => res.json(await company.roleDetail(req.params.id))));
 app.get("/api/tasks/:id/detail", route(async (req, res) => res.json(await company.taskDetail(req.params.id))));
 app.get("/api/artifacts", route(async (_req, res) => res.json(await company.listArtifacts())));
 app.get("/api/artifacts/content", route(async (req, res) => {
@@ -113,6 +115,7 @@ company.on("engines", debounced(SLOT_DEBOUNCE_MS, () => broadcast("engines", com
 company.on("control", pushSummary);
 company.on("rebalance", debounced(SLOT_DEBOUNCE_MS, () => broadcast("rebalance", company.rebalanceSnapshot())));
 company.on("live", (chunk) => broadcast("live", chunk));
+company.on("lessons", debounced(SLOT_DEBOUNCE_MS, async () => broadcast("lessons", await company.lessonsSummary())));
 contentSeo?.on("change", debounced(300, () => broadcast("contentseo", contentSeo.snapshot())));
 contentSeo?.on("finished", (run) => {
   const what = { done: "Xong", partial: "Xong một phần", quota: "Dừng vì hết quota Gemini", failed: "Lỗi", stopped: "Đã dừng", running: "" }[run.status as string] ?? run.status;
@@ -169,6 +172,12 @@ app.post("/api/artifacts/send", route(async (req, res) => {
 app.post("/api/engines/:engine/promote", route(async (req, res) => {
   await company.promote(req.params.engine as any, String(req.body?.id ?? ""));
   ok(res);
+}));
+app.post("/api/roles/:id/lessons", route(async (req, res) => ok(res, { lesson: await company.addRoleLesson(req.params.id, str(req.body?.text) ?? "") })));
+app.post("/api/lessons/:id/:decision", route(async (req, res) => {
+  const decision = req.params.decision;
+  if (decision !== "accept" && decision !== "dismiss" && decision !== "remove") return res.status(400).json({ error: "decision phải là accept, dismiss hoặc remove" });
+  ok(res, { lesson: await company.decideRoleLesson(req.params.id, decision, str(req.body?.text) || undefined) });
 }));
 app.post("/api/rebalance", route(async (_req, res) => ok(res, { proposal: await company.proposeRebalance() })));
 app.post("/api/rebalance/:id/apply", route(async (req, res) => {

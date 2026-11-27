@@ -3,6 +3,7 @@ import { existsSync } from "node:fs";
 import path from "node:path";
 import type { Stage } from "../types.js";
 import { writeFileAtomic } from "../store/atomicWrite.js";
+import { ROLES, type TeamId } from "../org/roles.js";
 
 export interface SlotDef {
   id: string; // "AG-01"
@@ -10,6 +11,7 @@ export interface SlotDef {
   icon: string;
   /** Org-chart rank: 1 = boss (exactly one), 2 = team lead, 3 = staff. */
   tier: 1 | 2 | 3;
+  team: TeamId;
 }
 
 export const TIER_LABELS: Record<1 | 2 | 3, string> = {
@@ -19,26 +21,15 @@ export const TIER_LABELS: Record<1 | 2 | 3, string> = {
 };
 
 /**
- * Ten fixed department slots, ranked into 3 tiers. AG-01 is the sole tier-1
- * "boss": when "Chạy luồng cả công ty" is used, the company-wide goal is
- * handed to it, and it (via decomposeGoalForDepartments) writes a specific
- * sub-goal for every other slot instead of everyone getting the same text.
- * Running a slot on its own (the "Chạy riêng khung này" button) is
- * unaffected by tier — any slot can still be run individually with
- * whatever goal is typed into the shared input.
+ * The department slots, ranked into 3 tiers and grouped into teams — defined
+ * in src/org/roles.ts together with each role's playbook, model tier and
+ * checks. AG-01 is the sole tier-1 "boss": when "Chạy luồng cả công ty" is
+ * used, the company-wide goal is handed to it, and it plans a work tree whose
+ * epics go to team leads and subtasks to staff. Running a slot on its own
+ * (the "Chạy riêng khung này" button) is unaffected by tier — any slot can
+ * still be run individually with whatever goal is typed into the shared input.
  */
-export const SLOTS: SlotDef[] = [
-  { id: "AG-01", name: "AI Product Lead", icon: "🚀", tier: 1 },
-  { id: "AG-02", name: "AI Market Researcher", icon: "🔍", tier: 2 },
-  { id: "AG-05", name: "AI Backend Architect", icon: "🏗️", tier: 2 },
-  { id: "AG-08", name: "AI QA & Security", icon: "🛡️", tier: 2 },
-  { id: "AG-03", name: "AI Data Engineer", icon: "🗄️", tier: 3 },
-  { id: "AG-04", name: "AI Data Scientist", icon: "🧠", tier: 3 },
-  { id: "AG-06", name: "AI Frontend / 3D UI", icon: "🖥️", tier: 3 },
-  { id: "AG-07", name: "AI Automation Ops", icon: "⚙️", tier: 3 },
-  { id: "AG-09", name: "AI Content & SEO", icon: "📢", tier: 3 },
-  { id: "AG-10", name: "AI Release Manager", icon: "🚩", tier: 3 },
-];
+export const SLOTS: SlotDef[] = ROLES.map(({ id, name, icon, tier, team }) => ({ id, name, icon, tier, team }));
 
 /**
  * Which tasks each slot holds (oldest first) and which plan, if any, the
@@ -61,8 +52,8 @@ export interface DashboardState {
   paused: boolean;
 }
 
-/** QA/security and release are the natural gates; the CEO can toggle any slot. */
-export const DEFAULT_GATED_SLOTS = ["AG-08", "AG-10"];
+/** QA, security and release are the natural gates; the CEO can toggle any slot. */
+export const DEFAULT_GATED_SLOTS = ROLES.filter((r) => r.gatedByDefault).map((r) => r.id);
 
 const STATE_PATH = path.resolve(process.cwd(), "data/dashboard.json");
 

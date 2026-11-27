@@ -1,4 +1,5 @@
 import "dotenv/config";
+import { createRoleSupport } from "./org/runtime.js";
 import path from "node:path";
 import type { ProjectConfig } from "./types.js";
 import type { Agents } from "./orchestrator/pipeline.js";
@@ -134,6 +135,11 @@ export function buildPipelineConfig(): PipelineConfig {
       architecture: process.env.CLAUDE_MODEL_ARCHITECTURE || undefined,
       review: process.env.CLAUDE_MODEL_REVIEW || undefined,
     },
+    // Role playbooks, role checks and per-role model routing (ROLE_PLAYBOOKS=0 turns all of it off).
+    roles:
+      process.env.ROLE_PLAYBOOKS === "0"
+        ? undefined
+        : createRoleSupport({ light: process.env.CLAUDE_MODEL_LIGHT || undefined, strong: process.env.CLAUDE_MODEL_STRONG || undefined }),
     visual: buildVisualConfig(),
   };
 }

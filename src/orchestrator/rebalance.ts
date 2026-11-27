@@ -16,6 +16,8 @@ export interface LoadSlot {
   id: string;
   name: string;
   tier: 1 | 2 | 3;
+  /** Team name, when the company has teams. */
+  team?: string;
   parallel: number;
   running: number;
   queued: number;
@@ -54,6 +56,7 @@ export function buildRebalancePrompt(slots: LoadSlot[]): string {
     "Rules:",
     "- Only move tasks marked \"movable\": true. Never move anything to AG-01.",
     "- Specialty first: give a task to someone whose role fits the work. A shorter queue alone is NOT a reason to hand data engineering to a content writer.",
+    "- Each slot's \"team\" is the team it belongs to: prefer moving work to someone in the same team; cross a team only when no one in the team has the specialty, and say so in the reason.",
     "- To reprioritize inside one queue, use \"to\" = the task's current slot with \"position\": \"top\" — worth it when that task unblocks others (see \"unblocks\") or the queue ahead of it is waiting on input anyway.",
     "- A task that is waiting on input can still move; it will keep waiting for the same input in its new queue.",
     `- At most ${MAX_MOVES} moves. If the current distribution is already fine, return an empty "moves" list and say so.`,

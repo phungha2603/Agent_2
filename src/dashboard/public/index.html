@@ -66,6 +66,7 @@
       <button class="tab active" data-action="view" data-view="org">Sơ đồ tổ chức</button>
       <button class="tab" data-action="view" data-view="flow">Dòng chảy</button>
       <button class="tab" data-action="view" data-view="timeline">Timeline</button>
+      <button class="tab" data-action="view" data-view="roles">Năng lực vị trí <span id="lessons-tab-badge" class="side-badge" hidden></span></button>
       <button class="tab" data-action="view" data-view="artifacts">Sản phẩm</button>
       <button class="tab" data-action="view" data-view="seo">Auto Content SEO</button>
     </div>
@@ -105,6 +106,7 @@
                 <marker id="arrow-assign" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="m-assign" /></marker>
               </defs>
             </svg>
+            <div class="org-level level-ceo" id="row-0"></div>
             <div class="org-level level-boss" id="row-1"></div>
             <div class="org-level level-teams" id="row-2"></div>
             <div class="org-level level-loose" id="row-3"></div>
@@ -123,12 +125,16 @@
 
     <section id="view-flow" class="view" hidden></section>
     <section id="view-timeline" class="view" hidden></section>
+    <section id="view-roles" class="view" hidden></section>
     <section id="view-artifacts" class="view" hidden></section>
     <section id="view-seo" class="view" hidden></section>
   </main>
 
   <div id="drawer-backdrop" class="backdrop" hidden></div>
   <aside id="drawer" class="drawer" hidden aria-label="Chi tiết task"></aside>
+
+  <div id="role-backdrop" class="backdrop" hidden></div>
+  <aside id="role-drawer" class="drawer role-drawer" hidden aria-label="Playbook và bài học của vị trí"></aside>
 
   <div id="inbox-backdrop" class="backdrop" hidden></div>
   <aside id="inbox" class="drawer inbox" hidden aria-label="Hộp duyệt"></aside>

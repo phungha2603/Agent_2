@@ -5,10 +5,11 @@ import type { Agent, AgentResponse } from "../src/types.js";
 
 const DEPTS: Department[] = [
   { id: "AG-01", name: "Boss", tier: 1 },
-  { id: "AG-02", name: "Lead A", tier: 2 },
-  { id: "AG-05", name: "Lead B", tier: 2 },
+  { id: "AG-05", name: "Lead A", tier: 2 },
+  { id: "AG-11", name: "Lead B", tier: 2 },
   { id: "AG-08", name: "Lead C", tier: 2 },
-  ...["AG-03", "AG-04", "AG-06", "AG-07", "AG-09", "AG-10"].map((id) => ({ id, name: `Staff ${id}`, tier: 3 as const })),
+  { id: "AG-12", name: "Lead D", tier: 2 },
+  ...["AG-02", "AG-03", "AG-04", "AG-06", "AG-07", "AG-09", "AG-10"].map((id) => ({ id, name: `Staff ${id}`, tier: 3 as const })),
 ];
 
 const plan = (epics: unknown[]) => JSON.stringify({ summary: "s", epics, verifyCommands: ["npm test"] });
@@ -120,7 +121,7 @@ describe("materializePlan", () => {
     expect(byTitle("E3.S3").dependsOn).toEqual([byTitle("E1.S2").id, byTitle("E3.S2").id]);
 
     const integration = tasks.find((t) => t.planRef?.epicId === "E1" && !t.planRef.subtaskId)!;
-    expect(integration.slotId).toBe("AG-05");
+    expect(integration.slotId).toBe("AG-11");
     expect(integration.dependsOn).toEqual([byTitle("E1.S1").id, byTitle("E1.S2").id]);
     expect(byTitle("E1.S1").context.acceptanceCriteria).toEqual(["Ingests a sample file"]);
     expect(byTitle("E1.S1").context.sharedBrief).toContain("Ship it");

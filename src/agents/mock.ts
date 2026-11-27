@@ -8,9 +8,9 @@ export const MOCK_PLAN = {
   epics: [
     {
       id: "E1",
-      rationale: "Backend architect owns data + model integration.",
+      rationale: "The data lead owns data + model integration.",
       title: "Data & model",
-      owner: "AG-05",
+      owner: "AG-11",
       goal: "Ingest data and serve a model.",
       acceptanceCriteria: ["Pipeline output feeds the model", "Model endpoint returns predictions"],
       subtasks: [
@@ -20,16 +20,16 @@ export const MOCK_PLAN = {
     },
     {
       id: "E2",
-      rationale: "Market researcher owns the product story.",
+      rationale: "The product manager owns the product story.",
       title: "Content",
-      owner: "AG-02",
+      owner: "AG-12",
       goal: "Explain the product.",
       acceptanceCriteria: ["Landing copy exists"],
       subtasks: [{ id: "E2.S1", rationale: "Copywriting fits Content & SEO.", inputs: "The product summary.", title: "Landing copy", owner: "AG-09", description: "Write the landing page copy.", acceptanceCriteria: ["Copy covers the main use case"], dependsOn: [] }],
     },
     {
       id: "E3",
-      rationale: "QA & Security owns the release gate.",
+      rationale: "The QA lead owns the release gate.",
       title: "Quality & release",
       owner: "AG-08",
       goal: "Ship it safely.",

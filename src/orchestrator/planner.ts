@@ -8,6 +8,25 @@ export interface Department {
   id: string;
   name: string;
   tier: 1 | 2 | 3;
+  /** Team name; when departments carry teams, epics stay inside their lead's team. */
+  team?: string;
+  /** What the team is responsible for. */
+  teamMission?: string;
+  /** One line on this role's specialty. */
+  summary?: string;
+}
+
+/** "Kỹ thuật — mission. Lead: AG-05 (Tech Lead: …). Staff: AG-13 (…), …" per team, for the planner and the rebalancer. */
+export function teamRoster(departments: Department[]): string[] {
+  const teams = [...new Set(departments.filter((d) => d.tier > 1 && d.team).map((d) => d.team!))];
+  const who = (d: Department) => `${d.id} (${d.name.replace(/^AI /, "")}${d.summary ? `: ${d.summary}` : ""})`;
+  return teams.map((team) => {
+    const members = departments.filter((d) => d.team === team);
+    const lead = members.find((d) => d.tier === 2);
+    const staff = members.filter((d) => d.tier === 3);
+    const mission = members.find((d) => d.teamMission)?.teamMission;
+    return `  * Team "${team}"${mission ? ` — ${mission}` : ""} Lead: ${lead ? who(lead) : "(none)"}. Staff: ${staff.map(who).join("; ") || "(none)"}.`;
+  });
 }
 
 export interface PlanSubtask {
@@ -186,14 +205,23 @@ export function buildPlanPrompt(
   revision?: { previous?: WorkPlan; feedback: string },
   environment?: string,
   survey?: string,
+  playbook?: string,
 ): string {
   const leads = departments.filter((d) => d.tier === 2).map((d) => `${d.id} (${d.name})`).join(", ");
+  const roster = teamRoster(departments);
   const staff = departments.filter((d) => d.tier === 3).map((d) => `${d.id} (${d.name})`).join(", ");
   const parts = [
     "PLAN: You are the boss (AG-01) of an AI software company. Break the company-wide goal below into a structured work tree BEFORE anyone starts work, so every task traces back to the goal instead of departments working on disconnected things.",
     "Rules:",
     `- 1 to ${limits.maxEpics} epics. Each epic is owned by exactly one team lead: ${leads}. The lead later integrates and verifies the epic as a whole.`,
     `- Each epic has 1-4 subtasks, at most ${limits.maxSubtasks} subtasks in total. Each subtask is owned by one staff member whose specialty fits: ${staff}. A staff member may own more than one subtask.`,
+    ...(roster.length
+      ? [
+          "- The company is organised in teams. Give each epic to the lead of the team whose responsibility it is, and each of its subtasks to a staff member of THAT team whose specialty fits. Borrow someone from another team only when the epic's own team has no one with the needed specialty, and say so in that subtask's rationale. The quality team checks and hardens the others' work; don't give it new features to build.",
+          "- Teams:",
+          ...roster,
+        ]
+      : []),
     "- Every subtask must be concrete, implementable and verifiable in code, and contribute directly to the goal. No vague research or documentation subtasks unless the goal itself needs them.",
     "- acceptanceCriteria: 2-5 specific, testable statements per epic and per subtask — things a reviewer can check by running the code or its tests.",
     "- dependsOn: ids of subtasks (in any epic) that must finish first because this one consumes their output. No cycles. Leave it empty whenever work can proceed in parallel.",
@@ -213,6 +241,7 @@ export function buildPlanPrompt(
           survey,
         ]
       : []),
+    ...(playbook ? [playbook.trim()] : []),
     "",
     `Company-wide goal: ${goal}`,
   ];
@@ -311,10 +340,17 @@ export function parsePlan(text: string, departments: Department[], limits: PlanL
       if (seen.has(subId)) throw new Error(`duplicate id ${subId}`);
       seen.add(subId);
       let subOwner = typeof s?.owner === "string" ? s.owner.trim() : "";
+      const epicTeam = departments.find((d) => d.id === owner)?.team;
       if (!staff.includes(subOwner)) {
-        const fixed = staff[staffTurn++ % staff.length];
+        // Prefer someone from the epic's own team.
+        const own = epicTeam ? staff.filter((id) => departments.find((d) => d.id === id)?.team === epicTeam) : [];
+        const pool = own.length ? own : staff;
+        const fixed = pool[staffTurn++ % pool.length];
         notes.push(`Subtask ${subId}: owner "${subOwner || "(none)"}" is not a staff member — reassigned to ${fixed}.`);
         subOwner = fixed;
+      } else if (epicTeam) {
+        const subTeam = departments.find((d) => d.id === subOwner)?.team;
+        if (subTeam && subTeam !== epicTeam) notes.push(`Subtask ${subId}: ${subOwner} is borrowed from team "${subTeam}" for epic ${epicId} (team "${epicTeam}").`);
       }
       return {
         id: subId,
@@ -400,6 +436,8 @@ export async function draftAndReviewPlan(
     environment?: string;
     /** formatSurvey() of the project directory, when it already has files. */
     survey?: string;
+    /** The boss's playbook (planning standards and lessons), added to every draft prompt. */
+    playbook?: string;
   },
 ): Promise<PlanDraftResult> {
   const limits = opts.limits ?? DEFAULT_PLAN_LIMITS;
@@ -410,7 +448,7 @@ export async function draftAndReviewPlan(
 
   for (let round = 1; round <= opts.maxRounds; round++) {
     opts.onRound?.(round, "draft");
-    const prompt = buildPlanPrompt(goal, departments, limits, feedback ? { previous, feedback } : undefined, opts.environment, opts.survey);
+    const prompt = buildPlanPrompt(goal, departments, limits, feedback ? { previous, feedback } : undefined, opts.environment, opts.survey, opts.playbook);
     const draft = await agents.claude.send(prompt, { title: goal }, opts.send);
     if (FAKE_TOOL_CALL_RE.test(draft.content)) {
       feedback =

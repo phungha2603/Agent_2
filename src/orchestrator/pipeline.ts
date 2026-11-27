@@ -1,6 +1,7 @@
 import type {
   Agent,
   AgentResponse,
+  FeedbackEntry,
   HistoryEntry,
   ProjectConfig,
   RoleName,
@@ -26,6 +27,8 @@ import { applyArchitectureRevision } from "./archRevision.js";
 import { compressForClaude } from "./compressForClaude.js";
 import { collectProjectFiles } from "./projectFiles.js";
 import { MaxTurnsReached } from "../agents/claude-cli.js";
+import type { RoleCheckFinding, RoleCheckInput } from "../verify/roleChecks.js";
+import type { GuidanceStage } from "../org/playbooks.js";
 
 export function createTask(title: string, projectConfig?: ProjectConfig): TaskRecord {
   const now = new Date().toISOString();
@@ -98,8 +101,22 @@ export interface VisualConfig {
   captureScreenshot: (opts: { cwd: string; buildDir: string; outPath: string; waitMs?: number }) => Promise<string>;
 }
 
+/**
+ * What a task's role adds to the pipeline (see src/org/runtime.ts): its
+ * playbook for each step, its own verification checks, and which Claude
+ * model its calls use. Optional — without it every task runs role-agnostic.
+ */
+export interface RoleSupport {
+  guidance(task: TaskRecord, stage: GuidanceStage): Promise<string | undefined>;
+  checks(task: TaskRecord, input: RoleCheckInput): Promise<RoleCheckFinding[]>;
+  claudeModel(task: TaskRecord, purpose: "architecture" | "review"): string | undefined;
+  label(task: TaskRecord): string | undefined;
+}
+
 export interface PipelineConfig {
   verify: VerifyConfig;
+  /** Role playbooks, checks and model routing for tasks that belong to a role. */
+  roles?: RoleSupport;
   /**
    * When set, verification runs in a shadow copy of the project and the
    * engineer's files reach the project only once it passes. Unset keeps the
@@ -317,7 +334,7 @@ export function fileAllowed(file: string, patterns: string[]): boolean {
 
 /** Options for Claude's file-reading calls: the task's own project directory, read-only tools, a turn budget. */
 function claudeReadOpts(task: TaskRecord, config: PipelineConfig, opts: SendOptions): SendOptions {
-  return { ...opts, cwd: resolveVerify(task, config).cwd, tools: READ_ONLY_TOOLS, maxTurns: ARCH_MAX_TURNS, model: config.claudeModels?.architecture };
+  return { ...opts, cwd: resolveVerify(task, config).cwd, tools: READ_ONLY_TOOLS, maxTurns: ARCH_MAX_TURNS, model: config.roles?.claudeModel(task, "architecture") ?? config.claudeModels?.architecture };
 }
 
 /**
@@ -326,12 +343,46 @@ function claudeReadOpts(task: TaskRecord, config: PipelineConfig, opts: SendOpti
  * multiplied a review's input tokens many times over (one review: 814k).
  */
 function claudeReviewOpts(task: TaskRecord, config: PipelineConfig, opts: SendOptions): SendOptions {
-  return { ...opts, cwd: resolveVerify(task, config).cwd, tools: "", model: config.claudeModels?.review };
+  return { ...opts, cwd: resolveVerify(task, config).cwd, tools: "", model: config.roles?.claudeModel(task, "review") ?? config.claudeModels?.review };
 }
 
 export function log(task: TaskRecord, stage: Stage, by: RoleName, summary: string): void {
   const entry: HistoryEntry = { stage, at: new Date().toISOString(), by, summary };
   task.history.push(entry);
+}
+
+const FEEDBACK_LOG_MAX = 12;
+const FEEDBACK_ENTRY_CHARS = 2000;
+
+/** Keeps every send-back on the task (reviewFeedback only holds the latest) — the raw material for role lessons. */
+export function recordFeedback(task: TaskRecord, by: string, kind: FeedbackEntry["kind"], text: string): void {
+  const log = (task.feedbackLog ??= []);
+  log.push({ at: new Date().toISOString(), by, kind, text: text.slice(0, FEEDBACK_ENTRY_CHARS) });
+  if (log.length > FEEDBACK_LOG_MAX) log.splice(0, log.length - FEEDBACK_LOG_MAX);
+}
+
+/**
+ * A step's prompt with the task role's playbook added. It goes after the
+ * step's own instructions (callers and agents key on the prompt's first
+ * word, e.g. "REVIEW:") and before a review's closing verdict instruction,
+ * so the reply format the parser relies on stays the last thing asked.
+ */
+export function withRole(prompt: string, guidance: string | undefined): string {
+  if (!guidance) return prompt;
+  if (prompt.endsWith(VERDICT_INSTRUCTION)) {
+    return `${prompt.slice(0, prompt.length - VERDICT_INSTRUCTION.length)}${guidance}\n${VERDICT_INSTRUCTION}`;
+  }
+  return prompt + guidance;
+}
+
+async function roleGuidance(task: TaskRecord, config: Pick<PipelineConfig, "roles"> | undefined, stage: GuidanceStage): Promise<string | undefined> {
+  try {
+    return await config?.roles?.guidance(task, stage);
+  } catch (err) {
+    // A missing or unreadable playbook must never stop the work itself.
+    log(task, task.stage, "system", `Role playbook unavailable (${(err as Error).message}) — continuing without it.`);
+    return undefined;
+  }
 }
 
 /** Generates the reference image once (if this task's visual review is on and it hasn't been made yet). */
@@ -390,6 +441,7 @@ function applyReviewVerdict(task: TaskRecord, config: PipelineConfig, res: Agent
   }
   task.reviewRejections += 1;
   task.context.reviewFeedback = [`${feedbackLabel}:\n${res.content}`];
+  recordFeedback(task, /gemini/i.test(feedbackLabel) && !/claude/i.test(feedbackLabel) ? "gemini" : "claude", "review", res.content);
   if (task.reviewRejections < config.maxReviewRejections) {
     task.stage = "implementation";
   } else {
@@ -413,7 +465,7 @@ export function isTerminal(task: TaskRecord): boolean {
  * holding the shared workspace lock; only applyImplementation below, which
  * actually touches disk, needs it.
  */
-export async function draftImplementation(task: TaskRecord, agents: Agents, hooks: AdvanceHooks = {}): Promise<void> {
+export async function draftImplementation(task: TaskRecord, agents: Agents, hooks: AdvanceHooks = {}, config?: Pick<PipelineConfig, "roles">): Promise<void> {
   const opts: SendOptions = { onChunk: hooks.onChunk, taskId: task.id, signal: hooks.signal };
   const feedback = task.context.reviewFeedback?.length
     ? `\n\nAddress this feedback from the previous attempt:\n${task.context.reviewFeedback.join("\n")}`
@@ -421,7 +473,8 @@ export async function draftImplementation(task: TaskRecord, agents: Agents, hook
   // The engineer can't read the project: give it the current contents of
   // the files it may write, instead of letting it rebuild them from memory.
   task.context.projectFiles = await collectProjectFiles(task, task.projectConfig?.verifyCwd, allowedFilesFrom(task.context.architectureSpec) ?? []);
-  const res = await agents.muse.send(PROMPTS.implementation + feedback, pruneContext("implementation", task.context), opts);
+  const role = await roleGuidance(task, config, "implementation");
+  const res = await agents.muse.send(PROMPTS.implementation + (role ?? "") + feedback, pruneContext("implementation", task.context), opts);
   task.context.implementationDiff = res.content;
   task.implementationAttempts += 1;
 }
@@ -572,7 +625,7 @@ export async function advance(task: TaskRecord, agents: Agents, config: Pipeline
 
   switch (task.stage) {
     case "ideation": {
-      const res = await agents.gemini.send(PROMPTS.ideation, ctx("ideation"), opts);
+      const res = await agents.gemini.send(withRole(PROMPTS.ideation, await roleGuidance(task, config, "ideation")), ctx("ideation"), opts);
       task.context.ideaBrief = res.content;
       log(task, task.stage, "gemini", "Idea brief drafted.");
       await ensureReferenceImage(task, config);
@@ -619,11 +672,12 @@ export async function advance(task: TaskRecord, agents: Agents, config: Pipeline
         }
         throw new Error(`Claude did not produce a usable architecture guide after ${SPEC_RETRIES + 1} tries: ${problem}.`);
       };
+      const archRole = await roleGuidance(task, config, "architecture");
       if (!revising) {
-        task.context.architectureSpec = await askClaude(PROMPTS.architecture, true);
+        task.context.architectureSpec = await askClaude(withRole(PROMPTS.architecture, archRole), true);
         log(task, task.stage, "claude", "Architecture spec written.");
       } else {
-        const reply = await askClaude(PROMPTS.architectureRevision, false);
+        const reply = await askClaude(withRole(PROMPTS.architectureRevision, archRole), false);
         const { spec, patched } = applyArchitectureRevision(task.context.architectureSpec!, reply);
         task.context.architectureSpec = spec;
         log(
@@ -645,7 +699,7 @@ export async function advance(task: TaskRecord, agents: Agents, config: Pipeline
     }
 
     case "architecture_review": {
-      const res = await sendReview(agents.gemini, PROMPTS.architectureReview, ctx("architecture_review"), opts);
+      const res = await sendReview(agents.gemini, withRole(PROMPTS.architectureReview, await roleGuidance(task, config, "architecture_review")), ctx("architecture_review"), opts);
       log(task, task.stage, "gemini", `Verdict: ${res.verdict}.`);
       if (res.verdict === "approve") {
         task.context.reviewFeedback = [];
@@ -654,13 +708,14 @@ export async function advance(task: TaskRecord, agents: Agents, config: Pipeline
         task.architectureRounds = (task.architectureRounds ?? 0) + 1;
         const maxRounds = config.maxArchitectureRounds ?? 20;
         task.context.reviewFeedback = [`Gemini's architecture feedback (round ${task.architectureRounds}):\n${res.content}`];
+        recordFeedback(task, "gemini", "architecture", res.content);
         task.stage = task.architectureRounds < maxRounds ? "architecture" : "rejected";
       }
       return task;
     }
 
     case "implementation": {
-      await draftImplementation(task, agents, hooks);
+      await draftImplementation(task, agents, hooks, config);
       await applyImplementation(task, config);
       return task;
     }
@@ -691,6 +746,29 @@ export async function advance(task: TaskRecord, agents: Agents, config: Pipeline
       } else {
         if (files.length) result.log += `\n\n== Syntax check of the ${files.length} file(s) written this attempt: OK ==`;
         clearAlert(task, "files_broken");
+      }
+      // The role's own checks (secrets, stubs, tests, iOS destination …) on the files this attempt wrote.
+      const findings = config.roles ? await config.roles.checks(task, { cwd: runCwd, files, commands: verify.commands }).catch((err: Error) => {
+        log(task, task.stage, "system", `Role checks could not run (${err.message}) — skipped.`);
+        return [] as RoleCheckFinding[];
+      }) : [];
+      const roleName = config.roles?.label(task) ?? "role";
+      const failed = findings.filter((f) => f.level === "fail");
+      const warned = findings.filter((f) => f.level === "warn");
+      if (failed.length) {
+        result.passed = false;
+        result.log += `\n\n== Role checks (${roleName}): ${failed.length} FAILED ==\n${failed.map((f) => `- [${f.check}] ${f.text}`).join("\n")}`;
+        setAlert(task, "role_checks", "warn", `Kiểm tra theo vai trò ${roleName} thất bại: ${failed.map((f) => f.text).join(" ")}`);
+        recordFeedback(task, "system", "role_check", failed.map((f) => f.text).join("\n"));
+      } else {
+        if (findings.length || (config.roles && files.length)) result.log += `\n\n== Role checks (${roleName}): OK ==`;
+        clearAlert(task, "role_checks");
+      }
+      if (warned.length) {
+        result.log += `\n\n== Role checks (${roleName}): ${warned.length} warning(s) for the reviewers and the CEO ==\n${warned.map((f) => `- [${f.check}] ${f.text}`).join("\n")}`;
+        setAlert(task, "role_warnings", "warn", warned.map((f) => f.text).join(" "));
+      } else {
+        clearAlert(task, "role_warnings");
       }
       if (result.passed && !coversWrittenFiles(result.log, verify.commands, files)) {
         setAlert(
@@ -747,7 +825,7 @@ export async function advance(task: TaskRecord, agents: Agents, config: Pipeline
       // stand-in for a round, not a permanent reassignment: the next task
       // (or even a later round of this one) tries Gemini again.
       try {
-        const res = await sendReview(agents.gemini, PROMPTS.reviewGemini, ctx("review_gemini"), opts);
+        const res = await sendReview(agents.gemini, withRole(PROMPTS.reviewGemini, await roleGuidance(task, config, "review")), ctx("review_gemini"), opts);
         log(task, task.stage, "gemini", `Verdict: ${res.verdict}.`);
         clearAlert(task, "gemini_down");
         // Whatever this independent review's verdict, it goes to Claude next —
@@ -780,7 +858,7 @@ export async function advance(task: TaskRecord, agents: Agents, config: Pipeline
           "warn",
           `Gemini không review được (${(err as Error).message.slice(0, 160)}) — chỉ có Claude review, không có ý kiến độc lập thứ hai.`,
         );
-        const res = await sendReview(agents.claude, PROMPTS.reviewClaudeFallback, ctx("review_gemini"), claudeReviewOpts(task, config, opts));
+        const res = await sendReview(agents.claude, withRole(PROMPTS.reviewClaudeFallback, await roleGuidance(task, config, "review")), ctx("review_gemini"), claudeReviewOpts(task, config, opts));
         log(task, task.stage, "claude", `Verdict: ${res.verdict} (standing in for Gemini).`);
         applyReviewVerdict(task, config, res, "Claude (standing in for Gemini) review feedback");
         return task;
@@ -790,7 +868,7 @@ export async function advance(task: TaskRecord, agents: Agents, config: Pipeline
     case "review_claude": {
       const res = await sendReview(
         agents.claude,
-        PROMPTS.reviewClaude,
+        withRole(PROMPTS.reviewClaude, await roleGuidance(task, config, "review")),
         await compressForClaude(agents.gemini, ctx("review_claude"), opts.signal),
         claudeReviewOpts(task, config, opts),
       );
@@ -843,6 +921,7 @@ export function resolveCheckpoint(task: TaskRecord, approved: boolean, feedback?
   if (!approved && feedback) {
     task.context.reviewFeedback = [feedback];
     (task.context.ceoRequests ??= []).push(feedback);
+    recordFeedback(task, "ceo", "ceo", feedback);
   }
   if (task.stage !== "done") task.alerts = [];
   return task;
@@ -864,6 +943,7 @@ export function requestRevision(task: TaskRecord, feedback: string): TaskRecord 
   task.autoRecoveries = 0;
   task.context.reviewFeedback = [`CEO revision request (keep the architecture; change exactly this):\n${request}`];
   (task.context.ceoRequests ??= []).push(request);
+  recordFeedback(task, "ceo", "ceo", request);
   log(task, task.stage, "ceo", `Revision requested: ${request}`);
   task.alerts = [];
   trace(task, "CEO", "revise", `Sent back to implementation for a revision: ${request}`);

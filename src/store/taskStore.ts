@@ -1,4 +1,4 @@
-import { mkdir, readFile } from "node:fs/promises";
+import { mkdir, readFile, readdir } from "node:fs/promises";
 import { existsSync } from "node:fs";
 import path from "node:path";
 import type { TaskRecord } from "../types.js";
@@ -32,4 +32,19 @@ export async function loadTask(id: string): Promise<TaskRecord> {
 
 export function taskExists(id: string): boolean {
   return existsSync(path.join(DATA_DIR, `${id}.json`));
+}
+
+/** Every task ever saved (including ones no longer in any queue) — for history-wide reports. */
+export async function listAllTasks(): Promise<TaskRecord[]> {
+  const names = await readdir(DATA_DIR).catch(() => [] as string[]);
+  const out: TaskRecord[] = [];
+  for (const name of names) {
+    if (!name.endsWith(".json")) continue;
+    try {
+      out.push(JSON.parse(await readFile(path.join(DATA_DIR, name), "utf8")) as TaskRecord);
+    } catch {
+      // a half-written or corrupted file is skipped, not fatal for a report
+    }
+  }
+  return out;
 }

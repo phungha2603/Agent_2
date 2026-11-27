@@ -181,7 +181,17 @@ export interface TraceEntry {
  * confirmation. One per kind — a newer one of the same kind replaces it.
  */
 export interface TaskAlert {
-  kind: "no_files" | "files_rejected" | "files_broken" | "verify_coverage" | "verify_unconfigured" | "spec_rewritten" | "gemini_down" | "files_overwritten";
+  kind:
+    | "no_files"
+    | "files_rejected"
+    | "files_broken"
+    | "verify_coverage"
+    | "verify_unconfigured"
+    | "spec_rewritten"
+    | "gemini_down"
+    | "files_overwritten"
+    | "role_checks"
+    | "role_warnings";
   level: "warn" | "info";
   at: string;
   stage: Stage;
@@ -234,4 +244,18 @@ export interface TaskRecord {
   alerts?: TaskAlert[];
   /** A CEO directive asking to redo the work, applied once the stage currently running finishes. */
   redoRequested?: string;
+  /**
+   * Every time this task was sent back (architecture/review rejections, CEO
+   * revisions or redesigns) — reviewFeedback only keeps the latest. When the
+   * task ships, this becomes a lesson proposal for its role.
+   */
+  feedbackLog?: FeedbackEntry[];
+}
+
+export interface FeedbackEntry {
+  at: string;
+  /** "gemini", "claude", "ceo" or "system". */
+  by: string;
+  kind: "architecture" | "review" | "ceo" | "role_check";
+  text: string;
 }

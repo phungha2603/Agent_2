@@ -388,7 +388,7 @@ describe("artifacts, traces and telemetry", () => {
     expect(s1.lastRun.durationMs).toBeGreaterThanOrEqual(0);
     expect(s1.totals.runs).toBeGreaterThanOrEqual(6);
     expect(s1.assignedBy).toBe("AG-01 (Claude)");
-    expect(s1.outputsTo.map((o: any) => o.slotId).sort()).toEqual(["AG-04", "AG-05"]);
+    expect(s1.outputsTo.map((o: any) => o.slotId).sort()).toEqual(["AG-04", "AG-11"]);
 
     const detail = await c.taskDetail(s1.id);
     expect(detail.calls.length).toBeGreaterThanOrEqual(5);
