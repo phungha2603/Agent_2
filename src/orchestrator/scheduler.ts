@@ -21,7 +21,7 @@ import { buildHandoff, reachedHandoffPoint, type HandoffPoint } from "./handoff.
 import { execFile } from "node:child_process";
 import { hhmm as clockTime, quotaResumeAt } from "./quota.js";
 import { formatSurvey, surveyProject } from "../verify/survey.js";
-import { commitTaskFiles, discardTaskFiles, isGitRepo } from "../verify/gitProject.js";
+import { commitTaskFiles, discardTaskFiles, ensureProjectRepo, isGitRepo } from "../verify/gitProject.js";
 import type { Notifier } from "../dashboard/notify.js";
 import path from "node:path";
 import {
@@ -30,6 +30,7 @@ import {
   draftAndReviewPlan,
   materializePlan,
   newPlanId,
+  newProjectDir,
   projectDirWarnings,
   type Department,
   type PlanLimits,
@@ -71,6 +72,8 @@ export interface CompanyOptions {
   projectConfig?: () => ProjectConfig | undefined;
   /** Desktop notifications for the CEO (checkpoints, errors, finished plans). */
   notify?: Notifier;
+  /** PROJECTS_ROOT: a plan given no directory gets its own new folder here, named after its goal. */
+  projectsRoot?: string;
 }
 
 export interface Activity {
@@ -256,6 +259,7 @@ export class Company extends EventEmitter {
   private readonly settings: SchedulerSettings;
   private readonly projectConfig: () => ProjectConfig | undefined;
   private readonly notify: Notifier;
+  private readonly projectsRoot?: string;
   private state: DashboardState = { slots: {}, activePlanId: null, gates: {}, directives: [], paused: false };
   private readonly workers = new Map<string, Worker>();
   /** In-memory task objects for running workers — the source of truth while they run. */
@@ -286,6 +290,7 @@ export class Company extends EventEmitter {
     this.settings = opts.settings;
     this.projectConfig = opts.projectConfig ?? (() => undefined);
     this.notify = opts.notify ?? (() => {});
+    this.projectsRoot = opts.projectsRoot;
     this.engines = {
       claude: new Semaphore(opts.settings.claudeConcurrency),
       gemini: new Semaphore(opts.settings.geminiConcurrency),
@@ -632,7 +637,9 @@ export class Company extends EventEmitter {
     if (current && (current.status === "drafting" || current.status === "awaiting_approval")) {
       throw new UserError("Đang có một kế hoạch đang lập hoặc chờ duyệt — hãy quyết kế hoạch đó trước.");
     }
-    const dir = projectDir?.trim() || this.defaultProjectDir();
+    // No directory given: with PROJECTS_ROOT set, every plan gets a folder of
+    // its own (never an existing one); otherwise the configured default.
+    const dir = projectDir?.trim() || (this.projectsRoot ? await newProjectDir(this.projectsRoot, goal) : this.defaultProjectDir());
     if (dir && !path.isAbsolute(dir)) throw new UserError(`Thư mục dự án phải là đường dẫn tuyệt đối (bắt đầu bằng /): "${dir}".`);
     const now = nowIso();
     const plan: WorkPlanRecord = {
@@ -744,6 +751,18 @@ export class Company extends EventEmitter {
       if (!dir) throw new UserError("Kế hoạch chưa có thư mục dự án — điền thư mục rồi mới duyệt.");
       if (!commands.length) {
         throw new UserError("Kế hoạch chưa có lệnh kiểm tra (build/test) — điền lệnh rồi mới duyệt, nếu không sẽ không có gì chứng minh code chạy được.");
+      }
+      // Every project is a git repository before work starts, so each task
+      // the CEO approves is its own commit and a rejected one can be undone.
+      try {
+        const repo = await ensureProjectRepo(dir);
+        if (repo) {
+          (plan.notes ??= []).push(
+            `Project: ${repo.created ? "created" : "existing folder put under git"} at ${dir} (git init, first commit ${repo.commit}).`,
+          );
+        }
+      } catch (err) {
+        (plan.notes ??= []).push(`Project: could not set up git in ${dir} (${(err as Error).message.slice(0, 200)}) — tasks run without per-task commits.`);
       }
       const base = this.projectConfig();
       const tasks = materializePlan(plan, { ...base, verifyCwd: dir, verifyCommands: commands, handoffOn: plan.project?.handoffOn, autoApprove: plan.project?.autoApprove === true,
@@ -1224,7 +1243,7 @@ export class Company extends EventEmitter {
       insights: await this.insights(idx),
       control: this.control(),
       rebalance: this.rebalanceSnapshot(),
-      settings: { defaultProjectDir: this.defaultProjectDir(), handoffOn: this.settings.handoffOn, stageErrorRetries: this.settings.stageErrorRetries, maxAutoRecoveries: this.pipeline.maxAutoRecoveries ?? 0 },
+      settings: { projectsRoot: this.projectsRoot ?? null, defaultProjectDir: this.projectsRoot ? "" : this.defaultProjectDir(), handoffOn: this.settings.handoffOn, stageErrorRetries: this.settings.stageErrorRetries, maxAutoRecoveries: this.pipeline.maxAutoRecoveries ?? 0 },
     };
   }
 

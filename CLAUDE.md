@@ -18,7 +18,7 @@ Luồng: Gemini (ý tưởng, thẩm định) → Claude (architecture, chốt c
 |---|---|
 | `orchestrator/pipeline.ts` | Máy trạng thái 1 task, prompt ở `PROMPTS`. Các chốt chặn: spec phải kết thúc bằng `FILES:`; file ngoài danh sách, không có rào code hoặc hỏng → lượt thất bại, không ghi gì |
 | `orchestrator/scheduler.ts` (`Company`, ~1.900 dòng) | Hàng đợi, giới hạn engine, khoá `workspace`, bàn giao, thử lại, chỉ thị, cổng duyệt, tự duyệt (`afterWorker`), git (`recordInGit`), thông báo, snapshot UI |
-| `orchestrator/planner.ts` | Kế hoạch Goal → Epic → Subtask; `project` riêng mỗi kế hoạch (thư mục, lệnh nền + lệnh riêng từng task, `handoffOn`, `autoApprove`, `skipClaudeReviewWhenGreen`) |
+| `orchestrator/planner.ts` | Kế hoạch Goal → Epic → Subtask; `project` riêng mỗi kế hoạch (thư mục — để trống thì tự tạo trong `PROJECTS_ROOT`, git init khi duyệt —, lệnh nền + lệnh riêng từng task, `handoffOn`, `autoApprove`, `skipClaudeReviewWhenGreen`) |
 | `orchestrator/` khác | `projectFiles` (đọc sẵn file liên quan cho Claude/Muse) · `quota` (hết hạn mức → chờ giờ reset) · `contextPruning` · `compressForClaude` · `archRevision` · `handoff` · `rebalance` |
 | `agents/` | `claude-cli.ts` (chế độ gọn; `tools`/`maxTurns`/`model` theo từng lượt) · `verdict.ts` (chỉ đọc dòng `VERDICT:`) · `muse.ts` (chỉ nhận markdown; bể gom profile theo người dùng Muse) · `gemini.ts` + `retry.ts` (bể key) · `mock.ts` |
 | `verify/` | `workspace` (kiểm tra trong bản sao `data/workspaces/`, ghi vào dự án khi qua) · `fileChecks` (cú pháp, chữ đã render) · `survey` (quét dự án cho planner) · `gitProject` · `failureDigest` · `runner` (có timeout) |

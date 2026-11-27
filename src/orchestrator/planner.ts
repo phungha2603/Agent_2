@@ -144,6 +144,33 @@ export async function projectDirWarnings(dir: string): Promise<string[]> {
   ];
 }
 
+/** A folder name for a goal: lowercase ASCII (Vietnamese accents dropped), words joined by dashes. */
+export function slugForGoal(goal: string, max = 50): string {
+  const slug = goal
+    .toLowerCase()
+    .normalize("NFD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .replace(/đ/g, "d")
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/^-+|-+$/g, "")
+    .slice(0, max)
+    .replace(/-+$/g, "");
+  return slug || "du-an";
+}
+
+/** A new, not-yet-existing folder under `root` named after the goal (adds -2, -3, ... instead of reusing one). */
+export async function newProjectDir(root: string, goal: string): Promise<string> {
+  const base = path.join(root, slugForGoal(goal));
+  for (let n = 1; ; n++) {
+    const candidate = n === 1 ? base : `${base}-${n}`;
+    try {
+      await readdir(candidate);
+    } catch {
+      return candidate;
+    }
+  }
+}
+
 export function newPlanId(): string {
   return `plan-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`;
 }

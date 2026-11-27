@@ -40,7 +40,9 @@ function tracker() {
   return { active, peak, calls };
 }
 
-async function setup(overrides: { gemini?: Agent; claude?: Agent; slotParallel?: Record<string, number>; notify?: (title: string, body: string) => void } = {}) {
+async function setup(
+  overrides: { gemini?: Agent; claude?: Agent; slotParallel?: Record<string, number>; notify?: (title: string, body: string) => void; projectsRoot?: string } = {},
+) {
   const dir = mkdtempSync(path.join(tmpdir(), "scheduler-test-"));
   process.chdir(dir);
   vi.resetModules();
@@ -74,6 +76,7 @@ async function setup(overrides: { gemini?: Agent; claude?: Agent; slotParallel?:
     },
     pipeline: { verify: { cwd: dir, commands: ["true"] }, maxImplementationAttempts: 3, maxReviewRejections: 3, maxAutoRecoveries: 1 },
     notify: overrides.notify,
+    projectsRoot: overrides.projectsRoot,
     settings: {
       claudeConcurrency: 2,
       geminiConcurrency: 2,
@@ -270,5 +273,25 @@ describe("auto-approve and notifications", () => {
     await waitFor(async () => (await allTasks(c)).some((x: any) => x.queueState === "waiting_you"));
     expect((await allTasks(c)).filter((x: any) => x.queueState === "done")).toHaveLength(0);
     await waitFor(() => notes.some((n) => n.startsWith("Chờ bạn duyệt · 1 cảnh báo đỏ")));
+  });
+});
+
+
+describe("PROJECTS_ROOT", () => {
+  it("gives a plan with no directory its own new folder named after the goal, and makes it a git repo on approval", async () => {
+    const { execFileSync } = await import("node:child_process");
+    const { existsSync, mkdirSync } = await import("node:fs");
+    const root = mkdtempSync(path.join(tmpdir(), "projects-root-"));
+    mkdirSync(path.join(root, "ung-dung-quan-ly-chi-tieu")); // an earlier project with the same name
+    const { company: c } = await setup({ projectsRoot: root });
+    const plan = await c.startPlan("Ứng dụng quản lý chi tiêu");
+    const dir = path.join(root, "ung-dung-quan-ly-chi-tieu-2");
+    expect(plan.project?.dir).toBe(dir); // never reuses an existing folder
+    expect(existsSync(dir)).toBe(false); // nothing is created until the plan is approved
+    await waitFor(async () => (await c.planSnapshot())?.status === "awaiting_approval");
+    await c.decidePlan(plan.id, true, undefined, { handoffOn: "checkpoint_final" });
+    expect(execFileSync("git", ["-C", dir, "log", "--format=%s"], { encoding: "utf8" })).toMatch(/Start of the project/);
+    expect(existsSync(path.join(dir, ".gitignore"))).toBe(true);
+    expect((await c.planSnapshot())?.notes?.join(" ")).toMatch(/created at/);
   });
 });

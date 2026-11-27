@@ -33,6 +33,7 @@ const company = new Company({
   settings: buildSchedulerSettings(),
   projectConfig: buildProjectConfigSnapshot,
   notify: createMacNotifier(),
+  projectsRoot: process.env.PROJECTS_ROOT?.trim() || undefined,
 });
 
 const app = express();

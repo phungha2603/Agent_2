@@ -1730,7 +1730,7 @@ $("#run-all-btn").addEventListener("click", async () => {
   const goal = goalInput.value.trim();
   if (!goal) return toast("Nhập mục tiêu chung cho cả công ty trước đã.");
   const projectDir = $("#project-dir-input").value.trim();
-  if (!projectDir) return toast("Nhập thư mục dự án (đường dẫn tuyệt đối) — nơi code của mục tiêu này được ghi và kiểm tra.");
+  if (!projectDir && !state.projectsRoot) return toast("Nhập thư mục dự án (đường dẫn tuyệt đối) — nơi code của mục tiêu này được ghi và kiểm tra.");
   const autoApprove = $("#opt-autoapprove").checked;
   const skipClaudeReviewWhenGreen = $("#opt-skipreview").checked;
   if (await post("/api/run-all", { goal, projectDir, autoApprove, skipClaudeReviewWhenGreen })) toast("Đã giao mục tiêu cho Sếp — đang lập cây công việc.");
@@ -1777,7 +1777,10 @@ function applyStatus(data) {
   state.slots = new Map(data.slots.map((s) => [s.id, s]));
   state.plan = data.plan;
   const dirInput = $("#project-dir-input");
-  if (dirInput && !dirInput.value && !dirInput.dataset.filled && data.settings?.defaultProjectDir) {
+  state.projectsRoot = data.settings?.projectsRoot || null;
+  if (dirInput && state.projectsRoot) {
+    dirInput.placeholder = `Để trống = thư mục mới riêng trong ${state.projectsRoot}`;
+  } else if (dirInput && !dirInput.value && !dirInput.dataset.filled && data.settings?.defaultProjectDir) {
     dirInput.value = data.settings.defaultProjectDir;
     dirInput.dataset.filled = "1";
   }

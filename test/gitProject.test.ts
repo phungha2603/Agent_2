@@ -3,7 +3,7 @@ import { existsSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { describe, expect, it } from "vitest";
-import { commitTaskFiles, discardTaskFiles, isGitRepo } from "../src/verify/gitProject.js";
+import { commitTaskFiles, discardTaskFiles, ensureProjectRepo, isGitRepo } from "../src/verify/gitProject.js";
 
 function repo(): string {
   const dir = mkdtempSync(path.join(tmpdir(), "git-project-"));
@@ -41,5 +41,20 @@ describe("git project recording", () => {
 
   it("knows a plain directory isn't a repository", async () => {
     expect(await isGitRepo(mkdtempSync(path.join(tmpdir(), "plain-")))).toBe(false);
+  });
+});
+
+
+describe("ensureProjectRepo", () => {
+  it("puts an existing folder under git with a baseline commit of what is there, and leaves a repo alone", async () => {
+    const dir = mkdtempSync(path.join(tmpdir(), "existing-"));
+    writeFileSync(path.join(dir, "app.py"), "x = 1\n");
+    const res = await ensureProjectRepo(dir);
+    expect(res?.created).toBe(false);
+    const files = execFileSync("git", ["-C", dir, "show", "--name-only", "--format=%s", "HEAD"], { encoding: "utf8" });
+    expect(files).toMatch(/Baseline/);
+    expect(files).toMatch(/app\.py/);
+    expect(files).toMatch(/\.gitignore/);
+    expect(await ensureProjectRepo(dir)).toBeUndefined();
   });
 });

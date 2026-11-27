@@ -1,5 +1,5 @@
 import { execFile } from "node:child_process";
-import { rm } from "node:fs/promises";
+import { access, mkdir, rm, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { promisify } from "node:util";
 
@@ -70,4 +70,59 @@ export async function discardTaskFiles(dir: string, files: string[]): Promise<{ 
     }
   }
   return { restored, removed };
+}
+
+const DEFAULT_GITIGNORE = [
+  "# Build output and caches",
+  ".build/",
+  ".swiftpm/",
+  "DerivedData/",
+  "build/",
+  "dist/",
+  "node_modules/",
+  "xcuserdata/",
+  "*.xcuserstate",
+  "__pycache__/",
+  ".venv/",
+  ".pytest_cache/",
+  ".DS_Store",
+  "",
+].join("\n");
+
+/**
+ * Makes a plan's project directory a git repository if it isn't one yet —
+ * creating the directory, a default .gitignore (unless one exists) and a
+ * first commit of whatever is already there — so every task approved later
+ * becomes its own commit and a rejected one can be undone. Returns what it
+ * did, or undefined if the directory was already a repository.
+ */
+export async function ensureProjectRepo(dir: string): Promise<{ created: boolean; commit: string } | undefined> {
+  if (await isGitRepo(dir)) return undefined;
+  let existed = true;
+  try {
+    await access(dir);
+  } catch {
+    existed = false;
+  }
+  await mkdir(dir, { recursive: true });
+  await git(dir, ["init", "--quiet"]);
+  const ignore = path.join(dir, ".gitignore");
+  try {
+    await access(ignore);
+  } catch {
+    await writeFile(ignore, DEFAULT_GITIGNORE, "utf8");
+  }
+  await git(dir, ["add", "-A"]);
+  const id = await identityArgs(dir);
+  await execFileAsync("git", [
+    "-C",
+    dir,
+    ...id,
+    "commit",
+    "--quiet",
+    "--allow-empty",
+    "-m",
+    existed ? "Baseline: project as it was before the AI Company started on it" : "Start of the project (created by the AI Company dashboard)",
+  ]);
+  return { created: !existed, commit: await git(dir, ["rev-parse", "--short", "HEAD"]) };
 }
