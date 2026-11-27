@@ -140,6 +140,8 @@ export interface ProjectConfig {
   autoApprove?: boolean;
   /** Skip Claude's final review when Gemini approved, nothing is flagged, and it isn't an integration task or a CEO revision. */
   skipClaudeReviewWhenGreen?: boolean;
+  /** Push each approved task's commit to the project's own GitHub repository. */
+  githubPush?: boolean;
   screenshotWaitMs?: number;
 }
 

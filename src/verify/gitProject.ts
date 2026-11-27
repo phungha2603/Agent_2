@@ -126,3 +126,73 @@ export async function ensureProjectRepo(dir: string): Promise<{ created: boolean
   ]);
   return { created: !existed, commit: await git(dir, ["rev-parse", "--short", "HEAD"]) };
 }
+
+/** GitHub side of a project: one remote repository per project, kept up to date as tasks are approved. */
+export interface GithubOps {
+  /** Whether `gh` is installed and logged in. */
+  available(): Promise<boolean>;
+  /** Creates a repository for `dir` (named after its folder, -2, -3... if taken), sets it as origin and pushes; returns its URL. */
+  createRepo(dir: string, description: string): Promise<string>;
+  /** Pushes the current branch to origin. */
+  push(dir: string): Promise<void>;
+  /** origin's URL, if the project already has one. */
+  remoteUrl(dir: string): Promise<string | undefined>;
+}
+
+async function gh(args: string[], cwd?: string): Promise<string> {
+  const { stdout } = await execFileAsync("gh", args, { cwd, maxBuffer: 4 * 1024 * 1024, timeout: 120_000 });
+  return stdout.trim();
+}
+
+/** The real thing, through the `gh` CLI the CEO is logged in with. Repositories are private unless `visibility` says otherwise. */
+export function createGithubOps(opts: { visibility?: "private" | "public" } = {}): GithubOps {
+  let login: Promise<string> | null = null;
+  const owner = () => (login ??= gh(["api", "user", "--jq", ".login"]));
+  return {
+    async available() {
+      try {
+        return Boolean(await owner());
+      } catch {
+        login = null;
+        return false;
+      }
+    },
+    async remoteUrl(dir) {
+      try {
+        return (await git(dir, ["remote", "get-url", "origin"])) || undefined;
+      } catch {
+        return undefined;
+      }
+    },
+    async createRepo(dir, description) {
+      const me = await owner();
+      const base = path.basename(path.resolve(dir)).replace(/[^A-Za-z0-9._-]/g, "-") || "project";
+      let name = base;
+      for (let n = 2; ; n++) {
+        try {
+          await gh(["repo", "view", `${me}/${name}`, "--json", "name"]);
+          name = `${base}-${n}`; // taken: try the next
+        } catch {
+          break; // free
+        }
+      }
+      await gh([
+        "repo",
+        "create",
+        `${me}/${name}`,
+        opts.visibility === "public" ? "--public" : "--private",
+        "--source",
+        dir,
+        "--remote",
+        "origin",
+        "--push",
+        "--description",
+        description.replace(/\s+/g, " ").slice(0, 300),
+      ]);
+      return `https://github.com/${me}/${name}`;
+    },
+    async push(dir) {
+      await git(dir, ["push", "--quiet", "-u", "origin", "HEAD"]);
+    },
+  };
+}

@@ -21,7 +21,7 @@ import { buildHandoff, reachedHandoffPoint, type HandoffPoint } from "./handoff.
 import { execFile } from "node:child_process";
 import { hhmm as clockTime, quotaResumeAt } from "./quota.js";
 import { formatSurvey, surveyProject } from "../verify/survey.js";
-import { commitTaskFiles, discardTaskFiles, ensureProjectRepo, isGitRepo } from "../verify/gitProject.js";
+import { commitTaskFiles, discardTaskFiles, ensureProjectRepo, isGitRepo, type GithubOps } from "../verify/gitProject.js";
 import type { Notifier } from "../dashboard/notify.js";
 import path from "node:path";
 import {
@@ -74,6 +74,8 @@ export interface CompanyOptions {
   notify?: Notifier;
   /** PROJECTS_ROOT: a plan given no directory gets its own new folder here, named after its goal. */
   projectsRoot?: string;
+  /** Creates each project's own GitHub repository and pushes approved tasks (undefined = GitHub off). */
+  github?: GithubOps;
 }
 
 export interface Activity {
@@ -260,6 +262,8 @@ export class Company extends EventEmitter {
   private readonly projectConfig: () => ProjectConfig | undefined;
   private readonly notify: Notifier;
   private readonly projectsRoot?: string;
+  private readonly github?: GithubOps;
+  private githubAvailable = false;
   private state: DashboardState = { slots: {}, activePlanId: null, gates: {}, directives: [], paused: false };
   private readonly workers = new Map<string, Worker>();
   /** In-memory task objects for running workers — the source of truth while they run. */
@@ -291,6 +295,8 @@ export class Company extends EventEmitter {
     this.projectConfig = opts.projectConfig ?? (() => undefined);
     this.notify = opts.notify ?? (() => {});
     this.projectsRoot = opts.projectsRoot;
+    this.github = opts.github;
+    void opts.github?.available().then((ok) => (this.githubAvailable = ok));
     this.engines = {
       claude: new Semaphore(opts.settings.claudeConcurrency),
       gemini: new Semaphore(opts.settings.geminiConcurrency),
@@ -469,14 +475,43 @@ export class Company extends EventEmitter {
    * back to the last commit (new ones are deleted), so work the CEO turned
    * down doesn't stay in the project. Not a git repository: nothing happens.
    */
+  private gitQueues = new Map<string, Promise<void>>();
+
+  /**
+   * One git operation at a time per repository: auto-approved tasks can be
+   * decided at the same moment, and two concurrent commits in one repo make
+   * git refuse one of them (index.lock) — that task's commit and push would
+   * silently be lost.
+   */
+  private inRepoQueue(dir: string, fn: () => Promise<void>): Promise<void> {
+    const prev = this.gitQueues.get(dir) ?? Promise.resolve();
+    const next = prev.then(fn, fn);
+    this.gitQueues.set(dir, next.catch(() => {}));
+    return next;
+  }
+
   private async recordInGit(task: TaskRecord, approved: boolean): Promise<void> {
     const dir = task.projectConfig?.verifyCwd;
+    if (!dir) return;
+    return this.inRepoQueue(path.resolve(dir), () => this.recordInGitNow(task, approved, dir));
+  }
+
+  private async recordInGitNow(task: TaskRecord, approved: boolean, dir: string): Promise<void> {
     const files = task.context.implementationFiles ?? [];
-    if (!dir || !files.length || !(await isGitRepo(dir))) return;
+    if (!files.length || !(await isGitRepo(dir))) return;
     try {
       if (approved) {
         const hash = await commitTaskFiles(dir, files, `${task.context.title}\n\nTask ${task.id}, approved by the CEO in the AI Company dashboard.`);
         log(task, task.stage, "system", hash ? `Committed ${files.length} file(s) to the project's git repository: ${hash}.` : "No file changes to commit to git.");
+        if (hash && task.projectConfig?.githubPush && this.github) {
+          // A failed push (offline, expired login) never blocks the work; the next approval pushes this commit too.
+          try {
+            await this.github.push(dir);
+            log(task, task.stage, "system", `Pushed ${hash} to the project's GitHub repository.`);
+          } catch (err) {
+            log(task, task.stage, "system", `Push to GitHub failed (${(err as Error).message.slice(0, 200)}) — the commit is kept locally and goes up with the next push.`);
+          }
+        }
       } else {
         const { restored, removed } = await discardTaskFiles(dir, files);
         log(
@@ -488,6 +523,33 @@ export class Company extends EventEmitter {
       }
     } catch (err) {
       log(task, task.stage, "system", `Git ${approved ? "commit" : "undo"} failed (the decision itself stands): ${(err as Error).message.slice(0, 300)}`);
+    }
+  }
+
+  /**
+   * The project's own GitHub repository: created (private) on approval if
+   * the plan asks for one and the folder has no origin yet; an existing
+   * origin is reused. Failures are noted on the plan, never fatal.
+   */
+  private async connectGithub(plan: WorkPlanRecord, dir: string): Promise<void> {
+    const project = plan.project;
+    if (!project?.githubRepo || !this.github) return;
+    try {
+      const existing = await this.github.remoteUrl(dir);
+      if (existing) {
+        project.githubUrl = existing;
+        await this.github.push(dir).catch(() => {});
+        (plan.notes ??= []).push(`GitHub: using the folder's existing repository ${existing}.`);
+        return;
+      }
+      if (!(await this.github.available())) {
+        (plan.notes ??= []).push("GitHub: gh is not logged in (run `gh auth login`) — the project keeps its local git only.");
+        return;
+      }
+      project.githubUrl = await this.github.createRepo(dir, plan.goal);
+      (plan.notes ??= []).push(`GitHub: created private repository ${project.githubUrl} and pushed the first commit.`);
+    } catch (err) {
+      (plan.notes ??= []).push(`GitHub: could not create the repository (${(err as Error).message.slice(0, 200)}) — the project keeps its local git only.`);
     }
   }
 
@@ -632,7 +694,11 @@ export class Company extends EventEmitter {
     return { taskId: target.id, created };
   }
 
-  async startPlan(goal: string, projectDir?: string, options: { autoApprove?: boolean; skipClaudeReviewWhenGreen?: boolean } = {}): Promise<WorkPlanRecord> {
+  async startPlan(
+    goal: string,
+    projectDir?: string,
+    options: { autoApprove?: boolean; skipClaudeReviewWhenGreen?: boolean; githubRepo?: boolean } = {},
+  ): Promise<WorkPlanRecord> {
     const current = await this.activePlan();
     if (current && (current.status === "drafting" || current.status === "awaiting_approval")) {
       throw new UserError("Đang có một kế hoạch đang lập hoặc chờ duyệt — hãy quyết kế hoạch đó trước.");
@@ -653,6 +719,7 @@ export class Company extends EventEmitter {
     plan.project!.handoffOn = await this.defaultHandoffFor(dir);
     plan.project!.autoApprove = options.autoApprove === true;
     plan.project!.skipClaudeReviewWhenGreen = options.skipClaudeReviewWhenGreen === true;
+    plan.project!.githubRepo = options.githubRepo === true && Boolean(this.github);
     await savePlan(plan);
     await this.mutateState((s) => (s.activePlanId = plan.id));
     this.emitPlan();
@@ -706,7 +773,14 @@ export class Company extends EventEmitter {
   /** The CEO sets or corrects where the plan's code lives and how it's verified, before approving. */
   async updatePlanProject(
     planId: string,
-    update: { dir?: string; verifyCommands?: string[]; handoffOn?: "checkpoint_final" | "done"; autoApprove?: boolean; skipClaudeReviewWhenGreen?: boolean },
+    update: {
+      dir?: string;
+      verifyCommands?: string[];
+      handoffOn?: "checkpoint_final" | "done";
+      autoApprove?: boolean;
+      skipClaudeReviewWhenGreen?: boolean;
+      githubRepo?: boolean;
+    },
   ): Promise<WorkPlanRecord> {
     const plan = await loadPlan(planId);
     if (!plan || (plan.status !== "awaiting_approval" && plan.status !== "drafting")) {
@@ -726,6 +800,7 @@ export class Company extends EventEmitter {
     if (update.handoffOn === "done" || update.handoffOn === "checkpoint_final") project.handoffOn = update.handoffOn;
     if (typeof update.autoApprove === "boolean") project.autoApprove = update.autoApprove;
     if (typeof update.skipClaudeReviewWhenGreen === "boolean") project.skipClaudeReviewWhenGreen = update.skipClaudeReviewWhenGreen;
+    if (typeof update.githubRepo === "boolean") project.githubRepo = update.githubRepo && Boolean(this.github);
     project.commandWarnings = commandWarnings(allPlanCommands(project.verifyCommands, plan.epics));
     plan.project = project;
     plan.updatedAt = nowIso();
@@ -738,7 +813,14 @@ export class Company extends EventEmitter {
     planId: string,
     approved: boolean,
     feedback?: string,
-    project?: { dir?: string; verifyCommands?: string[]; handoffOn?: "checkpoint_final" | "done"; autoApprove?: boolean; skipClaudeReviewWhenGreen?: boolean },
+    project?: {
+      dir?: string;
+      verifyCommands?: string[];
+      handoffOn?: "checkpoint_final" | "done";
+      autoApprove?: boolean;
+      skipClaudeReviewWhenGreen?: boolean;
+      githubRepo?: boolean;
+    },
   ): Promise<void> {
     if (project && Object.values(project).some((v) => v !== undefined)) {
       await this.updatePlanProject(planId, project);
@@ -764,9 +846,11 @@ export class Company extends EventEmitter {
       } catch (err) {
         (plan.notes ??= []).push(`Project: could not set up git in ${dir} (${(err as Error).message.slice(0, 200)}) — tasks run without per-task commits.`);
       }
+      await this.connectGithub(plan, dir);
       const base = this.projectConfig();
       const tasks = materializePlan(plan, { ...base, verifyCwd: dir, verifyCommands: commands, handoffOn: plan.project?.handoffOn, autoApprove: plan.project?.autoApprove === true,
         skipClaudeReviewWhenGreen: plan.project?.skipClaudeReviewWhenGreen === true,
+        githubPush: Boolean(plan.project?.githubUrl),
       });
       for (const t of tasks) await saveTask(t);
       plan.status = "approved";
@@ -1243,7 +1327,7 @@ export class Company extends EventEmitter {
       insights: await this.insights(idx),
       control: this.control(),
       rebalance: this.rebalanceSnapshot(),
-      settings: { projectsRoot: this.projectsRoot ?? null, defaultProjectDir: this.projectsRoot ? "" : this.defaultProjectDir(), handoffOn: this.settings.handoffOn, stageErrorRetries: this.settings.stageErrorRetries, maxAutoRecoveries: this.pipeline.maxAutoRecoveries ?? 0 },
+      settings: { githubAvailable: this.githubAvailable, projectsRoot: this.projectsRoot ?? null, defaultProjectDir: this.projectsRoot ? "" : this.defaultProjectDir(), handoffOn: this.settings.handoffOn, stageErrorRetries: this.settings.stageErrorRetries, maxAutoRecoveries: this.pipeline.maxAutoRecoveries ?? 0 },
     };
   }
 

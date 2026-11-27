@@ -17,6 +17,7 @@
       <input id="project-dir-input" type="text" placeholder="Thư mục dự án (đường dẫn tuyệt đối, nên là thư mục riêng)" title="Nơi Muse ghi code và nơi chạy lệnh build/test của kế hoạch này" />
       <div class="goal-options">
         <label class="check" title="Task qua kiểm tra, được Gemini & Claude duyệt và không có cảnh báo đỏ sẽ tự ship; task có cảnh báo vẫn chờ bạn. Dự án có git thì mỗi task là một commit, hoàn tác được."><input type="checkbox" id="opt-autoapprove" /> ⚡ Tự duyệt khi xanh</label>
+        <label class="check" id="opt-github-label" title="Khi duyệt kế hoạch: tạo repo GitHub riêng tư cho dự án; mỗi task được duyệt sẽ được commit và push lên đó."><input type="checkbox" id="opt-github" checked /> Tạo repo GitHub riêng</label>
         <label class="check" title="Subtask mà Gemini đã duyệt, không có cảnh báo đỏ thì bỏ bước Claude review (task nghiệm thu và yêu cầu sửa của bạn luôn qua Claude). Tiết kiệm quota Claude."><input type="checkbox" id="opt-skipreview" /> Bỏ Claude review khi Gemini duyệt &amp; xanh</label>
       </div>
       <button id="run-all-btn" class="btn btn-primary">▶ Chạy luồng cả công ty</button>

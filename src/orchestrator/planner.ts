@@ -76,6 +76,10 @@ export interface PlanProject {
   autoApprove?: boolean;
   /** Skip Claude's final review on a subtask Gemini approved with nothing flagged (integration tasks and CEO revisions always get it). */
   skipClaudeReviewWhenGreen?: boolean;
+  /** Give the project its own (private) GitHub repository on approval and push every approved task to it. */
+  githubRepo?: boolean;
+  /** That repository, once created (or the folder's existing origin). */
+  githubUrl?: string;
 }
 
 /** Every verification command in a plan: the baseline, plus each epic's and subtask's own. */

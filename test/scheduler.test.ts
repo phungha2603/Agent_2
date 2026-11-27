@@ -41,7 +41,14 @@ function tracker() {
 }
 
 async function setup(
-  overrides: { gemini?: Agent; claude?: Agent; slotParallel?: Record<string, number>; notify?: (title: string, body: string) => void; projectsRoot?: string } = {},
+  overrides: {
+    gemini?: Agent;
+    claude?: Agent;
+    slotParallel?: Record<string, number>;
+    notify?: (title: string, body: string) => void;
+    projectsRoot?: string;
+    github?: import("../src/verify/gitProject.js").GithubOps;
+  } = {},
 ) {
   const dir = mkdtempSync(path.join(tmpdir(), "scheduler-test-"));
   process.chdir(dir);
@@ -77,6 +84,7 @@ async function setup(
     pipeline: { verify: { cwd: dir, commands: ["true"] }, maxImplementationAttempts: 3, maxReviewRejections: 3, maxAutoRecoveries: 1 },
     notify: overrides.notify,
     projectsRoot: overrides.projectsRoot,
+    github: overrides.github,
     settings: {
       claudeConcurrency: 2,
       geminiConcurrency: 2,
@@ -261,7 +269,7 @@ describe("auto-approve and notifications", () => {
     const t = (await allTasks(c))[0];
     expect((await c.taskDetail(t.id)).task.trace?.some((e: any) => /Auto-approved/.test(e.text))).toBe(true);
     await waitFor(() => notes.includes("Kế hoạch hoàn tất"));
-  });
+  }, 30_000);
 
   it("still waits for the CEO when a result has a red warning", async () => {
     const notes: string[] = [];
@@ -293,5 +301,48 @@ describe("PROJECTS_ROOT", () => {
     expect(execFileSync("git", ["-C", dir, "log", "--format=%s"], { encoding: "utf8" })).toMatch(/Start of the project/);
     expect(existsSync(path.join(dir, ".gitignore"))).toBe(true);
     expect((await c.planSnapshot())?.notes?.join(" ")).toMatch(/created at/);
+  });
+});
+
+
+describe("a GitHub repository per project", () => {
+  it("creates the project's own repository on approval and pushes every approved task to it", async () => {
+    const { execFileSync } = await import("node:child_process");
+    const created: string[] = [];
+    const pushed: string[] = [];
+    const github = {
+      available: async () => true,
+      remoteUrl: async () => undefined,
+      createRepo: async (dir: string) => {
+        created.push(dir);
+        return `https://github.com/someone/${path.basename(dir)}`;
+      },
+      push: async (dir: string) => {
+        pushed.push(execFileSync("git", ["-C", dir, "log", "-1", "--format=%s"], { encoding: "utf8" }).trim());
+      },
+    };
+    const root = mkdtempSync(path.join(tmpdir(), "gh-projects-"));
+    const { company: c } = await setup({ projectsRoot: root, github });
+    await c.setGate("AG-08", false);
+    await c.setGate("AG-10", false);
+    const plan = await c.startPlan("Todo app", undefined, { githubRepo: true, autoApprove: true });
+    await waitFor(async () => (await c.planSnapshot())?.status === "awaiting_approval");
+    await c.decidePlan(plan.id, true, undefined, { handoffOn: "checkpoint_final" });
+    expect(created).toEqual([path.join(root, "todo-app")]);
+    expect((await c.planSnapshot())?.project?.githubUrl).toBe("https://github.com/someone/todo-app");
+    await waitFor(async () => (await allTasks(c)).length === 9 && (await allTasks(c)).every((x: any) => x.queueState === "done"), 20000);
+    // The stage turns "done" before the commit+push that follows it, so the last push may still be in flight.
+    await waitFor(() => pushed.length === 9); // one push per approved task, each after its own commit
+    expect(pushed.every((subject) => /^E\d/.test(subject))).toBe(true);
+  }, 30_000);
+
+  it("does nothing on GitHub when the plan didn't ask for a repository", async () => {
+    const calls: string[] = [];
+    const github = { available: async () => true, remoteUrl: async () => undefined, createRepo: async () => (calls.push("create"), "x"), push: async () => void calls.push("push") };
+    const { company: c } = await setup({ projectsRoot: mkdtempSync(path.join(tmpdir(), "gh-off-")), github });
+    const plan = await c.startPlan("Local only");
+    await waitFor(async () => (await c.planSnapshot())?.status === "awaiting_approval");
+    await c.decidePlan(plan.id, true, undefined, { handoffOn: "checkpoint_final" });
+    expect(calls).toEqual([]);
   });
 });

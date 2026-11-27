@@ -4,6 +4,7 @@ import express, { type NextFunction, type Request, type Response } from "express
 import { Company, isUserError } from "../orchestrator/scheduler.js";
 import { buildAgents, buildPipelineConfig, buildProjectConfigSnapshot, buildSchedulerSettings } from "../config.js";
 import { createMacNotifier } from "./notify.js";
+import { createGithubOps } from "../verify/gitProject.js";
 import { basicAuth, isLoopback } from "./auth.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -34,6 +35,7 @@ const company = new Company({
   projectConfig: buildProjectConfigSnapshot,
   notify: createMacNotifier(),
   projectsRoot: process.env.PROJECTS_ROOT?.trim() || undefined,
+  github: process.env.GITHUB_PROJECTS === "0" ? undefined : createGithubOps({ visibility: process.env.GITHUB_PROJECTS_VISIBILITY === "public" ? "public" : "private" }),
 });
 
 const app = express();
@@ -175,6 +177,7 @@ app.post("/api/run-all", route(async (req, res) => {
   const plan = await company.startPlan(goal, str(req.body?.projectDir), {
     autoApprove: req.body?.autoApprove === true,
     skipClaudeReviewWhenGreen: req.body?.skipClaudeReviewWhenGreen === true,
+    githubRepo: req.body?.githubRepo === true,
   });
   ok(res, { planId: plan.id });
 }));
@@ -185,6 +188,7 @@ function planProject(body: any): {
   handoffOn?: "done" | "checkpoint_final";
   autoApprove?: boolean;
   skipClaudeReviewWhenGreen?: boolean;
+  githubRepo?: boolean;
 } {
   const dir = str(body?.projectDir);
   const raw = body?.verifyCommands;
@@ -197,7 +201,8 @@ function planProject(body: any): {
   const handoffOn = handoff === "done" || handoff === "checkpoint_final" ? handoff : undefined;
   const autoApprove = typeof body?.autoApprove === "boolean" ? body.autoApprove : undefined;
   const skipClaudeReviewWhenGreen = typeof body?.skipClaudeReviewWhenGreen === "boolean" ? body.skipClaudeReviewWhenGreen : undefined;
-  return { dir, verifyCommands, handoffOn, autoApprove, skipClaudeReviewWhenGreen };
+  const githubRepo = typeof body?.githubRepo === "boolean" ? body.githubRepo : undefined;
+  return { dir, verifyCommands, handoffOn, autoApprove, skipClaudeReviewWhenGreen, githubRepo };
 }
 app.post("/api/plan/:id/project", route(async (req, res) => ok(res, await company.updatePlanProject(req.params.id, planProject(req.body)))));
 app.post("/api/plan/:id/decision", route(async (req, res) =>
