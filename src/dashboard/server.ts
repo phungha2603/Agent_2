@@ -1,10 +1,11 @@
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import express, { type NextFunction, type Request, type Response } from "express";
-import { Company, isUserError } from "../orchestrator/scheduler.js";
+import { Company, isUserError, UserError } from "../orchestrator/scheduler.js";
 import { buildAgents, buildPipelineConfig, buildProjectConfigSnapshot, buildSchedulerSettings } from "../config.js";
 import { createMacNotifier } from "./notify.js";
 import { createGithubOps } from "../verify/gitProject.js";
+import { ContentSeoService } from "../integrations/contentSeo.js";
 import { basicAuth, isLoopback } from "./auth.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -26,6 +27,8 @@ if (!isLoopback(HOST) && !(AUTH_USER && AUTH_PASSWORD)) {
 }
 const SUMMARY_DEBOUNCE_MS = 400;
 
+const notifier = createMacNotifier();
+
 // One set of agents for the whole process: in particular one Muse MCP
 // server, so there's only ever one Chrome on the Muse profile.
 const company = new Company({
@@ -33,10 +36,12 @@ const company = new Company({
   pipeline: buildPipelineConfig(),
   settings: buildSchedulerSettings(),
   projectConfig: buildProjectConfigSnapshot,
-  notify: createMacNotifier(),
+  notify: notifier,
   projectsRoot: process.env.PROJECTS_ROOT?.trim() || undefined,
   github: process.env.GITHUB_PROJECTS === "0" ? undefined : createGithubOps({ visibility: process.env.GITHUB_PROJECTS_VISIBILITY === "public" ? "public" : "private" }),
 });
+
+const contentSeo = process.env.CONTENTSEO_DIR?.trim() ? new ContentSeoService(process.env.CONTENTSEO_DIR.trim()) : undefined;
 
 const app = express();
 app.disable("x-powered-by");
@@ -108,6 +113,11 @@ company.on("engines", debounced(SLOT_DEBOUNCE_MS, () => broadcast("engines", com
 company.on("control", pushSummary);
 company.on("rebalance", debounced(SLOT_DEBOUNCE_MS, () => broadcast("rebalance", company.rebalanceSnapshot())));
 company.on("live", (chunk) => broadcast("live", chunk));
+contentSeo?.on("change", debounced(300, () => broadcast("contentseo", contentSeo.snapshot())));
+contentSeo?.on("finished", (run) => {
+  const what = { done: "Xong", partial: "Xong một phần", quota: "Dừng vì hết quota Gemini", failed: "Lỗi", stopped: "Đã dừng", running: "" }[run.status as string] ?? run.status;
+  notifier?.(`Content SEO · ${what}`, `${run.domain} / ${run.keyword}${run.result ? ` — ${run.result} bài` : ""}`);
+});
 
 app.get("/api/events", (req, res) => {
   res.writeHead(200, { "Content-Type": "text/event-stream", "Cache-Control": "no-cache", Connection: "keep-alive" });
@@ -209,6 +219,18 @@ app.post("/api/plan/:id/decision", route(async (req, res) =>
   ok(res, await company.decidePlan(req.params.id, Boolean(req.body?.approved), str(req.body?.feedback), planProject(req.body))),
 ));
 app.post("/api/plan/:id/retry", route(async (req, res) => ok(res, await company.retryPlan(req.params.id))));
+// ---------- Auto Content SEO tab (an existing project, run as-is) ----------
+app.get("/api/contentseo", (_req, res) => res.json(contentSeo ? contentSeo.snapshot() : null));
+const needContentSeo = () => {
+  if (!contentSeo) throw new UserError("Chưa cấu hình CONTENTSEO_DIR trong .env.");
+  return contentSeo;
+};
+app.post("/api/contentseo/run", route(async (req, res) => ok(res, await needContentSeo().startRun({ domain: str(req.body?.domain), keyword: str(req.body?.keyword), links: req.body?.links }))));
+app.post("/api/contentseo/run/stop", route(async (_req, res) => ok(res, needContentSeo().stopRun())));
+app.post("/api/contentseo/bot/start", route(async (_req, res) => ok(res, needContentSeo().startBot())));
+app.post("/api/contentseo/bot/stop", route(async (_req, res) => ok(res, needContentSeo().stopBot())));
+app.post("/api/contentseo/check", route(async (_req, res) => ok(res, await needContentSeo().check())));
+
 app.post("/api/reset", route(async (_req, res) => ok(res, await company.reset())));
 
 app.use((err: Error, _req: Request, res: Response, _next: NextFunction) => {
@@ -217,6 +239,7 @@ app.use((err: Error, _req: Request, res: Response, _next: NextFunction) => {
 });
 
 await company.init();
+await contentSeo?.init();
 const server = app.listen(PORT, HOST, () => {
   console.log(`AI Company dashboard: http://${isLoopback(HOST) ? "localhost" : HOST}:${PORT}${AUTH_USER && AUTH_PASSWORD ? " (login required)" : ""}`);
 });
@@ -224,6 +247,7 @@ const server = app.listen(PORT, HOST, () => {
 const shutdown = async () => {
   server.close();
   for (const c of clients) c.end();
+  contentSeo?.close();
   await company.close();
   process.exit(0);
 };

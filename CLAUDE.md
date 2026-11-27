@@ -22,7 +22,8 @@ Luồng: Gemini (ý tưởng, thẩm định) → Claude (architecture, chốt c
 | `orchestrator/` khác | `projectFiles` (đọc sẵn file liên quan cho Claude/Muse) · `quota` (hết hạn mức → chờ giờ reset) · `contextPruning` · `compressForClaude` · `archRevision` · `handoff` · `rebalance` |
 | `agents/` | `claude-cli.ts` (chế độ gọn; `tools`/`maxTurns`/`model` theo từng lượt) · `verdict.ts` (chỉ đọc dòng `VERDICT:`) · `muse.ts` (chỉ nhận markdown; bể gom profile theo người dùng Muse) · `gemini.ts` + `retry.ts` (bể key) · `mock.ts` |
 | `verify/` | `workspace` (kiểm tra trong bản sao `data/workspaces/`, ghi vào dự án khi qua) · `fileChecks` (cú pháp, chữ đã render) · `survey` (quét dự án cho planner) · `gitProject` · `failureDigest` · `runner` (có timeout) |
-| `dashboard/` | `server.ts` (API + SSE), `notify.ts` (thông báo macOS), `slots.ts`, `public/app.js` (~1.800 dòng) |
+| `dashboard/` | `server.ts` (API + SSE), `notify.ts` (thông báo macOS), `slots.ts`, `public/app.js` (~1.900 dòng) |
+| `integrations/contentSeo.ts` | Tab "Auto Content SEO": chạy dự án Python có sẵn (`CONTENTSEO_DIR`) qua `scripts/run_once.py` của nó (một lượt mỗi lúc), bật/tắt bot Telegram, lịch sử ở `data/contentseo/runs.json` |
 | `store/` | Ghi file nguyên tử vào `data/` (không commit) |
 
 ## Quy ước và bẫy

@@ -671,3 +671,14 @@ button.engine:hover { border-color: var(--text-dim); }
 .plan-tag { font-size: 10px; font-weight: 500; color: var(--text-dim); border: 1px solid var(--card-border); border-radius: 4px; padding: 0 4px; margin-left: 4px; vertical-align: middle; }
 .ship-warn-list { margin: 8px 0; padding-left: 18px; color: #ffb4b4; font-size: 13px; }
 .ship-warn-list li { margin: 4px 0; }
+
+/* ---------- Auto Content SEO tab ---------- */
+.seo-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; padding: 12px; }
+.seo-card { display: flex; flex-direction: column; gap: 6px; }
+.seo-wide { grid-column: 1 / -1; }
+.seo-card form { display: flex; flex-direction: column; gap: 4px; }
+.seo-run { margin-top: 8px; display: flex; flex-direction: column; gap: 6px; }
+.seo-progress, .seo-botlog { max-height: 260px; overflow: auto; white-space: pre-wrap; }
+.seo-table { width: 100%; border-collapse: collapse; font-size: 13px; }
+.seo-table th, .seo-table td { text-align: left; padding: 6px 8px; border-bottom: 1px solid var(--card-border); vertical-align: top; }
+@media (max-width: 900px) { .seo-grid { grid-template-columns: 1fr; } }

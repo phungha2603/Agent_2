@@ -1634,6 +1634,23 @@ document.addEventListener("click", async (e) => {
       if (await post(`/api/plan/${encodeURIComponent(ds.plan)}/project`, planProjectInputs(ds.plan))) toast("Đã lưu thư mục & lệnh kiểm tra.");
     }
     if (action === "plan-retry") await post(`/api/plan/${encodeURIComponent(ds.plan)}/retry`);
+    if (action === "seo-run") {
+      const body = { domain: $("#seo-domain").value, keyword: $("#seo-key").value, links: $("#seo-links").value.split(/\s+/).filter(Boolean) };
+      if (await post("/api/contentseo/run", body)) toast("Đã bắt đầu tạo bài — theo dõi tiến độ ngay bên dưới.");
+    }
+    if (action === "seo-stop") await post("/api/contentseo/run/stop");
+    if (action === "seo-bot-start") (await post("/api/contentseo/bot/start")) && toast("Đã bật bot Telegram.");
+    if (action === "seo-bot-stop") await post("/api/contentseo/bot/stop");
+    if (action === "seo-check") await post("/api/contentseo/check");
+    if (action === "seo-rerun") {
+      const r = state.seo?.runs.find((x) => x.id === ds.run);
+      if (r) {
+        $("#seo-domain").value = r.domain;
+        $("#seo-key").value = r.keyword;
+        $("#seo-links").value = r.links.join("\n");
+        toast("Đã điền lại form — bấm Tạo bài để chạy (chỉ tạo bù các bài còn thiếu).");
+      }
+    }
     if (action === "rebalance") {
       if (await post("/api/rebalance")) {
         toast("Sếp đang xem tải của từng người — đề xuất sẽ hiện ở khung bên phải hàng Trưởng nhóm.");
@@ -1767,13 +1784,108 @@ $("#company-steer").addEventListener("keydown", (e) => e.key === "Enter" && $("#
 function setView(view) {
   state.view = view;
   $$(".tab[data-view]").forEach((b) => b.classList.toggle("active", b.dataset.view === view));
-  for (const v of ["org", "flow", "timeline", "artifacts"]) $(`#view-${v}`).hidden = v !== view;
-  $("#filters").classList.toggle("hidden-filters", view === "artifacts");
+  for (const v of ["org", "flow", "timeline", "artifacts", "seo"]) $(`#view-${v}`).hidden = v !== view;
+  $("#filters").classList.toggle("hidden-filters", view === "artifacts" || view === "seo");
   $("#g-tip").hidden = true;
   if (view === "org") scheduleEdges();
   if (view === "flow") renderFlowView();
   if (view === "timeline") loadTimeline();
   if (view === "artifacts") loadArtifacts();
+  if (view === "seo") loadSeo();
+}
+
+// ---------- Auto Content SEO tab ----------
+const SEO_STATUS = {
+  running: ["q-running", "Đang chạy"],
+  done: ["q-done", "Xong"],
+  partial: ["q-waiting_you", "Xong một phần"],
+  quota: ["q-waiting_you", "Hết quota Gemini"],
+  failed: ["q-error", "Lỗi"],
+  stopped: ["q-error", "Đã dừng"],
+};
+const seoBadge = (s) => `<span class="qstate ${(SEO_STATUS[s] ?? ["", s])[0]}">${esc((SEO_STATUS[s] ?? ["", s])[1])}</span>`;
+
+async function loadSeo() {
+  const res = await fetch("/api/contentseo");
+  state.seo = await res.json();
+  renderSeo();
+}
+
+/** The form is drawn once (so typing survives live updates); status, bot and history redraw on every update. */
+function renderSeo() {
+  const el = $("#view-seo");
+  if (!el) return;
+  const d = state.seo;
+  if (!d) {
+    el.innerHTML = `<div class="view-intro">Chưa cấu hình. Thêm <code>CONTENTSEO_DIR=/đường/dẫn/tới/dự-án</code> vào <code>.env</code> của dashboard rồi khởi động lại.</div>`;
+    return;
+  }
+  if (!el.querySelector("#seo-form")) {
+    el.innerHTML = `
+      <div class="seo-grid">
+        <div class="panel seo-card">
+          <div class="panel-title">✍️ Tạo bài SEO</div>
+          <div id="seo-check" class="small"></div>
+          <form id="seo-form" onsubmit="return false">
+            <label class="panel-sub">Domain (tên folder trên Google Drive)</label>
+            <input class="feedback-input" id="seo-domain" placeholder="vd: UY88" />
+            <label class="panel-sub">Key (từ khoá chính)</label>
+            <input class="feedback-input" id="seo-key" placeholder="vd: UY88" />
+            <label class="panel-sub">Link tham khảo — mỗi dòng một link (4–5 link)</label>
+            <textarea class="feedback-input" id="seo-links" rows="5" placeholder="https://..."></textarea>
+            <div class="decision-row"><button class="btn btn-primary" data-action="seo-run" id="seo-run-btn">✍️ Tạo bài</button></div>
+          </form>
+          <div id="seo-current"></div>
+        </div>
+        <div class="panel seo-card">
+          <div class="panel-title">🤖 Bot Telegram</div>
+          <div id="seo-bot"></div>
+        </div>
+        <div class="panel seo-card seo-wide">
+          <div class="panel-title">🗂 Lịch sử tạo bài</div>
+          <div id="seo-history"></div>
+        </div>
+      </div>`;
+  }
+  const c = d.check;
+  $("#seo-check").innerHTML = !c
+    ? `<span class="muted">Đang kiểm tra cấu hình…</span>`
+    : c.ok
+      ? `<span class="why">✓ Cấu hình sẵn sàng · model <code>${esc(c.model ?? "?")}</code> · ${c.articles ?? "?"} bài mỗi lượt</span>`
+      : `<div class="feedback-box is-error">⚠ ${esc(c.error ?? "Cấu hình chưa sẵn sàng")}</div><button class="btn btn-small-inline" data-action="seo-check">Kiểm tra lại</button>`;
+  const run = d.current;
+  $("#seo-run-btn").disabled = Boolean(run);
+  $("#seo-current").innerHTML = run
+    ? `<div class="seo-run">
+        <div>${seoBadge(run.status)} <b>${esc(run.domain)}</b> / ${esc(run.keyword)} <span class="muted small">· bắt đầu ${esc(new Date(run.startedAt).toLocaleTimeString("vi-VN"))}</span>
+          <button class="btn btn-small-inline btn-danger-ghost" data-action="seo-stop">⏹ Dừng</button></div>
+        ${run.folderUrl ? `<div>📁 <a href="${esc(run.folderUrl)}" target="_blank" rel="noopener">Mở folder Drive</a></div>` : ""}
+        <pre class="live seo-progress">${esc(run.progress.map((p) => p.text).join("\n") || "Đang khởi động…")}</pre>
+      </div>`
+    : "";
+  const pre = el.querySelector(".seo-progress");
+  if (pre) pre.scrollTop = pre.scrollHeight;
+  const b = d.bot;
+  $("#seo-bot").innerHTML = `
+    <div>${b.running ? `<span class="qstate q-running">Đang chạy</span> <span class="muted small">pid ${b.pid} · từ ${esc(new Date(b.startedAt).toLocaleTimeString("vi-VN"))}</span>` : `<span class="qstate">Đã tắt</span>`}
+      ${b.running ? `<button class="btn btn-small-inline btn-danger-ghost" data-action="seo-bot-stop">⏹ Tắt bot</button>` : `<button class="btn btn-small-inline" data-action="seo-bot-start">▶ Bật bot</button>`}</div>
+    <div class="muted small">Bot nhận lệnh qua Telegram như trước. Bot tắt khi dashboard tắt. Đừng chạy thêm một bản bot ở nơi khác cùng lúc (Telegram sẽ báo xung đột).</div>
+    <pre class="live seo-botlog">${esc(b.log.join("\n") || "(chưa có log)")}</pre>`;
+  const log = el.querySelector(".seo-botlog");
+  if (log) log.scrollTop = log.scrollHeight;
+  $("#seo-history").innerHTML = d.runs.length
+    ? `<table class="seo-table"><thead><tr><th>Thời gian</th><th>Domain / Key</th><th>Kết quả</th><th>Folder</th><th></th></tr></thead><tbody>${d.runs
+        .map(
+          (r) => `<tr>
+            <td class="small">${esc(new Date(r.startedAt).toLocaleString("vi-VN"))}</td>
+            <td><b>${esc(r.domain)}</b> / ${esc(r.keyword)}<div class="muted small">${r.links.length} link</div></td>
+            <td>${seoBadge(r.status)} ${r.result ? `<span class="small">${esc(r.result)} bài</span>` : ""}${r.error ? `<div class="muted small">${esc(r.error.slice(0, 160))}</div>` : ""}</td>
+            <td>${r.folderUrl ? `<a href="${esc(r.folderUrl)}" target="_blank" rel="noopener">Drive</a>` : "—"}</td>
+            <td>${r.status === "running" ? "" : `<button class="btn btn-small-inline" data-action="seo-rerun" data-run="${esc(r.id)}" title="Điền lại form với cùng domain/key/link (chỉ tạo bù bài còn thiếu)">↻ Dùng lại</button>`}</td>
+          </tr>`,
+        )
+        .join("")}</tbody></table>`
+    : `<div class="muted">Chưa có lượt nào.</div>`;
 }
 
 // ---------- data ----------
@@ -1883,6 +1995,10 @@ function connect() {
     state.control = JSON.parse(e.data);
     renderTelemetry();
     renderCompanyDirectives();
+  });
+  es.addEventListener("contentseo", (e) => {
+    state.seo = JSON.parse(e.data);
+    if (state.view === "seo") renderSeo();
   });
   es.addEventListener("live", (e) => {
     const { id, stage, start, text } = JSON.parse(e.data);

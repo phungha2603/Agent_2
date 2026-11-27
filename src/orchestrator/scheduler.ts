@@ -231,7 +231,7 @@ const hhmm = (iso: string) => new Date(iso).toTimeString().slice(0, 5);
 const ms = (from?: string, to?: string) => (from ? (to ? Date.parse(to) : Date.now()) - Date.parse(from) : 0);
 const minutes = (msValue: number) => Math.max(1, Math.round(msValue / 60000));
 
-class UserError extends Error {}
+export class UserError extends Error {}
 
 /**
  * Runs the company: per-slot task queues with a per-slot parallelism cap,
