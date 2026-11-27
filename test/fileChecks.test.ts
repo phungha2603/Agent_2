@@ -22,7 +22,7 @@ describe("checkFileContent", () => {
   });
 
   it("flags YAML whose nesting was flattened, even though it still parses as flat YAML", async () => {
-    expect((await checkFileContent(".github/workflows/test.yml", FLAT_YAML)).join("\n")).toMatch(/"on:" has nothing nested under it/);
+    expect((await checkFileContent(".github/workflows/test.yml", FLAT_YAML)).join("\n")).toMatch(/no line is indented/);
   });
 
   it("flags invalid JSON and a broken Xcode project header", async () => {
@@ -36,6 +36,8 @@ describe("checkFileContent", () => {
       ["run.sh", '#!/usr/bin/env bash\n# comment\nset -euo pipefail\nexport PATH="$HOME/bin:$PATH"\n'],
       [".github/workflows/ci.yml", "name: CI\non:\n  push:\n    branches: [main]\njobs:\n  test:\n    runs-on: ubuntu-latest\n    steps:\n      - uses: actions/checkout@v4\n      - run: |\n          npm ci\n          npm test\n"],
       ["data.json", '{"a": [1, 2]}\n'],
+      // Empty trigger keys are valid workflow YAML (the false positive that blocked a real reply).
+      [".github/workflows/any-branch.yml", "name: T\non:\n  push:\n  pull_request:\njobs:\n  t:\n    runs-on: macos-14\n    steps:\n      - run: swift test\n"],
       ["notes.md", "# Title\n\n*emphasis* and `__init__`\n"],
       ["main.js", "export const x = 1;\n"],
     ];

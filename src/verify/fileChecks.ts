@@ -54,16 +54,14 @@ function yamlStructureProblems(content: string): string[] {
       if (!prev || indent <= indentOf(prev)) out.push(`line ${i + 1}: "${body.slice(0, 60)}" is not a "key: value" or "- item" line — the indentation looks lost`);
       continue;
     }
-    if (/:\s*(#.*)?$/.test(body)) {
-      const next = lines.slice(i + 1).find(significant);
-      if (next !== undefined) {
-        const nextIndent = indentOf(next);
-        const listAtSameLevel = nextIndent === indent && next.trimStart().startsWith("-");
-        if (nextIndent <= indent && !listAtSameLevel) {
-          out.push(`line ${i + 1}: "${body}" has nothing nested under it — the indentation looks lost`);
-        }
-      }
-    }
+  }
+  // A key left empty ("push:" in a GitHub workflow) is valid YAML, so one
+  // alone proves nothing. What flattening leaves behind is a whole file with
+  // block-opening keys and not a single indented line.
+  const openers = lines.filter((l) => significant(l) && /^[^\s#-][^#]*:\s*(#.*)?$/.test(l));
+  const indented = lines.some((l) => significant(l) && indentOf(l) > 0);
+  if (openers.length >= 2 && !indented) {
+    out.push(`no line is indented although ${openers.length} keys (e.g. "${openers[0].trim()}") open nested blocks — the indentation looks lost`);
   }
   return out.slice(0, 5);
 }

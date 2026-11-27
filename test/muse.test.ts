@@ -1,5 +1,6 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
+import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
 import { createMuseAgent, createMusePoolAgent } from "../src/agents/muse.js";
 import type { Agent, AgentResponse, TaskContext } from "../src/types.js";
 
@@ -86,6 +87,13 @@ describe("createMuseAgent", () => {
   beforeEach(() => {
     vi.clearAllMocks();
     connectMock.mockResolvedValue(undefined);
+  });
+
+  it("starts each account's server with its own profile and without the HTTP shim, so pooled servers don't fight over port 8787", async () => {
+    callToolMock.mockResolvedValue({ content: [{ type: "text", text: "ok" }] });
+    await createMuseAgent({ serverPath: "/fake/server.mjs", profileDir: "/p2" }).send("hi", { title: "t" } as TaskContext);
+    const env = (vi.mocked(StdioClientTransport).mock.calls[0][0] as any).env;
+    expect(env).toMatchObject({ MUSE_SHIM_PORT: "0", MUSE_PROFILE_DIR: "/p2" });
   });
 
   it("reconnects with a fresh client after the connection dies mid-session, instead of reusing the dead one forever", async () => {

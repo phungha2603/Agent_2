@@ -34,9 +34,16 @@ export function createMuseAgent(opts: { serverPath: string; profileDir?: string;
           const transport = new StdioClientTransport({
             command: "node",
             args: [opts.serverPath],
-            env: opts.profileDir
-              ? { ...processEnvSnapshot(), MUSE_PROFILE_DIR: opts.profileDir }
-              : processEnvSnapshot(),
+            // MUSE_SHIM_PORT=0: muse-server.mjs otherwise also opens an
+            // OpenAI-compatible HTTP shim on fixed port 8787, which this
+            // orchestrator never uses — and with an account pool, every
+            // server after the first failed to bind it and crashed, so all
+            // but one account answered "Connection closed".
+            env: {
+              ...processEnvSnapshot(),
+              MUSE_SHIM_PORT: "0",
+              ...(opts.profileDir ? { MUSE_PROFILE_DIR: opts.profileDir } : {}),
+            },
           });
           const c = new Client({ name: "ai-company-orchestrator", version: "0.1.0" });
           await c.connect(transport);
