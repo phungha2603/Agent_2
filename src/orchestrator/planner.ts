@@ -107,9 +107,9 @@ export function allPlanCommands(baseline: string[], epics: PlanEpic[] = []): str
 }
 
 /**
- * Commands that would pass while the thing they check still fails for the
- * user. The one seen so far: an iOS build for "generic/platform=iOS
- * Simulator" succeeded while Xcode's Run (a concrete simulator) failed.
+ * Commands that check the wrong thing: an iOS build for "generic/platform=iOS
+ * Simulator" succeeded while Xcode's Run (a concrete simulator) failed, and
+ * "python3 -I -m <package>" can never import the project's own code.
  */
 export function commandWarnings(commands: string[]): string[] {
   const out: string[] = [];
@@ -117,6 +117,12 @@ export function commandWarnings(commands: string[]): string[] {
   if (builds.length && builds.every((c) => /generic\/platform=iOS Simulator/i.test(c))) {
     out.push(
       'Lệnh build iOS chỉ dùng "generic/platform=iOS Simulator" — khác với khi bấm Run trong Xcode (một máy cụ thể), có lỗi chỉ hiện ở máy cụ thể. Nên thêm một lệnh build với -destination \'platform=iOS Simulator,name=<tên iPhone>\'.',
+    );
+  }
+  const isolated = commands.filter((c) => /\bpython3?(\.\d+)?\s+(-\w+\s+)*-[a-zA-Z]*[IP]/.test(c) && /\s-(m|c)\s/.test(c));
+  if (isolated.length) {
+    out.push(
+      `Lệnh Python chạy ở chế độ cô lập (-I/-P) sẽ không import được mã của chính dự án, kể cả khi code đúng — bỏ cờ đó: ${isolated.join(" · ")}`,
     );
   }
   return out;
@@ -229,6 +235,7 @@ export function buildPlanPrompt(
     "- Write titles, descriptions, criteria, rationale and inputs in the same language as the goal.",
     "- verifyCommands (top level): the BASELINE shell commands, in order, that every task runs from the project's root directory to build this goal's project and run its tests for real (e.g. \"swift build\", \"swift test\", \"npm test\"). They are the only proof the code works, so they must exercise this goal's own code and its tests — never a placeholder like echo or true. Every task must be able to pass them once its own work is done, so don't put a check here that only a later task can make pass.",
     "- verifyCommands on a subtask or epic: extra commands, run after the baseline, that exercise exactly the files that task writes and the baseline doesn't cover — e.g. \"python3 -m pytest -q content/scripts/test_x.py\", \"bash -n scripts/run.sh\", running a generator script and building what it produces. Every kind of file a task writes (Python, shell, generators, configs) must be exercised by the baseline or by its own commands. All commands run in a disposable copy of the project, so commands with side effects are safe.",
+    "- Never use python3 -I (or -P) in a command that runs or imports the project's own code (python3 -m <package>, python3 -c \"import <package>...\"): isolated mode drops the project directory from sys.path, so the import fails however correct the code is — a task once failed 15 attempts on this alone. Plain python3 runs from the project root, which is what these commands need.",
     "- An iOS app build must target a concrete simulator, the way Xcode's Run does: xcodebuild ... build -destination 'platform=iOS Simulator,name=<an installed iPhone simulator>'. \"generic/platform=iOS Simulator\" alone is not enough — it passed while Run on a real simulator failed.",
     "You have no tools in this step and cannot read any files: plan from the goal text alone. If the goal says files must be read or inspected, that is work for the tasks — each task's architecture step can open the project's files — so put it into their descriptions instead of trying to do it now.",
     "Reply with ONLY one JSON object, no prose before or after, in exactly this shape:",

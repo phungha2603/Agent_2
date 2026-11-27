@@ -174,4 +174,11 @@ describe("per-task verification commands", () => {
     expect(prompt).toMatch(/platform=iOS Simulator,name=/);
     expect(prompt).toMatch(/This machine: installed iOS simulators: iPhone 17\./);
   });
+
+  it("forbids python3 -I for commands that import the project, and warns the CEO when a plan still has one", () => {
+    expect(buildPlanPrompt("goal", DEPTS, { maxEpics: 3, maxSubtasks: 8 })).toMatch(/Never use python3 -I/);
+    expect(commandWarnings(["python3 -I -m footpredict backtest --data tests/fixtures"])).toHaveLength(1);
+    expect(commandWarnings(['python3 -I -c "import footpredict"'])).toHaveLength(1);
+    expect(commandWarnings(["python3 -m footpredict backtest", "python3 -m unittest discover -s tests -v", "python3 -I scripts/check.py"])).toEqual([]);
+  });
 });
