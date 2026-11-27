@@ -23,19 +23,22 @@ describe("compressForClaude", () => {
     expect(out).toEqual(ctx);
   });
 
-  it("replaces a large field with Gemini's summary of it, leaving small fields untouched", async () => {
-    const bigDiff = "L".repeat(5000) + "\nACTUAL CHANGE HERE";
+  it("replaces large review feedback with Gemini's summary, and never sends the diff or the log", async () => {
+    const bigDiff = "D".repeat(50_000);
+    const bigLog = "V".repeat(50_000);
     const gemini = stubGemini((prompt) => {
-      expect(prompt).toContain("=== implementationDiff ===");
-      return { role: "gemini", content: "=== implementationDiff ===\nShort brief: changed X, see ACTUAL CHANGE HERE." };
+      expect(prompt).toContain("=== reviewFeedback ===");
+      expect(prompt).not.toContain("D".repeat(100));
+      expect(prompt).not.toContain("V".repeat(100));
+      return { role: "gemini", content: "=== reviewFeedback ===\nShort brief: fix X." };
     });
-    const ctx: TaskContext = { title: "T", implementationDiff: bigDiff, reviewFeedback: ["small feedback"], acceptanceCriteria: ["a", "b"] };
+    const ctx: TaskContext = { title: "T", implementationDiff: bigDiff, verificationLog: bigLog, reviewFeedback: ["R".repeat(5000)], acceptanceCriteria: ["a", "b"] };
 
     const out = await compressForClaude(gemini, ctx);
-    expect(out.implementationDiff).toBe("Short brief: changed X, see ACTUAL CHANGE HERE.");
-    expect(out.reviewFeedback).toEqual(["small feedback"]); // untouched — wasn't big enough to send for compression
+    expect(out.reviewFeedback).toEqual(["Short brief: fix X."]);
+    expect(out.implementationDiff).toBe(bigDiff); // the reviewer checks the real code
+    expect(out.verificationLog).toBe(bigLog);
     expect(out.acceptanceCriteria).toEqual(["a", "b"]);
-    expect(out.title).toBe("T");
   });
 
   it("never sends architectureSpec to Gemini and never touches it, however large", async () => {
@@ -55,22 +58,18 @@ describe("compressForClaude", () => {
     const failing = stubGemini(() => {
       throw new Error("Gemini API error 503");
     });
-    const ctx: TaskContext = { title: "T", implementationDiff: "V".repeat(5000) };
+    const ctx: TaskContext = { title: "T", reviewFeedback: ["V".repeat(5000)] };
 
     const out = await compressForClaude(failing, ctx);
     expect(out).toEqual(ctx);
   });
 
-  it("keeps a field's original text when Gemini's reply omits that section", async () => {
-    const gemini = stubGemini(() => ({
-      role: "gemini",
-      content: "=== implementationDiff ===\nsummarized diff only", // no "=== reviewFeedback ===" section in the reply
-    }));
+  it("keeps the original feedback when Gemini's reply omits its section", async () => {
+    const gemini = stubGemini(() => ({ role: "gemini", content: "some unrelated reply" }));
     const bigFeedback = "F".repeat(5000);
-    const ctx: TaskContext = { title: "T", implementationDiff: "V".repeat(5000), reviewFeedback: [bigFeedback] };
+    const ctx: TaskContext = { title: "T", reviewFeedback: [bigFeedback] };
 
     const out = await compressForClaude(gemini, ctx);
-    expect(out.implementationDiff).toBe("summarized diff only");
     expect(out.reviewFeedback).toEqual([bigFeedback]); // not silently dropped
   });
 

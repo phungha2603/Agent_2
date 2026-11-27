@@ -3,16 +3,16 @@ import type { Agent, TaskContext } from "../types.js";
 /** Below this, compressing isn't worth an extra Gemini round-trip. */
 const COMPRESS_THRESHOLD_CHARS = 4000;
 
-// The verification log is the reviewer's only proof the code ran, so it is
-// never summarized (Gemini's summaries dropped test names and counts, and
-// reviews rejected work that had passed); pruneContext trims it by code.
-const COMPRESSIBLE_FIELDS = ["implementationDiff", "reviewFeedback"] as const;
+// The verification log and the implementation diff are the reviewer's only
+// evidence, so neither is summarized: Gemini's summaries dropped test names
+// and turned code into prose, and Claude rejected work it could not check.
+// pruneContext trims both by code instead.
+const COMPRESSIBLE_FIELDS = ["reviewFeedback"] as const;
 type CompressibleField = (typeof COMPRESSIBLE_FIELDS)[number];
 
 /**
- * Before a call to Claude, has Gemini compress the bulky, free-form fields
- * (verification logs, implementation diffs, review feedback) into a short
- * brief Claude can act on directly — cutting Claude's input tokens at the
+ * Before a call to Claude, has Gemini compress the bulky, free-form review
+ * feedback into a short brief Claude can act on directly — cutting Claude's input tokens at the
  * cost of one extra Gemini call. `architectureSpec` is always passed
  * through untouched: on an architecture revision Claude diffs against its
  * exact text (see archRevision.ts), so summarizing it would break that.
@@ -34,7 +34,7 @@ export async function compressForClaude(gemini: Agent, context: TaskContext, sig
     "Summarize each of the sections below into a short, concrete brief for another engineer (Claude) to act on directly. " +
     "Keep every specific fact: file names, function names, exact error messages, which acceptance criteria are affected, and the actual root cause of any failure. " +
     "Cut repetition, stack-trace noise, and anything not relevant to deciding what to do next. " +
-    "Reply with exactly one section per input, in the same order, each starting on its own line with its exact header unchanged (e.g. \"=== implementationDiff ===\").\n\n" +
+    "Reply with exactly one section per input, in the same order, each starting on its own line with its exact header unchanged (e.g. \"=== reviewFeedback ===\").\n\n" +
     candidates.map((c) => `=== ${c.field} ===\n${c.text}`).join("\n\n");
 
   let reply: string;
@@ -49,8 +49,7 @@ export async function compressForClaude(gemini: Agent, context: TaskContext, sig
     const re = new RegExp(`===\\s*${field}\\s*===\\s*([\\s\\S]*?)(?=\\n===|$)`);
     const summary = re.exec(reply)?.[1]?.trim();
     if (!summary) continue; // Gemini's reply didn't include this section — keep the original rather than lose it
-    if (field === "reviewFeedback") compressed.reviewFeedback = [summary];
-    else compressed[field] = summary;
+    compressed[field] = [summary];
   }
   return compressed;
 }
