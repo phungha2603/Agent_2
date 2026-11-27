@@ -63,6 +63,16 @@ app.get("/api/scoreboard", route(async (_req, res) => res.json(await company.sco
 app.get("/api/roles/:id", route(async (req, res) => res.json(await company.roleDetail(req.params.id))));
 app.get("/api/tasks/:id/detail", route(async (req, res) => res.json(await company.taskDetail(req.params.id))));
 app.get("/api/artifacts", route(async (_req, res) => res.json(await company.listArtifacts())));
+app.get("/api/projects", route(async (_req, res) => res.json(await company.projects())));
+app.get("/api/projects/:id/guide", route(async (req, res) => {
+  const guide = await company.projectGuide(req.params.id);
+  if (req.query.download) {
+    res.setHeader("Content-Disposition", `attachment; filename="${guide.filename.replace(/"/g, "")}"`);
+    res.type("text/markdown").send(guide.content);
+  } else {
+    res.json(guide);
+  }
+}));
 app.get("/api/artifacts/content", route(async (req, res) => {
   const art = await company.artifactContent(String(req.query.taskId), String(req.query.kind) as any, str(req.query.path));
   if (req.query.download) {

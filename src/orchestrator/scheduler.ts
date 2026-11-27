@@ -38,6 +38,7 @@ import {
   type WorkPlanRecord,
 } from "./planner.js";
 import { parseFileBlocks } from "../apply/applyFiles.js";
+import { buildRunGuide } from "./runGuide.js";
 import { buildRebalancePrompt, parseRebalance, type LoadSlot, type RebalanceProposal } from "./rebalance.js";
 import { listAllTasks, loadTask, saveTask, taskExists } from "../store/taskStore.js";
 import { loadPlan, savePlan } from "../store/planStore.js";
@@ -219,6 +220,8 @@ export interface Insights {
 export interface ArtifactInfo {
   id: string;
   taskId: string;
+  /** The plan (project) the task belongs to; absent for a task given directly to a slot. */
+  planId?: string;
   slotId?: string;
   taskTitle: string;
   kind: "brief" | "spec" | "file" | "verification";
@@ -281,6 +284,30 @@ export class UserError extends Error {}
 export function shipWarnings(task: TaskRecord): string[] {
   if (task.stage !== "checkpoint_final") return [];
   return (task.alerts ?? []).filter((a) => a.level === "warn").map((a) => a.text);
+}
+
+export interface ProjectSummary {
+  id: string;
+  title: string;
+  goal: string;
+  dir?: string;
+  githubUrl?: string;
+  createdAt: string;
+  /** Set once every task of the plan is done. */
+  finishedAt?: string;
+  active: boolean;
+  tasks: { done: number; total: number };
+}
+
+/** A goal's first sentence, short enough for a tab: "Xây dựng "FootPredict" — hệ thống…" */
+function projectTitle(goal: string): string {
+  const first = goal.trim().split("\n")[0].split(/(?<=[.:!?])\s/)[0].trim();
+  return first.length > 80 ? `${first.slice(0, 77)}…` : first;
+}
+
+/** Older plans have no project folder of their own; their tasks still record where they ran. */
+function projectDirOf(plan: WorkPlanRecord, tasks: TaskRecord[]): string | undefined {
+  return plan.project?.dir || tasks.map((t) => t.projectConfig?.verifyCwd).find(Boolean);
 }
 
 function directiveApplies(d: Directive, task: TaskRecord): boolean {
@@ -1167,7 +1194,10 @@ export class Company extends EventEmitter {
 
   async telemetry(index?: Index): Promise<Telemetry> {
     const idx = index ?? (await this.index());
-    const tasks = [...idx.values()];
+    const plan = await this.activePlan();
+    // Only the current project: earlier plans' tasks stay in the queues
+    // (and on the board) but would otherwise inflate its counts and cost.
+    const tasks = [...idx.values()].filter((x) => !plan || !x.planRef || x.planRef.planId === plan.id);
     const t: Telemetry = {
       paused: this.state.paused,
       runStartedAt: null,
@@ -1181,7 +1211,6 @@ export class Company extends EventEmitter {
       tokensEstimated: false,
     };
     let progress = 0;
-    const plan = await this.activePlan();
     const starts = tasks.map((x) => x.createdAt);
     if (plan) starts.push(plan.createdAt);
     t.runStartedAt = starts.length ? starts.sort()[0] : null;
@@ -1318,7 +1347,7 @@ export class Company extends EventEmitter {
     const idx = await this.index();
     for (const task of idx.values()) {
       if (onlyTaskId && task.id !== onlyTaskId) continue;
-      const base = { taskId: task.id, slotId: task.slotId ?? this.slotOf(task.id), taskTitle: task.context.title, updatedAt: task.updatedAt };
+      const base = { taskId: task.id, planId: task.planRef?.planId, slotId: task.slotId ?? this.slotOf(task.id), taskTitle: task.context.title, updatedAt: task.updatedAt };
       const c = task.context;
       if (c.ideaBrief) out.push({ ...base, id: `${task.id}::brief`, kind: "brief", title: "Idea brief", size: c.ideaBrief.length });
       if (c.architectureSpec) out.push({ ...base, id: `${task.id}::spec`, kind: "spec", title: "Architecture guide", size: c.architectureSpec.length });
@@ -1328,6 +1357,55 @@ export class Company extends EventEmitter {
       if (c.verificationLog) out.push({ ...base, id: `${task.id}::verification`, kind: "verification", title: "Verification log", size: c.verificationLog.length });
     }
     return out.sort((a, b) => b.updatedAt.localeCompare(a.updatedAt));
+  }
+
+  /** Every plan that produced tasks, newest first, with its own task counts — the "projects" of the products view. */
+  async projects(): Promise<ProjectSummary[]> {
+    const byPlan = new Map<string, TaskRecord[]>();
+    for (const task of await listAllTasks()) {
+      const id = task.planRef?.planId;
+      if (!id) continue;
+      if (!byPlan.has(id)) byPlan.set(id, []);
+      byPlan.get(id)!.push(task);
+    }
+    const out: ProjectSummary[] = [];
+    for (const [id, tasks] of byPlan) {
+      const plan = await loadPlan(id);
+      if (!plan) continue;
+      const done = tasks.filter((t) => t.stage === "done").length;
+      const finished = done === tasks.length;
+      out.push({
+        id,
+        title: projectTitle(plan.goal ?? id),
+        goal: plan.goal ?? "",
+        dir: projectDirOf(plan, tasks),
+        githubUrl: plan.project?.githubUrl,
+        createdAt: plan.createdAt ?? tasks.map((t) => t.createdAt).sort()[0],
+        finishedAt: finished ? tasks.map((t) => t.updatedAt).sort().at(-1) : undefined,
+        active: id === this.state.activePlanId,
+        tasks: { done, total: tasks.length },
+      });
+    }
+    return out.sort((a, b) => b.createdAt.localeCompare(a.createdAt));
+  }
+
+  /** How to run a finished project, built from its plan and its folder (README, stack markers). */
+  async projectGuide(planId: string): Promise<{ title: string; content: string; filename: string }> {
+    const project = (await this.projects()).find((p) => p.id === planId);
+    if (!project) throw new UserError(`Không tìm thấy dự án ${planId}.`);
+    if (!project.finishedAt) throw new UserError("Dự án chưa hoàn tất — hướng dẫn chạy có khi mọi task đã xong.");
+    const plan = (await loadPlan(planId))!;
+    const content = buildRunGuide({
+      title: project.title,
+      goal: project.goal,
+      dir: project.dir,
+      githubUrl: project.githubUrl,
+      verifyCommands: plan.project?.verifyCommands ?? [],
+      tasks: project.tasks,
+      finishedAt: project.finishedAt,
+    });
+    const slug = (project.dir ? path.basename(project.dir) : planId).replace(/[^a-zA-Z0-9._-]+/g, "_").slice(0, 60);
+    return { title: "Hướng dẫn chạy", content, filename: `HUONG_DAN_CHAY-${slug}.md` };
   }
 
   /** A task's own version of an artifact (files come from its own implementation reply, not whatever is on disk now). */

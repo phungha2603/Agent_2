@@ -83,7 +83,7 @@ const state = {
   /** ids of <details> the user opened, so re-renders keep them open */
   open: new Set(),
   drawer: { taskId: null, tab: "overview", detail: null, sig: "" },
-  artifacts: { list: [], selected: null, agent: "", q: "" },
+  artifacts: { list: [], projects: [], project: null, selected: null, agent: "", q: "" },
   timeline: null,
   rebalance: null,
   /** Composer ("Dự án mới") open state: null = follow the plan automatically, true/false = the user's choice until the plan changes. */
@@ -1502,19 +1502,74 @@ function niceStep(ms) {
 // ---------- artifacts hub ----------
 async function loadArtifacts() {
   try {
-    state.artifacts.list = await fetch("/api/artifacts").then((r) => r.json());
+    const [list, projects] = await Promise.all([fetch("/api/artifacts").then((r) => r.json()), fetch("/api/projects").then((r) => r.json())]);
+    state.artifacts.list = list;
+    state.artifacts.projects = projects;
     renderArtifacts();
   } catch {
     /* ignore */
   }
 }
 const refreshArtifacts = debounce(() => state.view === "artifacts" && loadArtifacts(), 2000);
-const KIND_ICON = { brief: "💡", spec: "📐", file: "📄", verification: "🧪" };
+const KIND_ICON = { brief: "💡", spec: "📐", file: "📄", verification: "🧪", guide: "📘" };
+/** "__none" = tasks given straight to a slot, outside any plan. */
+const NO_PROJECT = "__none";
+
+/** The selected project, defaulting to the active one (else the newest). */
+function currentProject() {
+  const a = state.artifacts;
+  const ids = a.projects.map((p) => p.id);
+  if (a.project === NO_PROJECT && a.list.some((x) => !x.planId)) return NO_PROJECT;
+  if (a.project && ids.includes(a.project)) return a.project;
+  return (a.projects.find((p) => p.active) ?? a.projects[0])?.id ?? NO_PROJECT;
+}
+
+function projectBar(pid) {
+  const a = state.artifacts;
+  const chips = a.projects.map((p) => {
+    const done = p.tasks.done === p.tasks.total;
+    return `<button class="proj-chip${p.id === pid ? " selected" : ""}" data-action="project-select" data-id="${esc(p.id)}" title="${esc(p.goal)}">${p.active ? '<span class="proj-dot" title="Dự án hiện tại"></span>' : ""}<span class="proj-name">${esc(p.title)}</span><span class="proj-count${done ? " done" : ""}">${done ? "✓ " : ""}${p.tasks.done}/${p.tasks.total}</span></button>`;
+  });
+  if (a.list.some((x) => !x.planId)) chips.push(`<button class="proj-chip${pid === NO_PROJECT ? " selected" : ""}" data-action="project-select" data-id="${NO_PROJECT}"><span class="proj-name">Task lẻ (ngoài kế hoạch)</span></button>`);
+  return `<div class="proj-bar">${chips.join("") || `<span class="muted">Chưa có dự án nào.</span>`}</div>`;
+}
+
+function projectCard(pid) {
+  const p = state.artifacts.projects.find((x) => x.id === pid);
+  if (!p) return "";
+  const done = Boolean(p.finishedAt);
+  const guideSel = state.artifacts.selected?.kind === "guide" && state.artifacts.selected.planId === p.id;
+  return `<div class="proj-card">
+      <div class="proj-card-main">
+        <div class="proj-card-title">${esc(p.title)}${p.active ? ' <span class="pill">Dự án hiện tại</span>' : ""}</div>
+        <div class="muted small">${done ? `Hoàn tất ${fmtTime(p.finishedAt)}` : `Đang làm — ${p.tasks.done}/${p.tasks.total} task xong`}${p.dir ? ` · <code>${esc(p.dir)}</code>` : ""}</div>
+      </div>
+      <div class="proj-card-actions">
+        ${p.githubUrl ? `<a class="btn btn-soft" href="${esc(p.githubUrl)}" target="_blank" rel="noopener">GitHub ↗</a>` : ""}
+        ${
+          done
+            ? `<button class="btn ${guideSel ? "btn-soft" : "btn-primary"}" data-action="project-guide" data-id="${esc(p.id)}">📘 Hướng dẫn chạy</button>`
+            : `<button class="btn btn-soft" disabled title="Có khi mọi task của dự án đã xong">📘 Hướng dẫn chạy</button>`
+        }
+      </div>
+    </div>`;
+}
+
+async function previewGuide(planId) {
+  state.artifacts.selected = { id: `guide::${planId}`, kind: "guide", planId, title: "Hướng dẫn chạy" };
+  renderArtifacts();
+  const data = await fetch(`/api/projects/${encodeURIComponent(planId)}/guide`).then((r) => r.json());
+  if (state.artifacts.selected?.id !== `guide::${planId}`) return;
+  state.artifacts.selected.content = data.content ?? data.error;
+  $("#art-preview").innerHTML = artifactPreview();
+}
 
 function renderArtifacts() {
   const el = $("#view-artifacts");
   const a = state.artifacts;
-  const list = a.list.filter((x) => (!a.agent || x.slotId === a.agent) && (!a.q || `${x.title} ${x.taskTitle}`.toLowerCase().includes(a.q.toLowerCase())));
+  const pid = currentProject();
+  const inProject = (x) => (pid === NO_PROJECT ? !x.planId : x.planId === pid);
+  const list = a.list.filter((x) => inProject(x) && (!a.agent || x.slotId === a.agent) && (!a.q || `${x.title} ${x.taskTitle}`.toLowerCase().includes(a.q.toLowerCase())));
   const groups = new Map();
   for (const x of list) {
     const k = `${x.slotId ?? "?"}|${x.taskId}`;
@@ -1525,6 +1580,8 @@ function renderArtifacts() {
   const prevSearch = $("#art-search");
   const hadFocus = prevSearch && document.activeElement === prevSearch;
   el.innerHTML = `
+    ${projectBar(pid)}
+    ${projectCard(pid)}
     <div class="art-layout">
       <div class="art-list">
         <div class="art-filters">
@@ -1551,6 +1608,13 @@ function renderArtifacts() {
 function artifactPreview() {
   const sel = state.artifacts.selected;
   if (!sel) return `<div class="muted">Chọn một sản phẩm bên trái để xem trước, tải về, hoặc gửi cho nhân sự khác làm đầu vào.</div>`;
+  if (sel.kind === "guide") {
+    return `
+    <div class="art-head"><b>📘 Hướng dẫn chạy</b> <span class="muted small">tự sinh từ kế hoạch, thư mục và README của dự án</span>
+      <span class="art-actions"><a class="btn btn-small-inline" href="/api/projects/${encodeURIComponent(sel.planId)}/guide?download=1">⬇ Tải về (.md)</a></span>
+    </div>
+    <pre class="art-content">${esc(sel.content ?? "Đang tải…")}</pre>`;
+  }
   const q = `taskId=${encodeURIComponent(sel.taskId)}&kind=${sel.kind}${sel.path ? `&path=${encodeURIComponent(sel.path)}` : ""}`;
   return `
     <div class="art-head"><b>${KIND_ICON[sel.kind]} ${esc(sel.title)}</b> <span class="muted small">từ ${esc(sel.slotId)} · ${esc(sel.taskTitle)}</span>
@@ -1895,6 +1959,12 @@ document.addEventListener("click", async (e) => {
       return sendModal(ds);
     case "artifact-preview":
       return previewArtifact(ds.id);
+    case "project-select":
+      state.artifacts.project = ds.id;
+      state.artifacts.selected = null;
+      return renderArtifacts();
+    case "project-guide":
+      return previewGuide(ds.id);
     case "modal-close":
       return closeModal();
     case "expand":

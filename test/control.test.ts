@@ -389,6 +389,25 @@ describe("artifacts, traces and telemetry", () => {
     expect(call.ctx.attachments![0].from).toMatch(/^AG-03/);
   });
 
+  it("counts only the current plan's tasks, and lists each plan as its own project", async () => {
+    const { c } = await setup();
+    const plan = await c.startPlan("first goal. More detail here");
+    await waitFor(async () => (await c.planSnapshot())?.status === "awaiting_approval");
+    await c.decidePlan(plan.id, true, undefined, { handoffOn: "checkpoint_final" });
+    await waitFor(async () => (await c.telemetry()).counts.total === 9, 15000);
+
+    const [project] = await c.projects();
+    expect(project).toMatchObject({ id: plan.id, title: "first goal.", active: true, tasks: { total: 9 } });
+    expect(project.finishedAt).toBeUndefined();
+    await expect(c.projectGuide(plan.id)).rejects.toThrow(/chưa hoàn tất/);
+    expect((await c.listArtifacts()).every((x: any) => x.planId === plan.id)).toBe(true);
+
+    await c.stop();
+    await c.startPlan("second goal");
+    expect((await c.telemetry()).counts.total).toBe(0); // the first plan's 9 tasks no longer count
+    expect((await c.projects()).find((p: any) => p.id === plan.id).active).toBe(false);
+  });
+
   it("records stage runs, tokens, full prompts, the decision trace and the critical path", async () => {
     const { c } = await setup();
     await c.setGate("AG-08", false);
