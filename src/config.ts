@@ -39,7 +39,7 @@ function geminiApiKeys(): string[] {
  * MUSE_PROFILE_DIR), so that many chats run at once. Falls back to the
  * single MUSE_PROFILE_DIR (or none, the server's own default profile).
  */
-function museProfileDirs(): (string | undefined)[] {
+export function museProfileDirs(): (string | undefined)[] {
   const pool = (process.env.MUSE_PROFILE_DIRS ?? "")
     .split(",")
     .map((s) => s.trim())
@@ -130,6 +130,10 @@ export function buildPipelineConfig(): PipelineConfig {
     maxArchitectureRounds: num("MAX_ARCHITECTURE_ROUNDS", 20),
     maxAutoRecoveries: num("MAX_AUTO_RECOVERIES", 1),
     isolation: buildIsolationConfig(),
+    claudeModels: {
+      architecture: process.env.CLAUDE_MODEL_ARCHITECTURE || undefined,
+      review: process.env.CLAUDE_MODEL_REVIEW || undefined,
+    },
     visual: buildVisualConfig(),
   };
 }
@@ -172,6 +176,7 @@ export function buildSchedulerSettings(): SchedulerSettings {
     stageErrorBackoffMs: [5000, 20000, 60000],
     handoffOn,
     planMaxRounds: Math.max(1, num("PLAN_MAX_REVIEW_ROUNDS", 3)),
+    planModel: process.env.CLAUDE_MODEL_PLAN || undefined,
     planLimits: { maxEpics: Math.max(1, num("PLAN_MAX_EPICS", 3)), maxSubtasks: Math.max(1, num("PLAN_MAX_SUBTASKS", 8)) },
     prices: { claude: price("CLAUDE"), gemini: price("GEMINI") },
   };

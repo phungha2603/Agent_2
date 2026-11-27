@@ -171,11 +171,20 @@ app.post("/api/control/stop", route(async (_req, res) => ok(res, await company.s
 app.post("/api/run-all", route(async (req, res) => {
   const goal = (str(req.body?.goal) ?? "").trim();
   if (!goal) return res.status(400).json({ error: "Thiếu mục tiêu." });
-  const plan = await company.startPlan(goal, str(req.body?.projectDir));
+  const plan = await company.startPlan(goal, str(req.body?.projectDir), {
+    autoApprove: req.body?.autoApprove === true,
+    skipClaudeReviewWhenGreen: req.body?.skipClaudeReviewWhenGreen === true,
+  });
   ok(res, { planId: plan.id });
 }));
 /** { dir?, verifyCommands? } from a request body — commands as a list or as one command per line. */
-function planProject(body: any): { dir?: string; verifyCommands?: string[]; handoffOn?: "done" | "checkpoint_final"; autoApprove?: boolean } {
+function planProject(body: any): {
+  dir?: string;
+  verifyCommands?: string[];
+  handoffOn?: "done" | "checkpoint_final";
+  autoApprove?: boolean;
+  skipClaudeReviewWhenGreen?: boolean;
+} {
   const dir = str(body?.projectDir);
   const raw = body?.verifyCommands;
   const verifyCommands = Array.isArray(raw)
@@ -186,7 +195,8 @@ function planProject(body: any): { dir?: string; verifyCommands?: string[]; hand
   const handoff = str(body?.handoffOn);
   const handoffOn = handoff === "done" || handoff === "checkpoint_final" ? handoff : undefined;
   const autoApprove = typeof body?.autoApprove === "boolean" ? body.autoApprove : undefined;
-  return { dir, verifyCommands, handoffOn, autoApprove };
+  const skipClaudeReviewWhenGreen = typeof body?.skipClaudeReviewWhenGreen === "boolean" ? body.skipClaudeReviewWhenGreen : undefined;
+  return { dir, verifyCommands, handoffOn, autoApprove, skipClaudeReviewWhenGreen };
 }
 app.post("/api/plan/:id/project", route(async (req, res) => ok(res, await company.updatePlanProject(req.params.id, planProject(req.body)))));
 app.post("/api/plan/:id/decision", route(async (req, res) =>

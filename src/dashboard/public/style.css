@@ -46,7 +46,10 @@ body {
 .brand h1 { font-size: 18px; margin: 0; }
 .topbar-sub { margin: 4px 0 0; font-size: 12px; color: var(--text-dim); max-width: 640px; }
 .command { display: flex; flex-wrap: wrap; gap: 8px; flex: 2 1 560px; justify-content: flex-end; }
-#goal-input {
+.goal-options { display: flex; gap: 12px; align-items: center; font-size: 12px; color: var(--text-dim); }
+.goal-options .check { display: inline-flex; gap: 4px; align-items: center; cursor: pointer; }
+#goal-input,
+#project-dir-input {
   flex: 1;
   min-width: 220px;
   background: var(--panel);

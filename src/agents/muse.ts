@@ -18,7 +18,7 @@ import { formatContext } from "./context.js";
  * streams), so onChunk is never called — the dashboard shows elapsed time
  * instead.
  */
-export function createMuseAgent(opts: { serverPath: string; profileDir?: string; timeoutSec?: number }): Agent {
+export function createMuseAgent(opts: { serverPath: string; profileDir?: string; timeoutSec?: number }): PoolAccount {
   let clientPromise: Promise<Client> | null = null;
   // A previous dead client's close() in flight — Chrome's user-data-dir
   // carries a lock file, so spawning the next muse-server.mjs for the same
@@ -59,6 +59,15 @@ export function createMuseAgent(opts: { serverPath: string; profileDir?: string;
 
   return {
     role: "muse",
+    label: opts.profileDir ? opts.profileDir.split("/").pop() : "default profile",
+    /** Opens this account's browser if needed and asks muse.ai who is logged in. */
+    async identity(): Promise<MuseIdentity> {
+      const c = await getClient();
+      const res = await c.callTool({ name: "muse_status", arguments: { launch: true } }, undefined, { timeout: 120_000 });
+      const raw = Array.isArray(res.content) ? res.content.filter((b: any) => b.type === "text").map((b: any) => b.text).join("\n") : "";
+      const parsed = JSON.parse(raw);
+      return { loggedIn: Boolean(parsed.loggedIn), viewerId: parsed.viewerId ?? null };
+    },
     async close(): Promise<void> {
       const pending = clientPromise;
       clientPromise = null;
@@ -153,29 +162,85 @@ export function museReplyOrThrow(parsed: { reply: string; replyFormat?: string; 
  * `museConcurrency` setting, which should match the pool size so the
  * scheduler actually lets that many calls through.
  */
-export function createMusePoolAgent(pool: Agent[], opts: { cooldownMs?: number; now?: () => number } = {}): Agent {
+/** What a pooled Muse account is: logged in or not, and which Muse user (viewer) it is. */
+export interface MuseIdentity {
+  loggedIn: boolean;
+  viewerId?: string | null;
+}
+
+export type PoolAccount = Agent & { identity?: () => Promise<MuseIdentity>; label?: string };
+
+export function createMusePoolAgent(pool: PoolAccount[], opts: { cooldownMs?: number; now?: () => number; warn?: (msg: string) => void } = {}): Agent {
   if (pool.length === 0) throw new Error("createMusePoolAgent requires at least one agent");
-  const idle: number[] = pool.map((_, i) => i);
-  const waiters: ((index: number) => void)[] = [];
   const cooldownMs = opts.cooldownMs ?? 10 * 60_000;
   const now = opts.now ?? Date.now;
+  const warn = opts.warn ?? ((m: string) => console.warn(m));
   // An account whose last call failed (stuck chat, dead session) is passed
   // over while another is free — otherwise the retry lands on the same
   // stuck account every time, since the first idle one is always picked.
   const failedAt = new Map<number, number>();
   const cooling = (i: number) => (failedAt.get(i) ?? -Infinity) > now() - cooldownMs;
 
-  function acquire(): Promise<number> {
-    if (idle.length) {
-      const pick = idle.findIndex((i) => !cooling(i));
-      return Promise.resolve(idle.splice(pick === -1 ? 0 : pick, 1)[0]);
+  // Two browser profiles logged in to the same Muse user share one chat
+  // thread: running them at once mixes the two tasks' conversations. So
+  // profiles are grouped by viewer and only one per viewer runs at a time;
+  // a profile that isn't logged in is left out.
+  const viewerOf = new Map<number, string>();
+  const excluded = new Set<number>();
+  let probed: Promise<void> | null = null;
+  const probe = () =>
+    (probed ??= (async () => {
+      for (let i = 0; i < pool.length; i++) {
+        const name = pool[i].label ?? `account ${i + 1}`;
+        try {
+          const id = await pool[i].identity?.();
+          if (id && !id.loggedIn) {
+            excluded.add(i);
+            warn(`Muse ${name} is not logged in — left out of the pool (log it in with npm run muse:login).`);
+          } else {
+            viewerOf.set(i, id?.viewerId ? String(id.viewerId) : `#${i}`);
+          }
+        } catch (err) {
+          viewerOf.set(i, `#${i}`);
+          warn(`Muse ${name}: could not check its login (${(err as Error).message.slice(0, 120)}) — kept, treated as its own account.`);
+        }
+      }
+      if (excluded.size === pool.length) excluded.clear(); // nothing usable: let the real error surface
+      const byViewer = new Map<string, number[]>();
+      for (const [i, v] of viewerOf) byViewer.set(v, [...(byViewer.get(v) ?? []), i]);
+      for (const ids of byViewer.values()) {
+        if (ids.length > 1) {
+          warn(`Muse ${ids.map((i) => pool[i].label ?? `account ${i + 1}`).join(" and ")} are the same Muse user — they will never run at the same time.`);
+        }
+      }
+    })());
+
+  const busy = new Set<number>();
+  const busyViewers = new Set<string>();
+  const waiters: (() => void)[] = [];
+
+  function tryTake(): number | undefined {
+    const free = pool
+      .map((_, i) => i)
+      .filter((i) => !busy.has(i) && !excluded.has(i) && !busyViewers.has(viewerOf.get(i) ?? `#${i}`));
+    if (!free.length) return undefined;
+    const pick = free.find((i) => !cooling(i)) ?? free[0];
+    busy.add(pick);
+    busyViewers.add(viewerOf.get(pick) ?? `#${pick}`);
+    return pick;
+  }
+  async function acquire(): Promise<number> {
+    await probe();
+    for (;;) {
+      const i = tryTake();
+      if (i !== undefined) return i;
+      await new Promise<void>((resolve) => waiters.push(resolve));
     }
-    return new Promise((resolve) => waiters.push(resolve));
   }
   function release(index: number): void {
-    const waiter = waiters.shift();
-    if (waiter) waiter(index);
-    else idle.push(index);
+    busy.delete(index);
+    busyViewers.delete(viewerOf.get(index) ?? `#${index}`);
+    for (const wake of waiters.splice(0)) wake();
   }
 
   return {

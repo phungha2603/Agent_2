@@ -166,7 +166,7 @@ function planProjectBlock(plan, editable) {
   const warnings = [...(p.warnings ?? []), ...(p.commandWarnings ?? [])].map((w) => `<div class="feedback-box is-error">⚠ ${esc(w)}</div>`).join("");
   const missing = !p.verifyCommands?.length ? `<div class="feedback-box is-error">⚠ Chưa có lệnh kiểm tra — không duyệt được cho tới khi điền.</div>` : "";
   if (!editable) {
-    return `<div class="plan-project small"><div>📁 <code>${esc(p.dir || "(chưa chọn)")}</code>${p.autoApprove ? ` · <span class="why">⚡ tự duyệt khi xanh</span>` : ""}</div><div>🧪 ${p.verifyCommands?.length ? p.verifyCommands.map((c) => `<code>${esc(c)}</code>`).join(" → ") : "<em>chưa có lệnh</em>"}</div>${warnings}${missing}</div>`;
+    return `<div class="plan-project small"><div>📁 <code>${esc(p.dir || "(chưa chọn)")}</code>${p.autoApprove ? ` · <span class="why">⚡ tự duyệt khi xanh</span>` : ""}${p.skipClaudeReviewWhenGreen ? ` · <span class="why">bỏ Claude review khi xanh</span>` : ""}</div><div>🧪 ${p.verifyCommands?.length ? p.verifyCommands.map((c) => `<code>${esc(c)}</code>`).join(" → ") : "<em>chưa có lệnh</em>"}</div>${warnings}${missing}</div>`;
   }
   return `<div class="plan-project">
     <label class="panel-sub">Thư mục dự án (Muse ghi code vào đây, lệnh kiểm tra chạy ở đây)</label>
@@ -180,6 +180,7 @@ function planProjectBlock(plan, editable) {
       <option value="checkpoint_final"${p.handoffOn === "checkpoint_final" ? " selected" : ""}>Ngay khi task trước chờ duyệt (nhanh hơn)</option>
     </select>
     <label class="check"><input type="checkbox" data-plan-autoapprove="${esc(plan.id)}"${p.autoApprove ? " checked" : ""} /> Tự duyệt task khi mọi thứ xanh (qua kiểm tra, Gemini & Claude đều duyệt, không cảnh báo đỏ) — task có cảnh báo vẫn chờ bạn; dự án có git thì mỗi task là một commit, hoàn tác được</label>
+    <label class="check"><input type="checkbox" data-plan-skipreview="${esc(plan.id)}"${p.skipClaudeReviewWhenGreen ? " checked" : ""} /> Bỏ Claude review khi Gemini đã duyệt và không có cảnh báo đỏ (task nghiệm thu và yêu cầu sửa của bạn luôn qua Claude)</label>
     <div class="row-inline"><button class="btn btn-small-inline" data-action="plan-project-save" data-plan="${esc(plan.id)}">Lưu thư mục & lệnh</button></div>
   </div>`;
 }
@@ -194,6 +195,8 @@ function planProjectInputs(planId) {
   if (handoff) out.handoffOn = handoff.value;
   const auto = document.querySelector(`[data-plan-autoapprove="${CSS.escape(planId)}"]`);
   if (auto) out.autoApprove = auto.checked;
+  const skip = document.querySelector(`[data-plan-skipreview="${CSS.escape(planId)}"]`);
+  if (skip) out.skipClaudeReviewWhenGreen = skip.checked;
   return out;
 }
 
@@ -1728,7 +1731,9 @@ $("#run-all-btn").addEventListener("click", async () => {
   if (!goal) return toast("Nhập mục tiêu chung cho cả công ty trước đã.");
   const projectDir = $("#project-dir-input").value.trim();
   if (!projectDir) return toast("Nhập thư mục dự án (đường dẫn tuyệt đối) — nơi code của mục tiêu này được ghi và kiểm tra.");
-  if (await post("/api/run-all", { goal, projectDir })) toast("Đã giao mục tiêu cho Sếp — đang lập cây công việc.");
+  const autoApprove = $("#opt-autoapprove").checked;
+  const skipClaudeReviewWhenGreen = $("#opt-skipreview").checked;
+  if (await post("/api/run-all", { goal, projectDir, autoApprove, skipClaudeReviewWhenGreen })) toast("Đã giao mục tiêu cho Sếp — đang lập cây công việc.");
 });
 $("#pause-btn").addEventListener("click", async () => {
   await post(state.control.paused ? "/api/control/resume" : "/api/control/pause");

@@ -74,6 +74,8 @@ export interface PlanProject {
    * turns it on for the plan.
    */
   autoApprove?: boolean;
+  /** Skip Claude's final review on a subtask Gemini approved with nothing flagged (integration tasks and CEO revisions always get it). */
+  skipClaudeReviewWhenGreen?: boolean;
 }
 
 /** Every verification command in a plan: the baseline, plus each epic's and subtask's own. */

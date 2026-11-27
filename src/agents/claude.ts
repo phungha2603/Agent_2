@@ -32,7 +32,7 @@ export function createClaudeAgent(opts: { apiKey: string; model?: string }): Age
             "anthropic-version": "2023-06-01",
           },
           body: JSON.stringify({
-            model,
+            model: sendOpts?.model ?? model,
             max_tokens: MAX_TOKENS,
             stream: Boolean(onChunk),
             messages: [{ role: "user", content: `${prompt}\n\n${formatContext(context)}` }],

@@ -105,7 +105,10 @@ export function createClaudeCliAgent(
 ): Agent {
   const bin = opts.command ?? "claude";
   const timeoutMs = (opts.timeoutSec ?? 900) * 1000;
-  const modelArgs = opts.model ? ["--model", opts.model] : [];
+  const modelArgs = (call: { model?: string }) => {
+    const m = call.model ?? opts.model;
+    return m ? ["--model", m] : [];
+  };
   let streaming = opts.stream ?? true;
   const toolsSetting = opts.tools ?? "";
   // An old CLI that doesn't know these flags falls back to the full CLI instead of failing every call.
@@ -117,6 +120,7 @@ export function createClaudeCliAgent(
     cwd?: string;
     tools: string;
     maxTurns?: number;
+    model?: string;
   }
   const turnArgs = (call: CallSetup) => (lean && call.tools && call.maxTurns ? ["--max-turns", String(call.maxTurns)] : []);
 
@@ -142,7 +146,7 @@ export function createClaudeCliAgent(
     };
     const proc = await runCli(
       bin,
-      ["-p", "--output-format", "stream-json", "--verbose", "--include-partial-messages", ...modelArgs, ...leanArgs(call.tools), ...turnArgs(call)],
+      ["-p", "--output-format", "stream-json", "--verbose", "--include-partial-messages", ...modelArgs(call), ...leanArgs(call.tools), ...turnArgs(call)],
       input,
       call.cwd,
       timeoutMs,
@@ -161,7 +165,7 @@ export function createClaudeCliAgent(
   }
 
   async function runPlain(input: string, call: CallSetup, onChunk?: (t: string) => void, signal?: AbortSignal): Promise<{ text: string; usage?: Usage }> {
-    const proc = await runCli(bin, ["-p", ...modelArgs, ...leanArgs(call.tools), ...turnArgs(call)], input, call.cwd, timeoutMs, undefined, signal);
+    const proc = await runCli(bin, ["-p", ...modelArgs(call), ...leanArgs(call.tools), ...turnArgs(call)], input, call.cwd, timeoutMs, undefined, signal);
     if (proc.code !== 0) {
       if (call.maxTurns && /max(imum)?[ _-]?turns/i.test(`${proc.stdout}\n${proc.stderr}`)) {
         throw new MaxTurnsReached(`claude CLI used up its ${call.maxTurns} turns before answering`);
@@ -183,7 +187,7 @@ export function createClaudeCliAgent(
       // names it, else the configured default.
       const input = `${prompt}\n\n${formatContext(context)}`;
       const signal = sendOpts?.signal;
-      const call: CallSetup = { cwd: sendOpts?.cwd ?? opts.cwd, tools: sendOpts?.tools ?? toolsSetting, maxTurns: sendOpts?.maxTurns };
+      const call: CallSetup = { cwd: sendOpts?.cwd ?? opts.cwd, tools: sendOpts?.tools ?? toolsSetting, maxTurns: sendOpts?.maxTurns, model: sendOpts?.model };
       const attempt = async (): Promise<{ text: string; usage?: Usage }> => {
         if (!streaming) return runPlain(input, call, sendOpts?.onChunk, signal);
         try {

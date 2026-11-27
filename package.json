@@ -10,6 +10,7 @@
     "dashboard": "tsx src/dashboard/server.ts",
     "start": "tsx src/dashboard/server.ts",
     "muse:login": "tsx src/scripts/museLogin.ts",
+    "muse:accounts": "tsx src/scripts/museAccounts.ts",
     "usage": "tsx src/scripts/usage.ts",
     "test": "vitest run"
   },

@@ -19,6 +19,7 @@ import { readFile } from "node:fs/promises";
 import path from "node:path";
 import { checkFiles, checkWrittenFiles, formatFileProblems } from "../verify/fileChecks.js";
 import { prepareShadow, type IsolationConfig } from "../verify/workspace.js";
+import { failureDigest } from "../verify/failureDigest.js";
 import { sendReview, VERDICT_INSTRUCTION } from "../agents/verdict.js";
 import { pruneContext } from "./contextPruning.js";
 import { applyArchitectureRevision } from "./archRevision.js";
@@ -105,6 +106,8 @@ export interface PipelineConfig {
    * old behavior (write into the project, verify there).
    */
   isolation?: IsolationConfig;
+  /** Claude model per step (CLAUDE_MODEL_ARCHITECTURE / _REVIEW); unset = the agent's own model. */
+  claudeModels?: { architecture?: string; review?: string };
   maxImplementationAttempts: number;
   maxReviewRejections: number;
   /** Safety ceiling on Claude/Gemini architecture discussion rounds (default 20 — meant to never be hit in practice). */
@@ -314,7 +317,7 @@ export function fileAllowed(file: string, patterns: string[]): boolean {
 
 /** Options for Claude's file-reading calls: the task's own project directory, read-only tools, a turn budget. */
 function claudeReadOpts(task: TaskRecord, config: PipelineConfig, opts: SendOptions): SendOptions {
-  return { ...opts, cwd: resolveVerify(task, config).cwd, tools: READ_ONLY_TOOLS, maxTurns: ARCH_MAX_TURNS };
+  return { ...opts, cwd: resolveVerify(task, config).cwd, tools: READ_ONLY_TOOLS, maxTurns: ARCH_MAX_TURNS, model: config.claudeModels?.architecture };
 }
 
 /**
@@ -323,7 +326,7 @@ function claudeReadOpts(task: TaskRecord, config: PipelineConfig, opts: SendOpti
  * multiplied a review's input tokens many times over (one review: 814k).
  */
 function claudeReviewOpts(task: TaskRecord, config: PipelineConfig, opts: SendOptions): SendOptions {
-  return { ...opts, cwd: resolveVerify(task, config).cwd, tools: "" };
+  return { ...opts, cwd: resolveVerify(task, config).cwd, tools: "", model: config.claudeModels?.review };
 }
 
 export function log(task: TaskRecord, stage: Stage, by: RoleName, summary: string): void {
@@ -501,6 +504,19 @@ export async function applyImplementation(task: TaskRecord, config: PipelineConf
   task.context.implementationFiles = written;
   log(task, task.stage, "muse", `Implementation attempt #${task.implementationAttempts}: wrote ${written.length} file(s): ${written.join(", ")}.`);
   task.stage = "verification";
+}
+
+/**
+ * With the plan's option on, a plain subtask Gemini approved with no red
+ * warning doesn't also need Claude's sign-off. Integration tasks (where the
+ * pieces meet) and CEO revisions (where Claude checks each request) always
+ * get it.
+ */
+function claudeReviewSkippable(task: TaskRecord): boolean {
+  if (!task.projectConfig?.skipClaudeReviewWhenGreen) return false;
+  if (!task.planRef?.subtaskId) return false;
+  if (task.context.ceoRequests?.length) return false;
+  return !(task.alerts ?? []).some((a) => a.level === "warn");
 }
 
 /**
@@ -712,10 +728,10 @@ export async function advance(task: TaskRecord, agents: Agents, config: Pipeline
         }
         task.stage = "review_gemini";
       } else if (task.implementationAttempts < config.maxImplementationAttempts) {
-        task.context.reviewFeedback = [`Verification failed:\n${result.log}`];
+        task.context.reviewFeedback = [`Verification failed:\n${failureDigest(result.log)}`];
         task.stage = "implementation";
       } else {
-        task.context.reviewFeedback = [`Verification failed:\n${result.log}`];
+        task.context.reviewFeedback = [`Verification failed:\n${failureDigest(result.log)}`];
         exhaustBudget(task, config, "verification kept failing");
       }
       return task;
@@ -740,6 +756,12 @@ export async function advance(task: TaskRecord, agents: Agents, config: Pipeline
         // the feedback holds up, and is the only one who can actually send the
         // task back to implementation (see review_claude below).
         task.context.reviewFeedback = res.verdict === "reject" ? [`Gemini review feedback:\n${res.content}`] : [];
+        if (res.verdict === "approve" && claudeReviewSkippable(task)) {
+          log(task, task.stage, "system", "Claude's final review skipped: Gemini approved, nothing is flagged, and this is neither an integration task nor a CEO revision (plan option).");
+          trace(task, "System", "note", "Claude review skipped — Gemini approved a green subtask (plan option).");
+          task.stage = "checkpoint_final";
+          return task;
+        }
         task.stage = "review_claude";
         return task;
       } catch (err) {

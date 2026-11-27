@@ -47,6 +47,8 @@ export interface SendOptions {
    * context — the reason a ~4k-token prompt cost ~286k input tokens.
    */
   maxTurns?: number;
+  /** Model for this call only (Claude); unset = the agent's configured model. */
+  model?: string;
 }
 
 export interface Agent {
@@ -136,6 +138,8 @@ export interface ProjectConfig {
   handoffOn?: "checkpoint_final" | "done";
   /** Ship the result without waiting for the CEO when everything is green (no red warning; reviewers approved). */
   autoApprove?: boolean;
+  /** Skip Claude's final review when Gemini approved, nothing is flagged, and it isn't an integration task or a CEO revision. */
+  skipClaudeReviewWhenGreen?: boolean;
   screenshotWaitMs?: number;
 }
 

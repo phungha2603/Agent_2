@@ -57,6 +57,8 @@ export interface SchedulerSettings {
   /** Where non-gated slots hand off; gated slots always wait for the CEO ("done"). */
   handoffOn: HandoffPoint;
   planMaxRounds: number;
+  /** Claude model for drafting plans and rebalance proposals (CLAUDE_MODEL_PLAN); unset = the agent's own. */
+  planModel?: string;
   planLimits: PlanLimits;
   /** Only used when a provider doesn't report its own cost. */
   prices?: Partial<Record<"claude" | "gemini", Price>>;
@@ -625,7 +627,7 @@ export class Company extends EventEmitter {
     return { taskId: target.id, created };
   }
 
-  async startPlan(goal: string, projectDir?: string): Promise<WorkPlanRecord> {
+  async startPlan(goal: string, projectDir?: string, options: { autoApprove?: boolean; skipClaudeReviewWhenGreen?: boolean } = {}): Promise<WorkPlanRecord> {
     const current = await this.activePlan();
     if (current && (current.status === "drafting" || current.status === "awaiting_approval")) {
       throw new UserError("Đang có một kế hoạch đang lập hoặc chờ duyệt — hãy quyết kế hoạch đó trước.");
@@ -642,6 +644,8 @@ export class Company extends EventEmitter {
       project: { dir, verifyCommands: [], warnings: dir ? await projectDirWarnings(dir) : ["Chưa chọn thư mục dự án."] },
     };
     plan.project!.handoffOn = await this.defaultHandoffFor(dir);
+    plan.project!.autoApprove = options.autoApprove === true;
+    plan.project!.skipClaudeReviewWhenGreen = options.skipClaudeReviewWhenGreen === true;
     await savePlan(plan);
     await this.mutateState((s) => (s.activePlanId = plan.id));
     this.emitPlan();
@@ -695,7 +699,7 @@ export class Company extends EventEmitter {
   /** The CEO sets or corrects where the plan's code lives and how it's verified, before approving. */
   async updatePlanProject(
     planId: string,
-    update: { dir?: string; verifyCommands?: string[]; handoffOn?: "checkpoint_final" | "done"; autoApprove?: boolean },
+    update: { dir?: string; verifyCommands?: string[]; handoffOn?: "checkpoint_final" | "done"; autoApprove?: boolean; skipClaudeReviewWhenGreen?: boolean },
   ): Promise<WorkPlanRecord> {
     const plan = await loadPlan(planId);
     if (!plan || (plan.status !== "awaiting_approval" && plan.status !== "drafting")) {
@@ -714,6 +718,7 @@ export class Company extends EventEmitter {
     }
     if (update.handoffOn === "done" || update.handoffOn === "checkpoint_final") project.handoffOn = update.handoffOn;
     if (typeof update.autoApprove === "boolean") project.autoApprove = update.autoApprove;
+    if (typeof update.skipClaudeReviewWhenGreen === "boolean") project.skipClaudeReviewWhenGreen = update.skipClaudeReviewWhenGreen;
     project.commandWarnings = commandWarnings(allPlanCommands(project.verifyCommands, plan.epics));
     plan.project = project;
     plan.updatedAt = nowIso();
@@ -726,7 +731,7 @@ export class Company extends EventEmitter {
     planId: string,
     approved: boolean,
     feedback?: string,
-    project?: { dir?: string; verifyCommands?: string[]; handoffOn?: "checkpoint_final" | "done"; autoApprove?: boolean },
+    project?: { dir?: string; verifyCommands?: string[]; handoffOn?: "checkpoint_final" | "done"; autoApprove?: boolean; skipClaudeReviewWhenGreen?: boolean },
   ): Promise<void> {
     if (project && Object.values(project).some((v) => v !== undefined)) {
       await this.updatePlanProject(planId, project);
@@ -741,7 +746,9 @@ export class Company extends EventEmitter {
         throw new UserError("Kế hoạch chưa có lệnh kiểm tra (build/test) — điền lệnh rồi mới duyệt, nếu không sẽ không có gì chứng minh code chạy được.");
       }
       const base = this.projectConfig();
-      const tasks = materializePlan(plan, { ...base, verifyCwd: dir, verifyCommands: commands, handoffOn: plan.project?.handoffOn, autoApprove: plan.project?.autoApprove === true });
+      const tasks = materializePlan(plan, { ...base, verifyCwd: dir, verifyCommands: commands, handoffOn: plan.project?.handoffOn, autoApprove: plan.project?.autoApprove === true,
+        skipClaudeReviewWhenGreen: plan.project?.skipClaudeReviewWhenGreen === true,
+      });
       for (const t of tasks) await saveTask(t);
       plan.status = "approved";
       await savePlan(plan);
@@ -800,6 +807,7 @@ export class Company extends EventEmitter {
         taskId: key,
         onChunk: (t) => this.onChunk(key, t),
         signal: this.rebalanceController.signal,
+        model: this.settings.planModel,
       });
       const parsed = parseRebalance(res.content, load);
       Object.assign(proposal, { status: "ready", summary: parsed.summary, moves: parsed.moves, notes: parsed.notes });
@@ -1623,7 +1631,7 @@ export class Company extends EventEmitter {
         previous: revision?.previous,
         environment: await this.machineEnvironment(),
         survey: await this.projectSurvey(plan),
-        send: { taskId: key, onChunk: (t) => this.onChunk(key, t), signal: this.planController.signal },
+        send: { taskId: key, onChunk: (t) => this.onChunk(key, t), signal: this.planController.signal, model: this.settings.planModel },
         onRound: (round, phase) => {
           this.planPhase = phase === "draft" ? `Round ${round}: Claude is drafting` : `Round ${round}: Gemini is reviewing`;
           this.resetLive(key);
