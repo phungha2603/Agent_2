@@ -83,6 +83,12 @@ const state = {
   rebalance: null,
   /** Composer ("Dự án mới") open state: null = follow the plan automatically, true/false = the user's choice until the plan changes. */
   composer: { manual: null, sig: "" },
+  /** Org chart: "compact" node cards or the full "detailed" cards. */
+  orgDensity: localStorage.getItem("dash-org-density") === "detailed" ? "detailed" : "compact",
+  /** Which tab the org view's side column shows: the plan tree or hand-offs & bottlenecks. */
+  sideTab: "plan",
+  /** leadId -> staff ids, worked out from who hands work to whom (see computeTeams). */
+  teams: new Map(),
 };
 
 // ---------- utils ----------
@@ -399,7 +405,9 @@ function cardSkeleton(slot) {
         <span class="card-name" title="${esc(slot.name)}"><span class="card-role">${esc(slot.name.replace(/^AI /, ""))}</span><span class="card-id">${slot.id}</span></span>
         <span class="card-tools" data-part="tools"></span>
       </div>
+      ${slot.tier === 2 ? `<div class="team-summary" data-part="team"></div>` : ""}
       <div data-part="state"></div>
+      <div class="cmp" data-part="compact"></div>
       <div data-part="links"></div>
       <div class="card-body" data-part="body"></div>
       <div data-part="actions"></div>
@@ -558,6 +566,9 @@ function updateCard(slot) {
     <div class="state-row"><span class="state-pill s-${st.kind}">${STATE_ICON[st.kind] ?? ""} ${esc(st.label)}</span>${
       st.kind === "running" ? engineBadge(slot.tasks.find((x) => x.queueState === "running")) : st.detail ? `<span class="state-detail" title="${esc(st.detail)}">${esc(st.detail)}</span>` : ""
     }</div>`;
+  card.querySelector('[data-part="compact"]').innerHTML = compactBody(slot, t);
+  card.querySelector(".avatar")?.style.setProperty("--p", slotProgress(slot));
+  if (slot.tier === 2) renderTeamSummary(slot);
   card.querySelector('[data-part="links"]').innerHTML = slotLinks(slot, t);
   card.querySelector('[data-part="body"]').innerHTML = taskBody(slot, t);
   const actions = card.querySelector('[data-part="actions"]');
@@ -607,18 +618,134 @@ function applyFilter(card, slot) {
   card.classList.toggle("filtered-out", !matchesFilter(slot));
 }
 
+/**
+ * Groups staff under team leads. There is no fixed reporting line in the data, so each staff member joins
+ * the lead they hand the most work to (counted over the lead's task inputs). Anyone with no direct hand-off
+ * follows the colleagues they work with, and otherwise goes to the smallest team, so every team stays visible.
+ */
+function computeTeams() {
+  const slots = [...state.slots.values()];
+  const leads = slots.filter((s) => s.tier === 2);
+  const staff = slots.filter((s) => s.tier === 3);
+  const teams = new Map(leads.map((l) => [l.id, []]));
+  if (!leads.length) return { teams, loose: staff.map((s) => s.id) };
+  const teamOf = new Map();
+  const pick = (s, scores) => {
+    let best = null;
+    for (const l of leads) {
+      const sc = scores.get(l.id) ?? 0;
+      const b = best && (scores.get(best.id) ?? 0);
+      if (!best || sc > b || (sc === b && teams.get(l.id).length < teams.get(best.id).length)) best = l;
+    }
+    teams.get(best.id).push(s.id);
+    teamOf.set(s.id, best.id);
+  };
+  const direct = new Map(
+    staff.map((s) => {
+      const scores = new Map();
+      for (const l of leads) {
+        let n = l.inFrom.includes(s.id) ? 1 : 0;
+        for (const t of l.tasks) n += t.inputsFrom.filter((i) => i.slotId === s.id).length;
+        scores.set(l.id, n);
+      }
+      return [s.id, scores];
+    }),
+  );
+  const strongest = (id) => Math.max(0, ...direct.get(id).values());
+  const ordered = [...staff].sort((x, y) => strongest(y.id) - strongest(x.id) || x.id.localeCompare(y.id));
+  const later = [];
+  for (const s of ordered) (strongest(s.id) > 0 ? pick(s, direct.get(s.id)) : later.push(s));
+  for (const s of later) {
+    const scores = new Map();
+    for (const other of [...s.outTo, ...s.inFrom]) {
+      const lead = teamOf.get(other) ?? (teams.has(other) ? other : null);
+      if (lead) scores.set(lead, (scores.get(lead) ?? 0) + 1);
+    }
+    pick(s, scores);
+  }
+  for (const [lead, members] of teams) members.sort((x, y) => (direct.get(y)?.get(lead) ?? 0) - (direct.get(x)?.get(lead) ?? 0) || x.localeCompare(y));
+  return { teams, loose: [] };
+}
+
 function renderOrg() {
   const slots = [...state.slots.values()];
-  const rows = { 1: $("#row-1"), 2: $("#row-2"), 3: $("#row-3") };
-  for (const tier of [1, 2, 3]) {
-    $$(".card", rows[tier]).forEach((c) => c.remove());
-    const html = slots.filter((s) => s.tier === tier).map(cardSkeleton).join("");
-    const side = rows[tier].querySelector(".side-panel");
-    if (side) side.insertAdjacentHTML("beforebegin", html);
-    else rows[tier].insertAdjacentHTML("beforeend", html);
-  }
+  const { teams, loose } = computeTeams();
+  state.teams = teams;
+  const card = (id) => (state.slots.get(id) ? cardSkeleton(state.slots.get(id)) : "");
+  $("#row-1").innerHTML = slots.filter((s) => s.tier === 1).map(cardSkeleton).join("");
+  const row2 = $("#row-2");
+  row2.style.setProperty("--teams", Math.max(1, teams.size));
+  row2.innerHTML = [...teams]
+    .map(([lead, members]) => `<div class="team" data-team="${esc(lead)}"><div class="team-lead">${card(lead)}</div><div class="team-members">${members.map(card).join("")}</div></div>`)
+    .join("");
+  const extra = [...loose, ...slots.filter((s) => ![1, 2, 3].includes(s.tier)).map((s) => s.id)];
+  $("#row-3").innerHTML = extra.length ? `<div class="loose-head">Chưa xếp nhóm</div><div class="loose-grid">${extra.map(card).join("")}</div>` : "";
+  applyOrgDensity();
   for (const slot of slots) updateCard(slot);
   scheduleEdges();
+}
+
+function applyOrgDensity() {
+  $("#org").classList.toggle("compact", state.orgDensity === "compact");
+  $$('.seg[data-action="org-density"]').forEach((b) => b.classList.toggle("active", b.dataset.value === state.orgDensity));
+}
+
+function renderSideTabs() {
+  $$(".side-tab").forEach((b) => b.classList.toggle("active", b.dataset.tab === state.sideTab));
+  $("#plan-panel").hidden = state.sideTab !== "plan";
+  $("#flow-panel").hidden = state.sideTab !== "flow";
+}
+
+/** Average progress of the slot's tasks (the boss shows the whole company's), drawn as the ring around the avatar. */
+function slotProgress(slot) {
+  if (slot.isBoss && !slot.tasks.length) return state.telemetry?.percent ?? 0;
+  if (!slot.tasks.length) return 0;
+  return Math.round(slot.tasks.reduce((sum, t) => sum + (t.progress ?? 0), 0) / slot.tasks.length);
+}
+
+/** The few lines a compact node shows: current task, its progress, and the slot's counters. */
+function compactBody(slot, t) {
+  if (!t) {
+    if (slot.isBoss && state.plan) {
+      return `<div class="cmp-task" title="${esc(state.plan.goal)}">📋 ${esc(state.plan.goal)}</div><div class="cmp-meta"><span>${esc(PLAN_STATUS[state.plan.status] ?? state.plan.status)}</span></div>`;
+    }
+    return `<div class="cmp-task muted">Đang rảnh — chưa có task.</div>`;
+  }
+  const c = slot.counts;
+  const total = slot.tasks.length;
+  const done = slot.tasks.filter((x) => x.queueState === "done").length;
+  const act = t.activity
+    ? `<span class="cmp-act ${t.activity.state}">⏱ <span class="elapsed" data-since="${esc(t.activity.since)}">${elapsed(t.activity.since)}</span> · ${esc(ENGINE_LABEL[t.activity.engine] ?? t.activity.engine)}</span>`
+    : "";
+  return `
+    <div class="cmp-task" title="${esc(t.title)}">${esc(t.title)}</div>
+    <div class="cmp-row"><div class="progress-track"><div class="progress-fill ${t.colorClass}" style="width:${t.progress}%"></div></div><span class="cmp-pct">${t.progress}%</span></div>
+    <div class="cmp-meta">
+      <span title="Task đã xong / tổng số task của người này">✓ ${done}/${total}</span>
+      ${c.running ? `<span class="q-running" title="Đang chạy">▶ ${c.running}</span>` : ""}
+      ${c.waitingYou ? `<span class="q-waiting_you" title="Chờ bạn duyệt">✋ ${c.waitingYou}</span>` : ""}
+      ${c.problems ? `<span class="q-error" title="Lỗi / bị chặn">⚠ ${c.problems}</span>` : ""}
+      ${act}
+    </div>`;
+}
+
+/** "Nhóm 3 người · 1 đang chạy · 1 chờ duyệt" on a lead's card, summed over the lead and their team. */
+function renderTeamSummary(lead) {
+  const el = $(`#org .card[data-slot="${lead.id}"] [data-part="team"]`);
+  if (!el) return;
+  const people = [lead, ...(state.teams.get(lead.id) ?? []).map((id) => state.slots.get(id)).filter(Boolean)];
+  const sum = (k) => people.reduce((n, p) => n + (p.counts[k] ?? 0), 0);
+  const running = sum("running");
+  const waiting = sum("waitingYou");
+  const problems = sum("problems");
+  const tasks = people.reduce((n, p) => n + p.tasks.length, 0);
+  const done = people.reduce((n, p) => n + p.tasks.filter((t) => t.queueState === "done").length, 0);
+  el.innerHTML = `<span class="ts-size">Nhóm ${people.length} người</span><span>✓ ${done}/${tasks}</span>${running ? `<span class="q-running">▶ ${running} đang chạy</span>` : ""}${waiting ? `<span class="q-waiting_you">✋ ${waiting} chờ duyệt</span>` : ""}${problems ? `<span class="q-error">⚠ ${problems} lỗi</span>` : ""}`;
+}
+
+/** A staff update changes its lead's team summary too. */
+function refreshTeamOf(slotId) {
+  for (const [lead, members] of state.teams) if (members.includes(slotId)) renderTeamSummary(state.slots.get(lead));
 }
 
 // ---------- side panels ----------
@@ -749,6 +876,10 @@ function renderFlowPanel() {
   const waits = ins.waits.length
     ? ins.waits.map((w) => `<li><b data-hover-slot="${w.slotId}">${w.slotId}</b> chờ ${w.waitingOn.map((s) => `<b data-hover-slot="${s}">${s}</b>`).join(", ")} · ${fmtDur(w.sinceMs)}<div class="flow-title">${esc(w.title)}</div></li>`).join("")
     : `<li class="muted">Không ai đang chờ đầu vào.</li>`;
+  const badge = $("#flow-tab-badge");
+  const hot = ins.alerts.filter((a) => a.level !== "info").length + ins.waits.length;
+  badge.hidden = !hot;
+  badge.textContent = String(hot);
   panel.innerHTML = `
     <div class="panel-sub">Cảnh báo</div><ul class="flow-list">${alerts}</ul>
     <div class="panel-sub">Đang thảo luận / bị từ chối</div><ul class="flow-list">${discussionsHtml}</ul>
@@ -1050,7 +1181,7 @@ function drawEdges() {
   svg.setAttribute("width", box.width);
   svg.setAttribute("height", org.scrollHeight);
   svg.setAttribute("viewBox", `0 0 ${box.width} ${org.scrollHeight}`);
-  $$("path.edge, text.edge-label", svg).forEach((p) => p.remove());
+  $$("path.edge, text.edge-label, path.tree-line, circle.edge-dot", svg).forEach((p) => p.remove());
   $$(".card.related-in, .card.related-out, .card.related-self", org).forEach((c) => c.classList.remove("related-in", "related-out", "related-self"));
   const focus = state.hoverSlot ?? state.focusSlot;
   org.classList.toggle("focusing", Boolean(focus));
@@ -1071,6 +1202,37 @@ function drawEdges() {
     const r = el.getBoundingClientRect();
     return { x: r.left - box.left, y: r.top - box.top, w: r.width, h: r.height };
   };
+  const NS = "http://www.w3.org/2000/svg";
+  const addPath = (d, cls) => {
+    const path = document.createElementNS(NS, "path");
+    path.setAttribute("d", d);
+    path.setAttribute("class", cls);
+    svg.appendChild(path);
+    return path;
+  };
+  // reporting lines: boss → each lead (elbow), lead → members (a spine in the team's left gutter)
+  const bossEl = $("#row-1 .card");
+  const boss = bossEl ? rect(bossEl.dataset.slot) : null;
+  for (const team of $$("#row-2 .team")) {
+    const lead = rect(team.dataset.team);
+    if (!lead) continue;
+    if (boss) {
+      const x1 = boss.x + boss.w / 2;
+      const y1 = boss.y + boss.h;
+      const x2 = lead.x + lead.w / 2;
+      const my = y1 + (lead.y - y1) / 2;
+      const r = Math.min(10, Math.abs(x2 - x1) / 2, (lead.y - y1) / 4);
+      const dir = Math.sign(x2 - x1);
+      addPath(dir ? `M${x1},${y1} V${my - r} Q${x1},${my} ${x1 + dir * r},${my} H${x2 - dir * r} Q${x2},${my} ${x2},${my + r} V${lead.y}` : `M${x1},${y1} V${lead.y}`, "tree-line");
+    }
+    const members = $$(".team-members .card", team).map((c) => rect(c.dataset.slot)).filter(Boolean);
+    if (!members.length) continue;
+    const sx = lead.x + 12;
+    const last = members.at(-1);
+    let d = `M${sx},${lead.y + lead.h} V${last.y + 22 - 8} Q${sx},${last.y + 22} ${sx + 8},${last.y + 22} H${last.x}`;
+    for (const m of members.slice(0, -1)) d += ` M${sx},${m.y + 22} H${m.x}`;
+    addPath(d, "tree-line");
+  }
   for (const e of shown) {
     const a = rect(e.from);
     const b = rect(e.to);
@@ -1097,6 +1259,21 @@ function drawEdges() {
     path.setAttribute("class", `edge e-${e.kind}${e.active ? " edge-active" : ""}`);
     path.setAttribute("marker-end", `url(#arrow-${e.kind})`);
     svg.appendChild(path);
+    if (e.active) {
+      // work travelling along a live hand-off
+      for (const begin of ["0s", "0.8s"]) {
+        const dot = document.createElementNS(NS, "circle");
+        dot.setAttribute("r", "3.5");
+        dot.setAttribute("class", "edge-dot");
+        const move = document.createElementNS(NS, "animateMotion");
+        move.setAttribute("dur", "1.6s");
+        move.setAttribute("begin", begin);
+        move.setAttribute("repeatCount", "indefinite");
+        move.setAttribute("path", d);
+        dot.appendChild(move);
+        svg.appendChild(dot);
+      }
+    }
   }
 }
 
@@ -1617,6 +1794,8 @@ document.addEventListener("click", async (e) => {
       state.inbox.open = false;
       renderInbox();
       if (state.view !== "org") setView("org");
+      state.sideTab = ds.target === "plan-panel" ? "plan" : "flow";
+      renderSideTabs();
       return $(`#${ds.target}`)?.scrollIntoView({ behavior: "smooth", block: "center" });
     case "tl-group":
       state.tl.group = ds.value;
@@ -1685,6 +1864,14 @@ document.addEventListener("click", async (e) => {
       state.composer.manual = true;
       renderComposer();
       return goalInput.focus();
+    case "org-density":
+      state.orgDensity = ds.value;
+      localStorage.setItem("dash-org-density", ds.value);
+      applyOrgDensity();
+      return scheduleEdges();
+    case "side-tab":
+      state.sideTab = ds.tab;
+      return renderSideTabs();
     case "banner-dismiss":
       localStorage.setItem("dash-banner-dismissed", ds.plan);
       return renderDoneBanner();
@@ -1777,8 +1964,10 @@ document.addEventListener("click", async (e) => {
     }
     if (action === "rebalance") {
       if (await post("/api/rebalance")) {
-        toast("Sếp đang xem tải của từng người — đề xuất sẽ hiện ở khung bên phải hàng Trưởng nhóm.");
+        toast("Sếp đang xem tải của từng người — đề xuất sẽ hiện ở tab Bàn giao & nghẽn bên phải.");
         if (state.view !== "org") setView("org");
+        state.sideTab = "flow";
+        renderSideTabs();
       }
     }
     if (action === "rebalance-apply") {
@@ -2080,6 +2269,7 @@ function connect() {
     if (!slot) return;
     state.slots.set(slot.id, slot);
     updateCard(slot);
+    refreshTeamOf(slot.id);
     renderApproveAll();
     renderReviewBadges();
     if (state.inbox.open) renderInbox();
@@ -2151,5 +2341,8 @@ setInterval(() => {
 }, 1000);
 setInterval(() => state.view === "timeline" && renderTimeline(), 5000);
 window.addEventListener("resize", scheduleEdges);
+new ResizeObserver(scheduleEdges).observe($("#org"));
+renderSideTabs();
+applyOrgDensity();
 
 loadStatus().then(connect);
