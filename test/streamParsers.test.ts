@@ -83,3 +83,19 @@ describe("parseClaudeCliLine", () => {
     expect(parseClaudeCliLine("not json")).toEqual({});
   });
 });
+
+
+describe("geminiChunkText errors", () => {
+  it("keeps the HTTP code of an error inside the stream, so a 503 is retried", async () => {
+    const { geminiChunkText } = await import("../src/agents/streamParsers.js");
+    const { isTransientApiError } = await import("../src/agents/retry.js");
+    let caught: unknown;
+    try {
+      geminiChunkText(JSON.stringify({ error: { code: 503, message: "This model is currently experiencing high demand.", status: "UNAVAILABLE" } }));
+    } catch (err) {
+      caught = err;
+    }
+    expect((caught as { status?: number }).status).toBe(503);
+    expect(isTransientApiError(caught)).toBe(true);
+  });
+});

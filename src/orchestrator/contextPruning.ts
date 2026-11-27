@@ -29,7 +29,11 @@ function tail(text: string | undefined, max: number): string | undefined {
  */
 export function pruneContext(stage: Stage, ctx: TaskContext): TaskContext {
   // CEO directives go to every stage; forwarded material only to the stages that produce the work.
-  const base: TaskContext = { title: ctx.title, directives: ctx.directives?.length ? ctx.directives : undefined };
+  const base: TaskContext = {
+    title: ctx.title,
+    directives: ctx.directives?.length ? ctx.directives : undefined,
+    ceoRequests: ctx.ceoRequests?.length ? ctx.ceoRequests : undefined,
+  };
   const producing = stage === "ideation" || stage === "architecture" || stage === "architecture_review" || stage === "implementation";
   if (producing && ctx.attachments?.length) {
     base.attachments = ctx.attachments.slice(-PRUNE_LIMITS.attachments).map((a) => ({ ...a, content: head(a.content, PRUNE_LIMITS.attachmentChars)! }));

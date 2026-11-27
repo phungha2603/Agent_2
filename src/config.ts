@@ -10,6 +10,7 @@ import { createClaudeAgent } from "./agents/claude.js";
 import { createClaudeCliAgent } from "./agents/claude-cli.js";
 import { createMuseAgent, createMusePoolAgent } from "./agents/muse.js";
 import { screenshotBuildOutput } from "./verify/screenshot.js";
+import { DEFAULT_SYNC_EXCLUDE, type IsolationConfig } from "./verify/workspace.js";
 import type { SchedulerSettings } from "./orchestrator/scheduler.js";
 import type { Price } from "./agents/limited.js";
 
@@ -128,8 +129,19 @@ export function buildPipelineConfig(): PipelineConfig {
     maxReviewRejections: num("MAX_REVIEW_REJECTIONS", 3),
     maxArchitectureRounds: num("MAX_ARCHITECTURE_ROUNDS", 20),
     maxAutoRecoveries: num("MAX_AUTO_RECOVERIES", 1),
+    isolation: buildIsolationConfig(),
     visual: buildVisualConfig(),
   };
+}
+
+/** On unless VERIFY_ISOLATE=0: verification runs in data/workspaces, never in the project itself. */
+function buildIsolationConfig(): IsolationConfig | undefined {
+  if (process.env.VERIFY_ISOLATE === "0") return undefined;
+  const extra = (process.env.VERIFY_SYNC_EXCLUDE ?? "")
+    .split(",")
+    .map((s) => s.trim())
+    .filter(Boolean);
+  return { root: path.resolve(process.cwd(), "data/workspaces"), exclude: [...DEFAULT_SYNC_EXCLUDE, ...extra] };
 }
 
 function num(name: string, fallback: number): number {

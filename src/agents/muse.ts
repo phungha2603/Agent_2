@@ -153,14 +153,23 @@ export function museReplyOrThrow(parsed: { reply: string; replyFormat?: string; 
  * `museConcurrency` setting, which should match the pool size so the
  * scheduler actually lets that many calls through.
  */
-export function createMusePoolAgent(pool: Agent[]): Agent {
+export function createMusePoolAgent(pool: Agent[], opts: { cooldownMs?: number; now?: () => number } = {}): Agent {
   if (pool.length === 0) throw new Error("createMusePoolAgent requires at least one agent");
   const idle: number[] = pool.map((_, i) => i);
   const waiters: ((index: number) => void)[] = [];
+  const cooldownMs = opts.cooldownMs ?? 10 * 60_000;
+  const now = opts.now ?? Date.now;
+  // An account whose last call failed (stuck chat, dead session) is passed
+  // over while another is free — otherwise the retry lands on the same
+  // stuck account every time, since the first idle one is always picked.
+  const failedAt = new Map<number, number>();
+  const cooling = (i: number) => (failedAt.get(i) ?? -Infinity) > now() - cooldownMs;
 
   function acquire(): Promise<number> {
-    const next = idle.shift();
-    if (next !== undefined) return Promise.resolve(next);
+    if (idle.length) {
+      const pick = idle.findIndex((i) => !cooling(i));
+      return Promise.resolve(idle.splice(pick === -1 ? 0 : pick, 1)[0]);
+    }
     return new Promise((resolve) => waiters.push(resolve));
   }
   function release(index: number): void {
@@ -174,7 +183,12 @@ export function createMusePoolAgent(pool: Agent[]): Agent {
     async send(prompt: string, context: TaskContext, sendOpts?: SendOptions): Promise<AgentResponse> {
       const index = await acquire();
       try {
-        return await pool[index].send(prompt, context, sendOpts);
+        const res = await pool[index].send(prompt, context, sendOpts);
+        failedAt.delete(index);
+        return res;
+      } catch (err) {
+        if ((err as Error).name !== "AbortError") failedAt.set(index, now());
+        throw err;
       } finally {
         release(index);
       }

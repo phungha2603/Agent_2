@@ -87,7 +87,7 @@ describe("approval gates", () => {
     const { c } = await setup();
     const plan = await c.startPlan("goal");
     await waitFor(async () => (await c.planSnapshot())?.status === "awaiting_approval");
-    await c.decidePlan(plan.id, true);
+    await c.decidePlan(plan.id, true, undefined, { handoffOn: "checkpoint_final" });
 
     // AG-10 (gated by default) finishes E3.S3 but doesn't hand off; AG-08's integration task keeps waiting for it.
     await waitFor(async () => (await byTitle(c, "E3.S3"))?.queueState === "waiting_you", 15000);
@@ -374,7 +374,7 @@ describe("artifacts, traces and telemetry", () => {
     await c.setGate("AG-10", false);
     const plan = await c.startPlan("goal");
     await waitFor(async () => (await c.planSnapshot())?.status === "awaiting_approval");
-    await c.decidePlan(plan.id, true);
+    await c.decidePlan(plan.id, true, undefined, { handoffOn: "checkpoint_final" });
     await waitFor(async () => (await tasksOf(c)).filter((t: any) => t.queueState === "waiting_you").length === 9, 15000);
 
     const tel = await c.telemetry();

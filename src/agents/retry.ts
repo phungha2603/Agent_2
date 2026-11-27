@@ -69,10 +69,13 @@ export interface KeyPool {
   current(): string;
   /** Advances to the next key (wraps around) — call this after a 429 on the current one. */
   rotate(): void;
+  /** Removes the current key for good (it was rejected as invalid); false if it was the last one. */
+  drop(): boolean;
 }
 
-export function createKeyPool(keys: string[]): KeyPool {
-  if (keys.length === 0) throw new Error("createKeyPool requires at least one key");
+export function createKeyPool(initialKeys: string[]): KeyPool {
+  if (initialKeys.length === 0) throw new Error("createKeyPool requires at least one key");
+  const keys = [...initialKeys];
   let i = 0;
   return {
     get size() {
@@ -83,6 +86,13 @@ export function createKeyPool(keys: string[]): KeyPool {
     },
     rotate() {
       i = (i + 1) % keys.length;
+    },
+    drop() {
+      if (keys.length <= 1) return false;
+      const [gone] = keys.splice(i, 1);
+      i = i % keys.length;
+      console.warn(`Gemini key …${gone.slice(-4)} was rejected (401/403) and is removed from the rotation until the server restarts.`);
+      return true;
     },
   };
 }
@@ -101,8 +111,15 @@ export async function withKeyRotation<T>(pool: KeyPool, fn: (apiKey: string) => 
       return await fn(apiKey);
     } catch (err) {
       lastErr = err;
-      if ((err as { status?: number } | undefined)?.status === 429 && pool.size > 1) {
+      const status = (err as { status?: number } | undefined)?.status;
+      if (status === 429 && pool.size > 1) {
         pool.rotate();
+        continue;
+      }
+      // An invalid key never starts working: drop it and try the next one
+      // now, instead of failing every call that lands on it.
+      if ((status === 401 || status === 403) && pool.drop()) {
+        i -= 1;
         continue;
       }
       throw err;

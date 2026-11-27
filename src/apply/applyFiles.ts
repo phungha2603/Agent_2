@@ -1,4 +1,4 @@
-import { mkdir, writeFile } from "node:fs/promises";
+import { chmod, mkdir, writeFile } from "node:fs/promises";
 import path from "node:path";
 
 export interface ParsedFile {
@@ -84,6 +84,9 @@ export async function writeFiles(cwd: string, files: ParsedFile[]): Promise<stri
     }
     await mkdir(path.dirname(target), { recursive: true });
     await writeFile(target, file.content, "utf8");
+    // A script with a shebang is meant to be run directly; written as a
+    // plain 0644 file, `./scripts/x.sh` fails with "Permission denied".
+    if (file.content.startsWith("#!")) await chmod(target, 0o755);
     written.push(file.path);
   }
   return written;

@@ -21,6 +21,8 @@ export interface PlanSubtask {
   rationale: string;
   /** What this subtask builds on (goal parts, upstream outputs). */
   inputs: string;
+  /** Extra commands that exercise this subtask's own files, run after the plan's baseline commands. */
+  verifyCommands?: string[];
   taskId?: string;
 }
 
@@ -31,6 +33,8 @@ export interface PlanEpic {
   goal: string;
   acceptanceCriteria: string[];
   rationale: string;
+  /** Extra commands for the epic's integration task, run after the plan's baseline commands. */
+  verifyCommands?: string[];
   subtasks: PlanSubtask[];
   /** The lead's integration task, depending on all of this epic's subtasks. */
   taskId?: string;
@@ -56,6 +60,35 @@ export interface PlanProject {
   commandsByCeo?: boolean;
   /** Vietnamese notes about the directory (e.g. it already holds other files). */
   warnings: string[];
+  /** Vietnamese notes about the verification commands (e.g. an iOS build that isn't what Xcode's Run does). */
+  commandWarnings?: string[];
+  /**
+   * When a task's dependents may start. "done" = only after the CEO
+   * approved it — the default when repairing an existing project, where
+   * building on an unapproved fix spreads its mistakes.
+   */
+  handoffOn?: "checkpoint_final" | "done";
+}
+
+/** Every verification command in a plan: the baseline, plus each epic's and subtask's own. */
+export function allPlanCommands(baseline: string[], epics: PlanEpic[] = []): string[] {
+  return [...baseline, ...epics.flatMap((e) => [...(e.verifyCommands ?? []), ...e.subtasks.flatMap((s) => s.verifyCommands ?? [])])];
+}
+
+/**
+ * Commands that would pass while the thing they check still fails for the
+ * user. The one seen so far: an iOS build for "generic/platform=iOS
+ * Simulator" succeeded while Xcode's Run (a concrete simulator) failed.
+ */
+export function commandWarnings(commands: string[]): string[] {
+  const out: string[] = [];
+  const builds = commands.filter((c) => /\bxcodebuild\b/.test(c) && /\b(build|test)\b/.test(c) && /iOS Simulator/i.test(c));
+  if (builds.length && builds.every((c) => /generic\/platform=iOS Simulator/i.test(c))) {
+    out.push(
+      'Lệnh build iOS chỉ dùng "generic/platform=iOS Simulator" — khác với khi bấm Run trong Xcode (một máy cụ thể), có lỗi chỉ hiện ở máy cụ thể. Nên thêm một lệnh build với -destination \'platform=iOS Simulator,name=<tên iPhone>\'.',
+    );
+  }
+  return out;
 }
 
 export type PlanStatus = "drafting" | "awaiting_approval" | "approved" | "failed" | "discarded";
@@ -107,7 +140,14 @@ export function newPlanId(): string {
   return `plan-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`;
 }
 
-export function buildPlanPrompt(goal: string, departments: Department[], limits: PlanLimits, revision?: { previous?: WorkPlan; feedback: string }): string {
+export function buildPlanPrompt(
+  goal: string,
+  departments: Department[],
+  limits: PlanLimits,
+  revision?: { previous?: WorkPlan; feedback: string },
+  environment?: string,
+  survey?: string,
+): string {
   const leads = departments.filter((d) => d.tier === 2).map((d) => `${d.id} (${d.name})`).join(", ");
   const staff = departments.filter((d) => d.tier === 3).map((d) => `${d.id} (${d.name})`).join(", ");
   const parts = [
@@ -120,10 +160,20 @@ export function buildPlanPrompt(goal: string, departments: Department[], limits:
     "- dependsOn: ids of subtasks (in any epic) that must finish first because this one consumes their output. No cycles. Leave it empty whenever work can proceed in parallel.",
     "- rationale: one sentence per epic and subtask on why that owner is the right one (their specialty vs. what the work needs). inputs: what the subtask builds on — which part of the goal, which other subtask's output.",
     "- Write titles, descriptions, criteria, rationale and inputs in the same language as the goal.",
-    "- verifyCommands: the shell commands, in order, that build this goal's project and run its tests for real, run from the project's root directory (e.g. \"swift build\", \"swift test\", \"python3 -m pytest -q\", \"npm test\", \"xcodebuild -list -project App.xcodeproj\"). They are the only proof the code works, so they must exercise this goal's own code and its tests — never a placeholder like echo or true.",
+    "- verifyCommands (top level): the BASELINE shell commands, in order, that every task runs from the project's root directory to build this goal's project and run its tests for real (e.g. \"swift build\", \"swift test\", \"npm test\"). They are the only proof the code works, so they must exercise this goal's own code and its tests — never a placeholder like echo or true. Every task must be able to pass them once its own work is done, so don't put a check here that only a later task can make pass.",
+    "- verifyCommands on a subtask or epic: extra commands, run after the baseline, that exercise exactly the files that task writes and the baseline doesn't cover — e.g. \"python3 -m pytest -q content/scripts/test_x.py\", \"bash -n scripts/run.sh\", running a generator script and building what it produces. Every kind of file a task writes (Python, shell, generators, configs) must be exercised by the baseline or by its own commands. All commands run in a disposable copy of the project, so commands with side effects are safe.",
+    "- An iOS app build must target a concrete simulator, the way Xcode's Run does: xcodebuild ... build -destination 'platform=iOS Simulator,name=<an installed iPhone simulator>'. \"generic/platform=iOS Simulator\" alone is not enough — it passed while Run on a real simulator failed.",
     "You have no tools in this step and cannot read any files: plan from the goal text alone. If the goal says files must be read or inspected, that is work for the tasks — each task's architecture step can open the project's files — so put it into their descriptions instead of trying to do it now.",
     "Reply with ONLY one JSON object, no prose before or after, in exactly this shape:",
-    '{"summary": "...", "epics": [{"id": "E1", "title": "...", "owner": "AG-05", "goal": "...", "rationale": "...", "acceptanceCriteria": ["..."], "subtasks": [{"id": "E1.S1", "title": "...", "owner": "AG-03", "description": "...", "rationale": "...", "inputs": "...", "acceptanceCriteria": ["..."], "dependsOn": []}]}], "verifyCommands": ["..."]}',
+    '{"summary": "...", "epics": [{"id": "E1", "title": "...", "owner": "AG-05", "goal": "...", "rationale": "...", "acceptanceCriteria": ["..."], "subtasks": [{"id": "E1.S1", "title": "...", "owner": "AG-03", "description": "...", "rationale": "...", "inputs": "...", "acceptanceCriteria": ["..."], "dependsOn": [], "verifyCommands": []}], "verifyCommands": []}], "verifyCommands": ["..."]}',
+    ...(environment ? ["", `This machine: ${environment}`] : []),
+    ...(survey
+      ? [
+          "",
+          "Automatic survey of the existing project directory (you cannot read files, this is what's there). Every file it reports as failing its checks, and every test file with no tests, must be fixed by some subtask — name those files in the subtasks' descriptions:",
+          survey,
+        ]
+      : []),
     "",
     `Company-wide goal: ${goal}`,
   ];
@@ -155,6 +205,12 @@ function asStringArray(value: unknown, where: string): string[] {
   const items = value.filter((v): v is string => typeof v === "string" && v.trim().length > 0).map((v) => v.trim());
   if (items.length === 0) throw new Error(`${where}: acceptanceCriteria is empty`);
   return items;
+}
+
+function commandList(value: unknown): string[] {
+  return Array.isArray(value)
+    ? value.filter((c: unknown): c is string => typeof c === "string" && c.trim().length > 0).map((c: string) => c.trim())
+    : [];
 }
 
 function requireString(value: unknown, where: string): string {
@@ -230,6 +286,7 @@ export function parsePlan(text: string, departments: Department[], limits: PlanL
         dependsOn: Array.isArray(s?.dependsOn) ? s.dependsOn.filter((d: unknown): d is string => typeof d === "string").map((d: string) => d.trim()) : [],
         rationale: typeof s?.rationale === "string" ? s.rationale.trim() : "",
         inputs: typeof s?.inputs === "string" ? s.inputs.trim() : "",
+        verifyCommands: commandList(s?.verifyCommands),
       };
     });
     return {
@@ -239,6 +296,7 @@ export function parsePlan(text: string, departments: Department[], limits: PlanL
       goal: typeof e?.goal === "string" ? e.goal.trim() : "",
       acceptanceCriteria: asStringArray(e?.acceptanceCriteria, `epic ${epicId}`),
       rationale: typeof e?.rationale === "string" ? e.rationale.trim() : "",
+      verifyCommands: commandList(e?.verifyCommands),
       subtasks,
     };
   });
@@ -254,9 +312,7 @@ export function parsePlan(text: string, departments: Department[], limits: PlanL
   }
   assertAcyclic(new Map(allSubtasks.map((s) => [s.id, s.dependsOn])));
 
-  const verifyCommands = Array.isArray(raw.verifyCommands)
-    ? raw.verifyCommands.filter((c: unknown): c is string => typeof c === "string" && c.trim().length > 0).map((c: string) => c.trim())
-    : [];
+  const verifyCommands = commandList(raw.verifyCommands);
   if (!verifyCommands.length) notes.push("Plan: Claude proposed no verification commands — set them before approving.");
   return { plan: { summary: typeof raw.summary === "string" ? raw.summary.trim() : "", epics, verifyCommands }, notes };
 }
@@ -269,9 +325,11 @@ export function renderPlan(plan: WorkPlan): string {
     for (const s of e.subtasks) {
       lines.push(`  ${s.id} [${s.owner}] ${s.title}${s.dependsOn.length ? ` (after ${s.dependsOn.join(", ")})` : ""}`, `    ${s.description}`, `    Why this owner: ${s.rationale || "(not given)"} · Builds on: ${s.inputs || "(not given)"}`);
       lines.push(...s.acceptanceCriteria.map((c) => `    AC: ${c}`));
+      if (s.verifyCommands?.length) lines.push(`    Own verifyCommands: ${s.verifyCommands.join(" && ")}`);
     }
   }
-  lines.push("", `verifyCommands: ${plan.verifyCommands?.length ? plan.verifyCommands.join(" && ") : "(none proposed)"}`);
+  lines.push("", `Baseline verifyCommands (every task): ${plan.verifyCommands?.length ? plan.verifyCommands.join(" && ") : "(none proposed)"}`);
+  for (const e of plan.epics) if (e.verifyCommands?.length) lines.push(`${e.id} integration verifyCommands: ${e.verifyCommands.join(" && ")}`);
   return lines.join("\n");
 }
 
@@ -292,7 +350,18 @@ export async function draftAndReviewPlan(
   agents: { claude: Agent; gemini: Agent },
   goal: string,
   departments: Department[],
-  opts: { maxRounds: number; limits?: PlanLimits; revisionFeedback?: string; previous?: WorkPlan; send?: SendOptions; onRound?: (round: number, phase: "draft" | "review") => void },
+  opts: {
+    maxRounds: number;
+    limits?: PlanLimits;
+    revisionFeedback?: string;
+    previous?: WorkPlan;
+    send?: SendOptions;
+    onRound?: (round: number, phase: "draft" | "review") => void;
+    /** Facts about this machine the plan's commands depend on (e.g. installed iOS simulators). */
+    environment?: string;
+    /** formatSurvey() of the project directory, when it already has files. */
+    survey?: string;
+  },
 ): Promise<PlanDraftResult> {
   const limits = opts.limits ?? DEFAULT_PLAN_LIMITS;
   let feedback = opts.revisionFeedback;
@@ -302,7 +371,7 @@ export async function draftAndReviewPlan(
 
   for (let round = 1; round <= opts.maxRounds; round++) {
     opts.onRound?.(round, "draft");
-    const prompt = buildPlanPrompt(goal, departments, limits, feedback ? { previous, feedback } : undefined);
+    const prompt = buildPlanPrompt(goal, departments, limits, feedback ? { previous, feedback } : undefined, opts.environment, opts.survey);
     const draft = await agents.claude.send(prompt, { title: goal }, opts.send);
     if (FAKE_TOOL_CALL_RE.test(draft.content)) {
       feedback =
@@ -360,6 +429,11 @@ function sharedBriefFor(record: WorkPlanRecord, plan: WorkPlan, epic: PlanEpic, 
  */
 export function materializePlan(record: WorkPlanRecord, projectConfig?: ProjectConfig): TaskRecord[] {
   if (!record.epics) throw new Error("plan has no epics to materialize");
+  // Each task runs the plan's baseline plus its own commands, so a task's
+  // Python or shell files are actually exercised — the baseline alone
+  // (e.g. only Swift/Xcode builds) let broken ones through.
+  const forTask = (own?: string[]): ProjectConfig | undefined =>
+    projectConfig && { ...projectConfig, verifyCommands: [...new Set([...projectConfig.verifyCommands, ...(own ?? [])])] };
   const plan: WorkPlan = { summary: record.summary ?? "", epics: record.epics };
   const tasks: TaskRecord[] = [];
   const taskIdBySubtask = new Map<string, string>();
@@ -376,7 +450,7 @@ export function materializePlan(record: WorkPlanRecord, projectConfig?: ProjectC
           sharedBrief: sharedBriefFor(record, plan, epic, s.id),
           planRef: { planId: record.id, epicId: epic.id, subtaskId: s.id },
         },
-        projectConfig,
+        forTask(s.verifyCommands),
       );
       s.taskId = task.id;
       taskIdBySubtask.set(s.id, task.id);
@@ -408,7 +482,7 @@ export function materializePlan(record: WorkPlanRecord, projectConfig?: ProjectC
         sharedBrief: sharedBriefFor(record, plan, epic),
         planRef: { planId: record.id, epicId: epic.id },
       },
-      projectConfig,
+      forTask(epic.verifyCommands),
     );
     task.dependsOn = epic.subtasks.map((s) => s.taskId!).filter(Boolean);
     epic.taskId = task.id;

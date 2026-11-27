@@ -2,7 +2,7 @@ import { existsSync, mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { describe, expect, it } from "vitest";
-import { advance, applyImplementation, createTask, specProblem, type PipelineConfig } from "../src/orchestrator/pipeline.js";
+import { advance, allowedFilesFrom, applyImplementation, createTask, fileAllowed, specProblem, type PipelineConfig } from "../src/orchestrator/pipeline.js";
 import { createMockAgent } from "../src/agents/mock.js";
 import { formatContext } from "../src/agents/context.js";
 import { verdictFor } from "../src/agents/verdict.js";
@@ -108,7 +108,7 @@ describe("verification guards", () => {
 
 describe("architecture guards", () => {
   const FAKE_TOOL = "I'll check what's actually on disk first.\n\n<function_calls>\n<invoke name=\"Bash\">\n<parameter name=\"command\">find .</parameter>\n</invoke>\n</function_calls>";
-  const GUIDE = "Implementation guide.\n" + "- file.ts: does the thing, with the exact interface described here.\n".repeat(5);
+  const GUIDE = "Implementation guide.\n" + "- file.ts: does the thing, with the exact interface described here.\n".repeat(5) + "FILES: file.ts";
 
   it("recognises a fake tool call or a one-line note as not-a-guide", () => {
     expect(specProblem(FAKE_TOOL, { requireLength: true })).toMatch(/tool call/);
@@ -175,5 +175,35 @@ describe("Muse reply format", () => {
     expect(() => museReplyOrThrow({ reply: "FILE: a", replyFormat: "rendered-text" }, 300)).toThrow(/rendered page text/);
     expect(() => museReplyOrThrow({ reply: "FILE: a" }, 300)).toThrow(/older version/);
     expect(() => museReplyOrThrow({ reply: "FILE: a, cut", replyFormat: "markdown-dom", timedOut: true }, 300)).toThrow(/within 300s/);
+  });
+});
+
+
+describe("files the engineer may write", () => {
+  it("reads the guide's FILES line, tolerating Markdown around it", () => {
+    expect(allowedFilesFrom("Guide...\n\n**FILES:** `scripts/validate.py`, scripts/*.sh")).toEqual(["scripts/validate.py", "scripts/*.sh"]);
+    expect(allowedFilesFrom("no list here")).toBeUndefined();
+    expect(specProblem("x".repeat(300), { requireLength: true })).toMatch(/FILES/);
+  });
+
+  it("matches * within one path segment and ** across segments", () => {
+    expect(fileAllowed("scripts/test.sh", ["scripts/*.sh"])).toBe(true);
+    expect(fileAllowed("scripts/sub/test.sh", ["scripts/*.sh"])).toBe(false);
+    expect(fileAllowed("Tests/A/B.swift", ["Tests/**"])).toBe(true);
+    expect(fileAllowed(".github/workflows/test.yml", ["scripts/*.py"])).toBe(false);
+  });
+
+  it("rejects the whole attempt when it writes a file outside the list (the test.yml it kept rewriting)", async () => {
+    const task = createTask("Scoped");
+    task.stage = "implementation";
+    task.implementationAttempts = 1;
+    task.context.architectureSpec = "guide\nFILES: scripts/validate-xcodeproj.py";
+    task.context.implementationDiff =
+      "FILE: scripts/validate-xcodeproj.py\n```python\nx = 1\n```\nFILE: .github/workflows/test.yml\n```yaml\nname: T\n```\n";
+    const c = cfg();
+    await applyImplementation(task, c);
+    expect(task.stage).toBe("implementation");
+    expect(existsSync(path.join(c.verify.cwd, "scripts/validate-xcodeproj.py"))).toBe(false);
+    expect(task.context.reviewFeedback?.[0]).toMatch(/test\.yml[\s\S]*not on the guide's FILES: line/);
   });
 });

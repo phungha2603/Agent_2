@@ -136,6 +136,12 @@ function findTaskSnapshot(taskId) {
   return state.drawer.detail?.snapshot?.id === taskId ? state.drawer.detail.snapshot : null;
 }
 
+/** Which plan a task belongs to — tasks of different plans can share a title ("E3.S1"). */
+function planTag(ref) {
+  if (!ref?.planId) return "";
+  return ` <span class="plan-tag" title="Kế hoạch ${esc(ref.planId)}">KH·${esc(ref.planId.slice(-4))}</span>`;
+}
+
 function redAlerts(t) {
   return t && t.stage === "checkpoint_final" ? (t.alerts ?? []).filter((a) => a.level === "warn").map((a) => a.text) : [];
 }
@@ -157,7 +163,7 @@ function shipWarningNote(t) {
 /** Where the plan's code goes and how it's verified — editable in the plan panel, a summary in the inbox. */
 function planProjectBlock(plan, editable) {
   const p = plan.project ?? { dir: "", verifyCommands: [], warnings: [] };
-  const warnings = (p.warnings ?? []).map((w) => `<div class="feedback-box is-error">⚠ ${esc(w)}</div>`).join("");
+  const warnings = [...(p.warnings ?? []), ...(p.commandWarnings ?? [])].map((w) => `<div class="feedback-box is-error">⚠ ${esc(w)}</div>`).join("");
   const missing = !p.verifyCommands?.length ? `<div class="feedback-box is-error">⚠ Chưa có lệnh kiểm tra — không duyệt được cho tới khi điền.</div>` : "";
   if (!editable) {
     return `<div class="plan-project small"><div>📁 <code>${esc(p.dir || "(chưa chọn)")}</code></div><div>🧪 ${p.verifyCommands?.length ? p.verifyCommands.map((c) => `<code>${esc(c)}</code>`).join(" → ") : "<em>chưa có lệnh</em>"}</div>${warnings}${missing}</div>`;
@@ -165,9 +171,14 @@ function planProjectBlock(plan, editable) {
   return `<div class="plan-project">
     <label class="panel-sub">Thư mục dự án (Muse ghi code vào đây, lệnh kiểm tra chạy ở đây)</label>
     <input class="feedback-input" data-plan-dir="${esc(plan.id)}" value="${esc(p.dir)}" placeholder="/đường/dẫn/tuyệt/đối" />
-    <label class="panel-sub">Lệnh kiểm tra (build/test thật của dự án này) — mỗi dòng một lệnh${p.commandsByCeo ? "" : ", Claude đề xuất"}</label>
+    <label class="panel-sub">Lệnh kiểm tra nền (mọi task đều chạy) — mỗi dòng một lệnh${p.commandsByCeo ? "" : ", Claude đề xuất"}. Lệnh riêng của từng task xem trong cây việc.</label>
     <textarea class="feedback-input" rows="3" data-plan-cmds="${esc(plan.id)}" placeholder="ví dụ: swift build&#10;swift test">${esc((p.verifyCommands ?? []).join("\n"))}</textarea>
     ${warnings}${missing}
+    <label class="panel-sub">Khi nào task sau được bắt đầu</label>
+    <select class="feedback-input" data-plan-handoff="${esc(plan.id)}">
+      <option value="done"${p.handoffOn === "done" ? " selected" : ""}>Chỉ sau khi tôi duyệt task trước (an toàn — nên dùng khi sửa dự án có sẵn)</option>
+      <option value="checkpoint_final"${p.handoffOn === "checkpoint_final" ? " selected" : ""}>Ngay khi task trước chờ duyệt (nhanh hơn)</option>
+    </select>
     <div class="row-inline"><button class="btn btn-small-inline" data-action="plan-project-save" data-plan="${esc(plan.id)}">Lưu thư mục & lệnh</button></div>
   </div>`;
 }
@@ -178,6 +189,8 @@ function planProjectInputs(planId) {
   const out = {};
   if (dir) out.projectDir = dir.value.trim();
   if (cmds) out.verifyCommands = cmds.value;
+  const handoff = document.querySelector(`[data-plan-handoff="${CSS.escape(planId)}"]`);
+  if (handoff) out.handoffOn = handoff.value;
   return out;
 }
 
@@ -343,7 +356,7 @@ function taskBody(slot, t) {
   return `
     <div class="current" data-action="open-drawer" data-task="${esc(t.id)}" title="Bấm để xem đầy đủ output, prompt, artifact và lịch sử">
       <div class="current-label">Task hiện tại${remaining}</div>
-      <div class="task-title">${esc(t.title)}</div>
+      <div class="task-title">${esc(t.title)}${planTag(t.planRef)}</div>
       <div class="badges">
         <span class="badge ${t.colorClass}">${esc(t.label)}</span>
         <span class="qstate q-${t.queueState}">${QUEUE_LABEL[t.queueState]}</span>
@@ -535,7 +548,7 @@ function renderPlanPanel() {
             <div class="subtask"${s.taskId ? ` data-action="open-drawer" data-task="${esc(s.taskId)}"` : ""}>
               <div><b>${esc(s.id)}</b> ${esc(s.title)} ${ownerChip(s.owner)} ${stageChip(plan, s.taskId)}</div>
               ${s.dependsOn.length ? `<div class="deps">⏳ sau ${esc(s.dependsOn.join(", "))}</div>` : ""}
-              ${details(`srat:${plan.id}:${s.id}`, "Vì sao giao cho người này?", `${s.rationale ? `<div class="why">💡 ${esc(s.rationale)}</div>` : `<div class="muted">Sếp không nêu lý do.</div>`}${s.inputs ? `<div class="why">📥 Dựa trên: ${esc(s.inputs)}</div>` : ""}<div class="epic-goal">${esc(s.description)}</div><ul class="ac">${s.acceptanceCriteria.map((c) => `<li>${esc(c)}</li>`).join("")}</ul>`)}
+              ${details(`srat:${plan.id}:${s.id}`, "Vì sao giao cho người này?", `${s.rationale ? `<div class="why">💡 ${esc(s.rationale)}</div>` : `<div class="muted">Sếp không nêu lý do.</div>`}${s.inputs ? `<div class="why">📥 Dựa trên: ${esc(s.inputs)}</div>` : ""}<div class="epic-goal">${esc(s.description)}</div><ul class="ac">${s.acceptanceCriteria.map((c) => `<li>${esc(c)}</li>`).join("")}</ul>${s.verifyCommands?.length ? `<div class="why">🧪 Lệnh kiểm tra riêng: ${s.verifyCommands.map((c) => `<code>${esc(c)}</code>`).join(" → ")}</div>` : ""}`)}
             </div>`,
             )
             .join("")}
@@ -1285,7 +1298,7 @@ function renderDrawer() {
     <div class="drawer-head">
       <div>
         <div class="muted small">${esc(slotId)} · ${esc(slotName(slotId))}${s.gated ? " · 🔒 cổng duyệt" : ""}</div>
-        <div class="drawer-title">${esc(task.context.title)}</div>
+        <div class="drawer-title">${esc(task.context.title)}${planTag(task.planRef)}</div>
         <div class="badges"><span class="badge ${s.colorClass}">${esc(s.label)}</span><span class="qstate q-${s.queueState}">${QUEUE_LABEL[s.queueState]}</span><span class="stage-raw">${esc(task.stage)}</span></div>
       </div>
       <button class="btn btn-icon" data-action="drawer-refresh" title="Làm mới">↻</button>
@@ -1553,8 +1566,23 @@ document.addEventListener("click", async (e) => {
         return;
       }
       const warns = action === "approve" ? redAlerts(findTaskSnapshot(ds.task)) : [];
-      if (warns.length && !confirm(`Kết quả này có ${warns.length} cảnh báo đỏ:\n\n- ${warns.join("\n- ")}\n\nVẫn ship?`)) return;
-      if (await post(`/api/tasks/${encodeURIComponent(ds.task)}/decision`, { action, feedback: fb, confirmWarnings: warns.length > 0 })) refreshDrawer();
+      if (warns.length) {
+        // An in-page confirmation (not the browser's confirm()), listing every red warning.
+        openModal(`
+          <div class="modal-title">⚠ Kết quả có ${warns.length} cảnh báo đỏ</div>
+          <ul class="ship-warn-list">${warns.map((w) => `<li>${esc(w)}</li>`).join("")}</ul>
+          <div class="muted small">Duyệt nghĩa là ship kết quả này dù có các cảnh báo trên.</div>
+          <div class="decision-row"><button class="btn btn-approve" data-action="approve-confirmed" data-task="${esc(ds.task)}">Vẫn duyệt</button><button class="btn btn-ghost" data-action="modal-close">Huỷ</button></div>`);
+        return;
+      }
+      if (await post(`/api/tasks/${encodeURIComponent(ds.task)}/decision`, { action, feedback: fb })) refreshDrawer();
+    }
+    if (action === "approve-confirmed") {
+      const fb = [...document.querySelectorAll(`[data-feedback-for="${CSS.escape(ds.task)}"]`)].map((x) => x.value).find((v) => v.trim()) ?? "";
+      if (await post(`/api/tasks/${encodeURIComponent(ds.task)}/decision`, { action: "approve", feedback: fb, confirmWarnings: true })) {
+        closeModal();
+        refreshDrawer();
+      }
     }
     if (action === "retry") (await post(`/api/tasks/${encodeURIComponent(ds.task)}/retry`)) && refreshDrawer();
     if (action === "prioritize") (await post(`/api/tasks/${encodeURIComponent(ds.task)}/move`, { toSlot: ds.slot, position: "top" })) && toast("Đã đưa lên đầu hàng đợi.");

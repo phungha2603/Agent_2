@@ -89,7 +89,8 @@ export function createMockAgent(role: RoleName): Agent {
             `Architecture spec for "${context.title}" (mock).\n\n` +
             "Files: NOTES.md — a short implementation note naming the task.\n" +
             "Build order: write NOTES.md, then run the plan's verification commands.\n" +
-            "Acceptance: each criterion is checked against NOTES.md by the verification step; no other files are needed for this dry run.",
+            "Acceptance: each criterion is checked against NOTES.md by the verification step; no other files are needed for this dry run.\n" +
+            "FILES: NOTES.md",
         };
       case "muse":
         return { role, content: `FILE: NOTES.md\n\`\`\`md\n# ${context.title}\n\nMock implementation note.\n\`\`\`\n` };

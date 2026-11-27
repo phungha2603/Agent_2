@@ -49,6 +49,19 @@ describe("parseFileBlocks", () => {
   });
 });
 
+describe("writeFiles — executables", () => {
+  it("makes files that start with a shebang executable, and leaves others alone", async () => {
+    const { statSync } = await import("node:fs");
+    const cwd = mkdtempSync(path.join(tmpdir(), "apply-files-mode-"));
+    await writeFiles(cwd, [
+      { path: "scripts/run.sh", content: "#!/usr/bin/env bash\necho hi\n" },
+      { path: "notes.md", content: "# not a script\n" },
+    ]);
+    expect(statSync(path.join(cwd, "scripts/run.sh")).mode & 0o111).not.toBe(0);
+    expect(statSync(path.join(cwd, "notes.md")).mode & 0o111).toBe(0);
+  });
+});
+
 describe("writeFiles", () => {
   it("writes parsed files under cwd and refuses to escape it", async () => {
     const cwd = mkdtempSync(path.join(tmpdir(), "apply-files-test-"));

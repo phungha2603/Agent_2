@@ -173,7 +173,7 @@ app.post("/api/run-all", route(async (req, res) => {
   ok(res, { planId: plan.id });
 }));
 /** { dir?, verifyCommands? } from a request body — commands as a list or as one command per line. */
-function planProject(body: any): { dir?: string; verifyCommands?: string[] } {
+function planProject(body: any): { dir?: string; verifyCommands?: string[]; handoffOn?: "done" | "checkpoint_final" } {
   const dir = str(body?.projectDir);
   const raw = body?.verifyCommands;
   const verifyCommands = Array.isArray(raw)
@@ -181,7 +181,9 @@ function planProject(body: any): { dir?: string; verifyCommands?: string[] } {
     : typeof raw === "string"
       ? raw.split("\n")
       : undefined;
-  return { dir, verifyCommands };
+  const handoff = str(body?.handoffOn);
+  const handoffOn = handoff === "done" || handoff === "checkpoint_final" ? handoff : undefined;
+  return { dir, verifyCommands, handoffOn };
 }
 app.post("/api/plan/:id/project", route(async (req, res) => ok(res, await company.updatePlanProject(req.params.id, planProject(req.body)))));
 app.post("/api/plan/:id/decision", route(async (req, res) =>

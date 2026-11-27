@@ -77,6 +77,12 @@ export interface TaskContext {
   upstream?: HandoffArtifact[];
   /** CEO steering instructions, company-wide and for this task's slot — they override earlier instructions. */
   directives?: string[];
+  /**
+   * The CEO's revision requests for this task, kept until it ships. Review
+   * feedback is replaced every round, so a request that lived only there was
+   * gone by the time the reviewers looked — and an unmet one got approved.
+   */
+  ceoRequests?: string[];
   /** Material the CEO forwarded to this task from another agent's output. */
   attachments?: { title: string; from: string; content: string }[];
   architectureSpec?: string;
@@ -118,6 +124,8 @@ export interface ProjectConfig {
   screenshotPath?: string;
   /** Built output directory to screenshot, relative to verifyCwd (e.g. "dist"). */
   buildDir?: string;
+  /** When dependents may start: once this task reaches the final checkpoint, or only once the CEO approved it. Unset = company setting. */
+  handoffOn?: "checkpoint_final" | "done";
   screenshotWaitMs?: number;
 }
 
@@ -157,7 +165,7 @@ export interface TraceEntry {
  * confirmation. One per kind — a newer one of the same kind replaces it.
  */
 export interface TaskAlert {
-  kind: "no_files" | "files_rejected" | "files_broken" | "verify_coverage" | "verify_unconfigured" | "spec_rewritten" | "gemini_down";
+  kind: "no_files" | "files_rejected" | "files_broken" | "verify_coverage" | "verify_unconfigured" | "spec_rewritten" | "gemini_down" | "files_overwritten";
   level: "warn" | "info";
   at: string;
   stage: Stage;
@@ -170,6 +178,8 @@ export interface TaskError {
   stage: Stage;
   message: string;
   attempts: number;
+  /** Set when the error was a usage limit with a known reset time: the task resumes by itself then. */
+  resumeAt?: string;
 }
 
 export interface TaskRecord {

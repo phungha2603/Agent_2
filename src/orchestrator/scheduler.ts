@@ -18,8 +18,14 @@ import {
   type PipelineConfig,
 } from "./pipeline.js";
 import { buildHandoff, reachedHandoffPoint, type HandoffPoint } from "./handoff.js";
+import { execFile } from "node:child_process";
+import { hhmm as clockTime, quotaResumeAt } from "./quota.js";
+import { formatSurvey, surveyProject } from "../verify/survey.js";
+import { commitTaskFiles, discardTaskFiles, isGitRepo } from "../verify/gitProject.js";
 import path from "node:path";
 import {
+  allPlanCommands,
+  commandWarnings,
   draftAndReviewPlan,
   materializePlan,
   newPlanId,
@@ -306,6 +312,8 @@ export class Company extends EventEmitter {
     for (const ids of Object.values(this.state.slots)) {
       for (const id of ids) {
         const t = await this.load(id);
+        // A usage-limit pause survives a restart: re-arm its automatic resume.
+        if (t?.lastError?.resumeAt) this.scheduleQuotaResume(t.id, new Date(t.lastError.resumeAt));
         const open = t?.runs?.filter((r) => !r.endedAt && !(r.human && isWaitingForHuman(t))) ?? [];
         if (t && open.length) {
           for (const r of open) Object.assign(r, { endedAt: t.updatedAt, outcome: "cancelled" });
@@ -407,8 +415,10 @@ export class Company extends EventEmitter {
 
     const wait = [...(task.runs ?? [])].reverse().find((r) => r.human && !r.endedAt);
     if (wait) Object.assign(wait, { endedAt: nowIso(), outcome: "ok", decision: act });
+    const finalCheckpoint = task.stage === "checkpoint_final";
     if (act === "revise") requestRevision(task, feedback ?? "");
     else resolveCheckpoint(task, act === "approve", feedback?.trim() || undefined);
+    if (finalCheckpoint) await this.recordInGit(task, act === "approve");
 
     if (act === "approve") {
       if (task.stage === "done") trace(task, "CEO", "gate", gated ? "Approved at the approval gate — result handed off." : "Approved and shipped.");
@@ -440,6 +450,53 @@ export class Company extends EventEmitter {
   }
 
   /** Clears a paused runtime error, or gives a rejected task a fresh budget (keeping its last feedback). */
+  /**
+   * In a git project, the final decision is recorded there too: an approved
+   * task's files become one commit; a rejected or revised task's files go
+   * back to the last commit (new ones are deleted), so work the CEO turned
+   * down doesn't stay in the project. Not a git repository: nothing happens.
+   */
+  private async recordInGit(task: TaskRecord, approved: boolean): Promise<void> {
+    const dir = task.projectConfig?.verifyCwd;
+    const files = task.context.implementationFiles ?? [];
+    if (!dir || !files.length || !(await isGitRepo(dir))) return;
+    try {
+      if (approved) {
+        const hash = await commitTaskFiles(dir, files, `${task.context.title}\n\nTask ${task.id}, approved by the CEO in the AI Company dashboard.`);
+        log(task, task.stage, "system", hash ? `Committed ${files.length} file(s) to the project's git repository: ${hash}.` : "No file changes to commit to git.");
+      } else {
+        const { restored, removed } = await discardTaskFiles(dir, files);
+        log(
+          task,
+          task.stage,
+          "system",
+          `Undid this task's files in the project (git): restored ${restored.length ? restored.join(", ") : "none"}; removed ${removed.length ? removed.join(", ") : "none"}.`,
+        );
+      }
+    } catch (err) {
+      log(task, task.stage, "system", `Git ${approved ? "commit" : "undo"} failed (the decision itself stands): ${(err as Error).message.slice(0, 300)}`);
+    }
+  }
+
+  private quotaTimers = new Map<string, NodeJS.Timeout>();
+
+  /** Clears a usage-limit pause at its reset time and lets the task run again (if nothing else happened to it meanwhile). */
+  private scheduleQuotaResume(taskId: string, at: Date): void {
+    clearTimeout(this.quotaTimers.get(taskId));
+    const timer = setTimeout(async () => {
+      this.quotaTimers.delete(taskId);
+      const task = await this.load(taskId);
+      if (!task?.lastError?.resumeAt || this.workers.has(taskId)) return;
+      task.lastError = undefined;
+      log(task, task.stage, "system", "Usage limit reset — resuming automatically.");
+      await saveTask(task);
+      this.emitTask(task);
+      this.pump();
+    }, Math.max(0, at.getTime() - Date.now()));
+    timer.unref?.();
+    this.quotaTimers.set(taskId, timer);
+  }
+
   async retryTask(taskId: string): Promise<void> {
     if (this.workers.has(taskId)) throw new UserError("Task đang chạy.");
     const task = await this.load(taskId);
@@ -578,6 +635,7 @@ export class Company extends EventEmitter {
       updatedAt: now,
       project: { dir, verifyCommands: [], warnings: dir ? await projectDirWarnings(dir) : ["Chưa chọn thư mục dự án."] },
     };
+    plan.project!.handoffOn = await this.defaultHandoffFor(dir);
     await savePlan(plan);
     await this.mutateState((s) => (s.activePlanId = plan.id));
     this.emitPlan();
@@ -585,12 +643,54 @@ export class Company extends EventEmitter {
     return plan;
   }
 
+  /** What's already in the plan's project directory, for the planner — undefined for a new/empty one. */
+  private async projectSurvey(plan: WorkPlanRecord): Promise<string | undefined> {
+    const dir = plan.project?.dir;
+    if (!dir) return undefined;
+    try {
+      const survey = await surveyProject(dir);
+      return survey && formatSurvey(survey);
+    } catch {
+      return undefined;
+    }
+  }
+
+  private environmentCache: Promise<string | undefined> | null = null;
+
+  /** Installed iOS simulators, so the plan can name a real one in its build commands (undefined off macOS). */
+  private machineEnvironment(): Promise<string | undefined> {
+    this.environmentCache ??= new Promise((resolve) => {
+      execFile("xcrun", ["simctl", "list", "devices", "available", "-j"], { timeout: 20_000, maxBuffer: 8 * 1024 * 1024 }, (err, stdout) => {
+        if (err) return resolve(undefined);
+        try {
+          const devices = Object.entries(JSON.parse(stdout).devices as Record<string, { name: string }[]>)
+            .filter(([runtime]) => /iOS/.test(runtime))
+            .flatMap(([, list]) => list.map((d) => d.name))
+            .filter((n) => /^iPhone/.test(n));
+          resolve(devices.length ? `installed iOS simulators: ${[...new Set(devices)].join(", ")}.` : undefined);
+        } catch {
+          resolve(undefined);
+        }
+      });
+    });
+    return this.environmentCache;
+  }
+
+  /** "done" when the directory already holds a project (a repair), else the company setting. */
+  private async defaultHandoffFor(dir: string): Promise<"checkpoint_final" | "done"> {
+    const warnings = dir ? await projectDirWarnings(dir) : [];
+    return warnings.some((w) => /đã có \d+ mục/.test(w)) ? "done" : this.settings.handoffOn;
+  }
+
   private defaultProjectDir(): string {
     return this.projectConfig()?.verifyCwd || this.pipeline.verify.cwd || "";
   }
 
   /** The CEO sets or corrects where the plan's code lives and how it's verified, before approving. */
-  async updatePlanProject(planId: string, update: { dir?: string; verifyCommands?: string[] }): Promise<WorkPlanRecord> {
+  async updatePlanProject(
+    planId: string,
+    update: { dir?: string; verifyCommands?: string[]; handoffOn?: "checkpoint_final" | "done" },
+  ): Promise<WorkPlanRecord> {
     const plan = await loadPlan(planId);
     if (!plan || (plan.status !== "awaiting_approval" && plan.status !== "drafting")) {
       throw new UserError("Chỉ sửa được thư mục / lệnh kiểm tra khi kế hoạch đang lập hoặc chờ duyệt.");
@@ -606,6 +706,8 @@ export class Company extends EventEmitter {
       project.verifyCommands = update.verifyCommands.map((c) => c.trim()).filter(Boolean);
       project.commandsByCeo = true;
     }
+    if (update.handoffOn === "done" || update.handoffOn === "checkpoint_final") project.handoffOn = update.handoffOn;
+    project.commandWarnings = commandWarnings(allPlanCommands(project.verifyCommands, plan.epics));
     plan.project = project;
     plan.updatedAt = nowIso();
     await savePlan(plan);
@@ -613,8 +715,15 @@ export class Company extends EventEmitter {
     return plan;
   }
 
-  async decidePlan(planId: string, approved: boolean, feedback?: string, project?: { dir?: string; verifyCommands?: string[] }): Promise<void> {
-    if (project && (project.dir !== undefined || project.verifyCommands !== undefined)) await this.updatePlanProject(planId, project);
+  async decidePlan(
+    planId: string,
+    approved: boolean,
+    feedback?: string,
+    project?: { dir?: string; verifyCommands?: string[]; handoffOn?: "checkpoint_final" | "done" },
+  ): Promise<void> {
+    if (project && (project.dir !== undefined || project.verifyCommands !== undefined || project.handoffOn !== undefined)) {
+      await this.updatePlanProject(planId, project);
+    }
     const plan = await loadPlan(planId);
     if (!plan || plan.status !== "awaiting_approval") throw new UserError("Kế hoạch không ở trạng thái chờ duyệt.");
     if (approved) {
@@ -625,7 +734,7 @@ export class Company extends EventEmitter {
         throw new UserError("Kế hoạch chưa có lệnh kiểm tra (build/test) — điền lệnh rồi mới duyệt, nếu không sẽ không có gì chứng minh code chạy được.");
       }
       const base = this.projectConfig();
-      const tasks = materializePlan(plan, { ...base, verifyCwd: dir, verifyCommands: commands });
+      const tasks = materializePlan(plan, { ...base, verifyCwd: dir, verifyCommands: commands, handoffOn: plan.project?.handoffOn });
       for (const t of tasks) await saveTask(t);
       plan.status = "approved";
       await savePlan(plan);
@@ -1117,7 +1226,7 @@ export class Company extends EventEmitter {
 
   /** A gated slot's results only hand off once the CEO approves them. */
   private handoffPointFor(task: TaskRecord): HandoffPoint {
-    return this.isGated(task) ? "done" : this.settings.handoffOn;
+    return this.isGated(task) ? "done" : (task.projectConfig?.handoffOn ?? this.settings.handoffOn);
   }
 
   pump(): void {
@@ -1241,6 +1350,18 @@ export class Company extends EventEmitter {
           return false;
         }
         this.finishRun(task, "error", message);
+        // A usage limit that names its reset time won't clear in seconds:
+        // pause until then and resume automatically instead of burning the
+        // retries and leaving the task stuck until someone clicks Retry.
+        const resumeAt = quotaResumeAt(message, new Date());
+        if (resumeAt) {
+          task.lastError = { at: nowIso(), stage: task.stage, message, attempts: attempt + 1, resumeAt: resumeAt.toISOString() };
+          log(task, task.stage, "system", `Usage limit at ${task.stage}: ${message} — paused, resumes automatically at ${clockTime(resumeAt)}.`);
+          await saveTask(task);
+          this.emitTask(task);
+          this.scheduleQuotaResume(task.id, resumeAt);
+          return false;
+        }
         if (attempt < retries) {
           const backoff = this.settings.stageErrorBackoffMs;
           const delay = backoff[Math.min(attempt, backoff.length - 1)] ?? 5000;
@@ -1455,6 +1576,8 @@ export class Company extends EventEmitter {
         limits: this.settings.planLimits,
         revisionFeedback: revision?.feedback,
         previous: revision?.previous,
+        environment: await this.machineEnvironment(),
+        survey: await this.projectSurvey(plan),
         send: { taskId: key, onChunk: (t) => this.onChunk(key, t), signal: this.planController.signal },
         onRound: (round, phase) => {
           this.planPhase = phase === "draft" ? `Round ${round}: Claude is drafting` : `Round ${round}: Gemini is reviewing`;
@@ -1464,6 +1587,7 @@ export class Company extends EventEmitter {
       });
       const project = plan.project ?? { dir: this.defaultProjectDir(), verifyCommands: [], warnings: [] };
       if (!project.commandsByCeo) project.verifyCommands = res.plan.verifyCommands ?? [];
+      project.commandWarnings = commandWarnings(allPlanCommands(project.verifyCommands, res.plan.epics));
       Object.assign(plan, {
         project,
         summary: res.plan.summary,

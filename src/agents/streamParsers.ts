@@ -1,3 +1,4 @@
+import { HttpStatusError } from "./retry.js";
 import type { Usage } from "../types.js";
 
 /**
@@ -77,7 +78,10 @@ export function anthropicStreamUsage(payload: string): { inputTokens?: number; o
 /** Text in one streamGenerateContent SSE payload (a partial GenerateContentResponse). */
 export function geminiChunkText(payload: string): string {
   const data = JSON.parse(payload);
-  if (data?.error) throw new Error(`Gemini stream error: ${JSON.stringify(data.error)}`);
+  // Carry the error's own HTTP code, so a 503 "high demand" or a 429 inside
+  // the stream is retried like one on the initial response — not treated as
+  // final (which sent reviews straight to the Claude stand-in).
+  if (data?.error) throw new HttpStatusError(Number(data.error.code) || 0, `Gemini stream error: ${JSON.stringify(data.error)}`);
   return (data?.candidates?.[0]?.content?.parts ?? []).map((p: any) => (typeof p?.text === "string" ? p.text : "")).join("");
 }
 

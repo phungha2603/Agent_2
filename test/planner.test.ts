@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { draftAndReviewPlan, materializePlan, parsePlan, type Department, type WorkPlanRecord } from "../src/orchestrator/planner.js";
+import { buildPlanPrompt, commandWarnings, draftAndReviewPlan, materializePlan, parsePlan, type Department, type WorkPlanRecord } from "../src/orchestrator/planner.js";
 import { MOCK_PLAN, createMockAgent } from "../src/agents/mock.js";
 import type { Agent, AgentResponse } from "../src/types.js";
 
@@ -127,5 +127,50 @@ describe("materializePlan", () => {
     expect(byTitle("E1.S1").context.sharedBrief).toContain("E2.S1"); // teammates' work listed, so it isn't duplicated
     expect(record.epics![0].subtasks[0].taskId).toBe(byTitle("E1.S1").id);
     expect(new Set(tasks.map((t) => t.id)).size).toBe(9);
+  });
+});
+
+
+describe("per-task verification commands", () => {
+  const planJson = JSON.stringify({
+    summary: "s",
+    verifyCommands: ["swift build", "swift test"],
+    epics: [
+      {
+        id: "E1", title: "E1", owner: "AG-05", goal: "g", acceptanceCriteria: ["ec"], verifyCommands: ["bash scripts/test.sh"],
+        subtasks: [
+          { id: "E1.S1", title: "py", owner: "AG-03", description: "d", acceptanceCriteria: ["c"], dependsOn: [], verifyCommands: ["python3 -m pytest -q content/scripts", "swift test"] },
+          { id: "E1.S2", title: "sw", owner: "AG-04", description: "d", acceptanceCriteria: ["c"], dependsOn: [] },
+        ],
+      },
+    ],
+  });
+
+  it("gives each task the baseline plus its own commands, without duplicates", () => {
+    const { plan: p } = parsePlan(planJson, DEPTS);
+    const record: WorkPlanRecord = { id: "plan-x", goal: "g", status: "approved", createdAt: "", updatedAt: "", ...p };
+    const tasks = materializePlan(record, { verifyCwd: "/proj", verifyCommands: p.verifyCommands! });
+    const cmds = (title: string) => tasks.find((t) => t.context.title.startsWith(title))!.projectConfig!.verifyCommands;
+    expect(cmds("E1.S1")).toEqual(["swift build", "swift test", "python3 -m pytest -q content/scripts"]);
+    expect(cmds("E1.S2")).toEqual(["swift build", "swift test"]);
+    expect(cmds("E1 · ")).toEqual(["swift build", "swift test", "bash scripts/test.sh"]);
+  });
+
+  it("warns when every iOS build targets only the generic simulator, not a concrete one like Xcode's Run", () => {
+    expect(commandWarnings(["xcodebuild -scheme App -destination 'generic/platform=iOS Simulator' build"])).toHaveLength(1);
+    expect(
+      commandWarnings([
+        "xcodebuild -scheme App -destination 'generic/platform=iOS Simulator' build",
+        "xcodebuild -scheme App -destination 'platform=iOS Simulator,name=iPhone 17' build",
+      ]),
+    ).toEqual([]);
+    expect(commandWarnings(["swift test", "xcodebuild -list -project App.xcodeproj"])).toEqual([]);
+  });
+
+  it("tells Claude about per-task commands, concrete simulators and this machine's simulators", () => {
+    const prompt = buildPlanPrompt("goal", DEPTS, { maxEpics: 3, maxSubtasks: 8 }, undefined, "installed iOS simulators: iPhone 17.");
+    expect(prompt).toMatch(/verifyCommands on a subtask or epic/);
+    expect(prompt).toMatch(/platform=iOS Simulator,name=/);
+    expect(prompt).toMatch(/This machine: installed iOS simulators: iPhone 17\./);
   });
 });

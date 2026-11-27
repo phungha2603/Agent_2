@@ -15,7 +15,10 @@ import type { VerifyConfig } from "../verify/runner.js";
 import { runVerification } from "../verify/runner.js";
 import { newTaskId } from "../store/taskStore.js";
 import { parseFileBlocks, writeFiles } from "../apply/applyFiles.js";
+import { readFile } from "node:fs/promises";
+import path from "node:path";
 import { checkFiles, checkWrittenFiles, formatFileProblems } from "../verify/fileChecks.js";
+import { prepareShadow, type IsolationConfig } from "../verify/workspace.js";
 import { sendReview, VERDICT_INSTRUCTION } from "../agents/verdict.js";
 import { pruneContext } from "./contextPruning.js";
 import { applyArchitectureRevision } from "./archRevision.js";
@@ -94,6 +97,12 @@ export interface VisualConfig {
 
 export interface PipelineConfig {
   verify: VerifyConfig;
+  /**
+   * When set, verification runs in a shadow copy of the project and the
+   * engineer's files reach the project only once it passes. Unset keeps the
+   * old behavior (write into the project, verify there).
+   */
+  isolation?: IsolationConfig;
   maxImplementationAttempts: number;
   maxReviewRejections: number;
   /** Safety ceiling on Claude/Gemini architecture discussion rounds (default 20 — meant to never be hit in practice). */
@@ -128,9 +137,17 @@ const READ_FILES_NOTE =
   "You can open the project's actual files with the Read, Grep and Glob tools (your working directory is the project) — use them when the real contents matter. " +
   "If those tools are not available to you, everything you need is in this message: never write out a tool call as text.";
 
+const CEO_REQUESTS_RULE =
+  "If CEO requests or CEO directives are listed above, go through every one of them: for each, say whether it is done and point at the evidence (which file, what it now contains). If any one is not done, reject — however good the rest is. ";
+
 const EVIDENCE_RULE =
   "Evidence rule: the only proof that the code builds and its tests pass is the verification log the orchestrator ran on this machine (shown first, labelled as such). " +
   "Anything the engineer says about having run, tested or verified things in its own environment is an unverified claim and counts for nothing. ";
+
+const FILES_LINE_RULE =
+  "End the guide with one line listing every file the engineer may create or change, exactly in this form: `FILES: path/one.ext, path/two.ext` (paths relative to the project root; `*` matches within one path segment, e.g. `scripts/*.sh`). " +
+  "The engineer may not write any other file, so leave out files that must stay as they are (and anything a CEO directive says not to touch). " +
+  "The engineer cannot read the project: for each existing file it must change, include in the guide that file's current content, or the exact parts it must keep, so it doesn't rebuild the file from an outdated copy.";
 
 /** Shortest first-draft guide accepted; anything shorter is a note about the guide, not the guide. */
 const MIN_SPEC_CHARS = 200;
@@ -152,7 +169,8 @@ const PROMPTS = {
     "You'll get a chance to go deep on exactly the part that needs it if Gemini pushes back on this round, so there's no need to over-specify everything up front. " +
     "If upstream handoffs are listed, build on those files and interfaces instead of recreating them. " +
     READ_FILES_NOTE +
-    " Your reply itself is the guide — the complete document, not a note about what you'll do next.",
+    " Your reply itself is the guide — the complete document, not a note about what you'll do next. " +
+    FILES_LINE_RULE,
   architectureRevision:
     "You are revising the architecture guide above after Gemini's feedback (below). Reply with ONLY a unified diff against the exact guide shown above — no prose before or after, don't restate the whole guide. " +
     "Go as deep and precise as the fix actually needs — exact function signatures, pseudocode, step-by-step logic for the specific part(s) you're changing, even though the original guide was kept concise; this is exactly the moment to add that depth. " +
@@ -164,6 +182,7 @@ const PROMPTS = {
     "Read it against the idea brief and the acceptance criteria (every criterion must have a clear way to be met and tested). If it's solid, approve it. If something is missing, ambiguous, risky, or could be designed better, reject and say exactly what to add or change — name the specific section, file, or interface and what you'd write instead, since Claude will revise the spec and you'll read the new version next round. " +
     "There is no limit on how many rounds this can take — only approve once you'd actually be comfortable seeing this built exactly as written. " +
     "An empty or placeholder spec (e.g. only a note that Claude will check something first) must be rejected. " +
+    "If CEO requests or CEO directives are listed above, the guide must cover every one of them; reject a guide that leaves one out. " +
     VERDICT_INSTRUCTION,
   implementation:
     "You are the engineer. Implement the following architecture spec in code, making sure every acceptance criterion listed is met (with a test where possible).\n" +
@@ -173,12 +192,14 @@ const PROMPTS = {
     "If the file itself contains a line of three backticks (e.g. a Markdown file with code samples), fence it with four or more backticks instead. " +
     "Only what is inside each file's code block is written to disk — put any explanation, notes or logs outside the code blocks, never inside them. " +
     "Do not skip writing a file's contents, and do not just describe what a file would contain. " +
+    "Write only the files on the guide's `FILES:` line — a reply that writes any other file is rejected as a whole. " +
     "The orchestrator builds and tests the files on the user's machine itself after you reply; whatever you ran in your own environment is not taken as proof that anything works.",
   reviewGemini:
     "REVIEW: Review this implementation against the idea brief, the acceptance criteria (each listed criterion must be demonstrably met — name any that isn't), and the verification log. " +
     "If a reference style image and a screenshot of the running implementation are attached, compare them directly — " +
     "say concretely where the screenshot matches or deviates from the reference's look (composition, color, mood, missing/extra elements), not just whether the code builds. " +
     EVIDENCE_RULE +
+    CEO_REQUESTS_RULE +
     "Approve or reject, with reasons. " +
     VERDICT_INSTRUCTION,
   reviewClaude:
@@ -187,6 +208,7 @@ const PROMPTS = {
     "If you reject — whether because you agree with that feedback or found your own issue — don't just say what's wrong: give precise, step-by-step instructions for exactly how to fix it (which file, which function, what the corrected logic should look like), as if correcting a student's work directly, so the engineer can act on it without guessing. " +
     "You are always the one who makes this call, not the independent reviewer. " +
     EVIDENCE_RULE +
+    CEO_REQUESTS_RULE +
     READ_FILES_NOTE +
     " Approve or reject, with reasons. " +
     VERDICT_INSTRUCTION,
@@ -196,6 +218,7 @@ const PROMPTS = {
     "If a reference style image and a screenshot of the running implementation are attached, compare them directly — say concretely where the screenshot matches or deviates from the reference's look. " +
     "This is your own final decision. If you reject, don't just say what's wrong: give precise, step-by-step instructions for exactly how to fix it (which file, which function, what the corrected logic should look like), as if correcting a student's work directly, so the engineer can act on it without guessing. " +
     EVIDENCE_RULE +
+    CEO_REQUESTS_RULE +
     READ_FILES_NOTE +
     " Approve or reject, with reasons. " +
     VERDICT_INSTRUCTION,
@@ -252,7 +275,33 @@ export function specProblem(spec: string, opts: { requireLength: boolean }): str
   if (opts.requireLength && len < MIN_SPEC_CHARS) {
     return `it is only ${len} characters — a note about the guide, not the guide`;
   }
+  if (opts.requireLength && !allowedFilesFrom(spec)) {
+    return "it has no closing `FILES: ...` line listing the files the engineer may write";
+  }
   return undefined;
+}
+
+/** The file patterns on the guide's last `FILES:` line, or undefined if it has none (older guides: no limit). */
+export function allowedFilesFrom(spec: string | undefined): string[] | undefined {
+  const lines = [...(spec ?? "").matchAll(/^[ \t>*_`-]*FILES:[*_`]*[ \t]*(.+)$/gim)];
+  if (!lines.length) return undefined;
+  const list = lines[lines.length - 1][1]
+    .split(",")
+    .map((p) => p.replace(/[`*_]+$/g, "").replace(/^[`]+|[`]+$/g, "").trim())
+    .filter(Boolean);
+  return list.length ? list : undefined;
+}
+
+/** Whether `file` is one of the allowed patterns (`*` = within one segment, `**` = across segments). */
+export function fileAllowed(file: string, patterns: string[]): boolean {
+  const norm = (p: string) => p.replace(/^\.\//, "");
+  return patterns.some((pat) => {
+    const re = norm(pat)
+      .split(/(\*\*|\*)/)
+      .map((part) => (part === "**" ? ".*" : part === "*" ? "[^/]*" : part.replace(/[.+?^${}()|[\]\\]/g, "\\$&")))
+      .join("");
+    return new RegExp(`^${re}$`).test(norm(file));
+  });
 }
 
 /** Options for Claude's file-reading calls: the task's own project directory, read-only tools. */
@@ -392,8 +441,14 @@ export async function applyImplementation(task: TaskRecord, config: PipelineConf
     return;
   }
   const unfenced = files.filter((f) => !f.fenced).map((f) => ({ path: f.path, problems: ["its contents are not inside a complete fenced code block (missing, or never closed), so they can't be told apart from prose"] }));
+  const allowed = allowedFilesFrom(task.context.architectureSpec);
+  const outside = allowed
+    ? files
+        .filter((f) => !fileAllowed(f.path, allowed))
+        .map((f) => ({ path: f.path, problems: [`not on the guide's FILES: line (${allowed.join(", ")}) — only those files may be written`] }))
+    : [];
   const broken = await checkFiles(files.filter((f) => f.fenced));
-  const problems = [...unfenced, ...broken];
+  const problems = [...outside, ...unfenced, ...broken];
   if (problems.length) {
     setAlert(
       task,
@@ -409,10 +464,49 @@ export async function applyImplementation(task: TaskRecord, config: PipelineConf
     );
     return;
   }
+  if (config.isolation) {
+    // Nothing touches the project yet: verification writes these into its
+    // own copy and promotes them only if every check passes.
+    task.context.implementationFiles = files.map((f) => f.path);
+    log(
+      task,
+      task.stage,
+      "muse",
+      `Implementation attempt #${task.implementationAttempts}: ${files.length} file(s) ready for verification in an isolated copy of the project: ${files.map((f) => f.path).join(", ")}.`,
+    );
+    task.stage = "verification";
+    return;
+  }
   const written = await writeFiles(resolveVerify(task, config).cwd, files);
   task.context.implementationFiles = written;
   log(task, task.stage, "muse", `Implementation attempt #${task.implementationAttempts}: wrote ${written.length} file(s): ${written.join(", ")}.`);
   task.stage = "verification";
+}
+
+/**
+ * Before anyone reviews this attempt, checks its files on disk still hold
+ * what the engineer wrote. If another task has written over one since, the
+ * reviewers would be judging something that isn't what's in the project.
+ */
+async function flagOverwrittenFiles(task: TaskRecord, config: PipelineConfig): Promise<void> {
+  const root = resolveVerify(task, config).cwd;
+  const changed: string[] = [];
+  for (const f of attemptFiles(task)) {
+    const onDisk = await readFile(path.join(root, f.path), "utf8").catch(() => undefined);
+    if (onDisk !== f.content) changed.push(f.path);
+  }
+  if (changed.length) {
+    setAlert(task, "files_overwritten", "warn", `File trên đĩa đã khác với bản task này viết (có thể bị task khác ghi đè): ${changed.join(", ")} — review có thể không khớp với dự án.`);
+    log(task, task.stage, "system", `Files changed on disk since this attempt wrote them: ${changed.join(", ")}.`);
+  } else {
+    clearAlert(task, "files_overwritten");
+  }
+}
+
+/** This attempt's files, re-read from the engineer's reply (the reply is the record; nothing else holds them before promotion). */
+function attemptFiles(task: TaskRecord) {
+  const wanted = new Set(task.context.implementationFiles ?? []);
+  return parseFileBlocks(task.context.implementationDiff ?? "").filter((f) => f.fenced && wanted.has(f.path));
 }
 
 /**
@@ -522,7 +616,14 @@ export async function advance(task: TaskRecord, agents: Agents, config: Pipeline
     case "verification": {
       const verify = resolveVerify(task, config);
       const files = task.context.implementationFiles ?? [];
-      const result = await runVerification(verify);
+      const staged = config.isolation ? attemptFiles(task) : [];
+      // Rebuilt on every run (not kept from the implementation step), so a
+      // restart between the two stages can't verify a stale copy.
+      const runCwd = config.isolation ? await prepareShadow(verify.cwd, config.isolation, staged) : verify.cwd;
+      const result = await runVerification({ cwd: runCwd, commands: verify.commands });
+      if (config.isolation) {
+        result.log = `(Run in an isolated copy of the project, ${runCwd} — the project itself is only updated if verification passes.)\n${result.log}`;
+      }
       if (!verify.commands.length) {
         setAlert(task, "verify_unconfigured", "warn", "Task này không có lệnh kiểm tra nào — không thể chứng minh code chạy được.");
       } else {
@@ -530,7 +631,7 @@ export async function advance(task: TaskRecord, agents: Agents, config: Pipeline
       }
       // Always, whatever the project's own commands cover: every file this
       // attempt wrote must still parse as its language.
-      const broken = await checkWrittenFiles(verify.cwd, files);
+      const broken = await checkWrittenFiles(runCwd, files);
       if (broken.length) {
         result.passed = false;
         result.log += `\n\n== Syntax check of the files written this attempt: ${broken.length} FAILED ==\n${formatFileProblems(broken)}`;
@@ -551,12 +652,18 @@ export async function advance(task: TaskRecord, agents: Agents, config: Pipeline
       }
       task.context.verificationLog = result.log;
       log(task, task.stage, "system", result.passed ? "Verification passed." : "Verification FAILED.");
+      if (result.passed && config.isolation && staged.length) {
+        const promoted = await writeFiles(verify.cwd, staged);
+        log(task, task.stage, "system", `Promoted ${promoted.length} verified file(s) into the project: ${promoted.join(", ")}.`);
+      } else if (!result.passed && config.isolation) {
+        log(task, task.stage, "system", "Nothing from this attempt was written to the project (verification failed in the isolated copy).");
+      }
       if (result.passed) {
         const visual = resolveVisual(task, config);
         if (visual) {
           try {
             await visual.captureScreenshot({
-              cwd: verify.cwd,
+              cwd: runCwd,
               buildDir: visual.buildDir,
               outPath: visual.screenshotPath,
               waitMs: visual.screenshotWaitMs,
@@ -579,6 +686,7 @@ export async function advance(task: TaskRecord, agents: Agents, config: Pipeline
     }
 
     case "review_gemini": {
+      await flagOverwrittenFiles(task, config);
       // Gemini is the independent reviewer for this stage, but its free
       // tier can go down for stretches (rate limits, server overload) —
       // when it's genuinely exhausted its own retry budget (not just a
@@ -653,6 +761,7 @@ export function resolveCheckpoint(task: TaskRecord, approved: boolean, feedback?
     log(task, task.stage, "ceo", approved ? "Shipped." : "Sent back for a redesign.");
     if (approved) {
       task.stage = "done";
+      task.context.ceoRequests = [];
     } else {
       // Route all the way back through ideation, not just architecture: a
       // human rejecting at the final checkpoint after both agents already
@@ -675,6 +784,7 @@ export function resolveCheckpoint(task: TaskRecord, approved: boolean, feedback?
   }
   if (!approved && feedback) {
     task.context.reviewFeedback = [feedback];
+    (task.context.ceoRequests ??= []).push(feedback);
   }
   if (task.stage !== "done") task.alerts = [];
   return task;
@@ -695,6 +805,7 @@ export function requestRevision(task: TaskRecord, feedback: string): TaskRecord 
   task.reviewRejections = 0;
   task.autoRecoveries = 0;
   task.context.reviewFeedback = [`CEO revision request (keep the architecture; change exactly this):\n${request}`];
+  (task.context.ceoRequests ??= []).push(request);
   log(task, task.stage, "ceo", `Revision requested: ${request}`);
   task.alerts = [];
   trace(task, "CEO", "revise", `Sent back to implementation for a revision: ${request}`);
@@ -743,6 +854,7 @@ export function amendShippedTask(task: TaskRecord, change: string): TaskRecord {
   task.architectureRounds = 0;
   task.autoRecoveries = 0;
   task.context.reviewFeedback = [change];
+  task.context.ceoRequests = [change];
   task.stage = "architecture";
   task.alerts = [];
   log(task, task.stage, "ceo", `Amending shipped task: ${change}`);

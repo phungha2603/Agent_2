@@ -106,7 +106,7 @@ describe("Company scheduler", () => {
     await waitFor(async () => (await c.planSnapshot())?.status === "awaiting_approval");
     expect(await allTasks(c)).toHaveLength(0); // nothing starts before the CEO approves the plan
 
-    await c.decidePlan(plan.id, true);
+    await c.decidePlan(plan.id, true, undefined, { handoffOn: "checkpoint_final" });
     await waitFor(async () => (await allTasks(c)).filter((x: any) => x.queueState === "waiting_you").length === 9);
 
     // Engine caps held, and independent work really did overlap.
@@ -216,6 +216,7 @@ describe("plan project settings", () => {
     const projectDir = path.join(dir, "vocab-app");
     const plan = await c.startPlan("Build the vocab app", projectDir);
     expect(plan.project?.warnings.join(" ")).toMatch(/chưa tồn tại/);
+    expect(plan.project?.handoffOn).toBe("checkpoint_final"); // a new project keeps the company setting
     await waitFor(async () => (await c.planSnapshot())?.status === "awaiting_approval");
     expect((await c.planSnapshot())?.project?.verifyCommands).toEqual(["test -s NOTES.md"]); // Claude's proposal
 
@@ -226,7 +227,7 @@ describe("plan project settings", () => {
     await c.decidePlan(plan.id, true, undefined, { verifyCommands: ["test -s NOTES.md", "true"] });
     const tasks = await allTasks(c);
     const detail = await c.taskDetail(tasks[0].id);
-    expect(detail.task.projectConfig).toMatchObject({ verifyCwd: projectDir, verifyCommands: ["test -s NOTES.md", "true"] });
+    expect(detail.task.projectConfig).toMatchObject({ verifyCwd: projectDir, verifyCommands: ["test -s NOTES.md", "true"], handoffOn: "checkpoint_final" });
   });
 
   it("warns when the project directory already holds other files", async () => {
@@ -235,5 +236,7 @@ describe("plan project settings", () => {
     writeFileSync(path.join(dir, "factorial.py"), "x = 1\n");
     const plan = await c.startPlan("goal", dir);
     expect(plan.project?.warnings.join(" ")).toMatch(/factorial\.py/);
+    // Repairing an existing project: dependents wait for the CEO's approval by default.
+    expect(plan.project?.handoffOn).toBe("done");
   });
 });

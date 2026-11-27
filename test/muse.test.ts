@@ -78,6 +78,29 @@ describe("createMusePoolAgent", () => {
     expect(closed.sort()).toEqual(["acc1", "acc2"]);
   });
 
+  it("passes over an account that just failed while another one is free", async () => {
+    const used: string[] = [];
+    let failFirst = true;
+    const account = (name: string): Agent => ({
+      role: "muse",
+      async send(): Promise<AgentResponse> {
+        used.push(name);
+        if (name === "acc1" && failFirst) {
+          failFirst = false;
+          throw new Error("Muse did not start replying within 240s");
+        }
+        return { role: "muse", content: "ok" };
+      },
+    });
+    let t = 0;
+    const pool = createMusePoolAgent([account("acc1"), account("acc2")], { cooldownMs: 1000, now: () => t });
+    await expect(pool.send("a", {} as TaskContext)).rejects.toThrow(/did not start/);
+    await pool.send("b", {} as TaskContext); // retry goes to acc2, not the stuck acc1
+    t = 5000; // cooldown over
+    await pool.send("c", {} as TaskContext);
+    expect(used).toEqual(["acc1", "acc2", "acc1"]);
+  });
+
   it("rejects an empty pool", () => {
     expect(() => createMusePoolAgent([])).toThrow();
   });

@@ -14,6 +14,9 @@ export function formatContext(context: TaskContext): string {
   if (context.directives?.length) {
     parts.push(`--- CEO directives (follow these; they override any earlier instruction) ---\n${context.directives.map((d) => `- ${d}`).join("\n")}`);
   }
+  if (context.ceoRequests?.length) {
+    parts.push(`--- CEO requests for this task (every one must be done) ---\n${context.ceoRequests.map((r) => `- ${r}`).join("\n")}`);
+  }
   if (context.sharedBrief) parts.push(`--- Shared plan context ---\n${context.sharedBrief}`);
   if (context.attachments?.length) {
     parts.push(
