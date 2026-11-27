@@ -81,6 +81,8 @@ const state = {
   artifacts: { list: [], selected: null, agent: "", q: "" },
   timeline: null,
   rebalance: null,
+  /** Composer ("Dự án mới") open state: null = follow the plan automatically, true/false = the user's choice until the plan changes. */
+  composer: { manual: null, sig: "" },
 };
 
 // ---------- utils ----------
@@ -259,34 +261,40 @@ function renderTelemetry() {
         .map(([name, s]) => `<button class="engine eng-${name} ${s.running >= s.limit ? "busy" : ""}" data-action="engine-open" data-engine="${name}" title="${esc(ENGINE_LABEL[name])}: ${s.running}/${s.limit} đang chạy${s.waiting ? `, ${s.waiting} đang chờ lượt` : ""} — bấm để xem hàng đợi"><b>${ENGINE_LABEL[name] ?? name}</b> ${s.running}/${s.limit}${s.waiting ? ` · chờ ${s.waiting}` : ""}</button>`)
         .join("")
     : "";
+  const c = t.counts;
+  const kpi = (cls, n, label, extra = "") => `<div class="kpi ${cls}${n > 0 ? " hot" : ""}"${extra}><b>${n}</b><span>${label}</span></div>`;
   el.innerHTML = `
     <div class="tm-progress" title="% hoàn thành toàn công ty (theo bước của từng task)">
-      <div class="tm-pct">${t.percent}%</div>
-      <div class="tm-bar"><div class="tm-fill" style="width:${t.percent}%"></div></div>
+      <div class="ring${t.percent >= 100 ? " full" : ""}" style="--p:${t.percent}"><span class="tm-pct">${t.percent}<small>%</small></span></div>
+      <div class="tm-progress-text"><b>${t.percent >= 100 ? "Hoàn tất" : c.running ? "Đang chạy" : t.paused ? "Tạm dừng" : "Tiến độ"}</b><span class="muted small">${c.done}/${c.total} task xong</span></div>
     </div>
-    <div class="tm-counts">
-      <span class="tm q-running">▶ <b>${t.counts.running}</b> chạy</span>
-      <span class="tm q-queued">⏸ <b>${t.counts.queued}</b> chờ</span>
-      <button class="tm tm-link q-waiting_you" data-action="inbox-open" data-tab="waiting" title="Mở hộp duyệt">✋ <b>${t.counts.waitingYou}</b> chờ duyệt</button>
-      <span class="tm q-error">⚠ <b>${t.counts.errors}</b> lỗi/chặn</span>
-      <span class="tm q-done">✓ <b>${t.counts.done}</b>/${t.counts.total} xong</span>
+    <div class="kpi-group">
+      ${kpi("q-running", c.running, "Đang chạy")}
+      ${kpi("q-queued", c.queued, "Hàng đợi")}
+      <button class="kpi tm-link q-waiting_you${c.waitingYou > 0 ? " hot" : ""}" data-action="inbox-open" data-tab="waiting" title="Mở hộp duyệt"><b>${c.waitingYou}</b><span>Chờ bạn duyệt</span></button>
+      ${kpi("q-error", c.errors, "Lỗi / chặn")}
+      <div class="kpi q-done${c.total && c.done === c.total ? " hot" : ""}"><b>${c.done}<small>/${c.total}</small></b><span>Đã xong</span></div>
     </div>
-    <div class="tm-usage">
-      ${runClock}
-      <span class="tm" title="${esc(engineTip)}"><b>${fmtTok(t.tokens.input + t.tokens.output)}</b> token${t.tokensEstimated ? "*" : ""}</span>
-      <span class="tm eng-claude" title="Riêng Claude đã dùng trong phiên này${claudeUsage ? ` — ${fmtTok(claudeUsage.input)} in / ${fmtTok(claudeUsage.output)} out${claudeUsage.costUsd ? ` · ${fmtCost(claudeUsage.costUsd)}` : ""}` : ""}">🧠 Claude <b>${fmtTok(claudeTok)}</b> tok</span>
-      <span class="tm" title="Claude CLI tự báo chi phí (theo giá API — gói Pro/Max không tính thêm). Gemini/Claude API chỉ tính nếu đặt giá trong .env. Muse không có số liệu."><b>${fmtCost(t.costUsd)}</b>${t.costPartial ? " ước tính" : ""}</span>
-      ${t.paused ? `<span class="tm paused-pill">⏸ Đang tạm dừng</span>` : ""}
+    <div class="kpi-group">
+      ${t.runStartedAt
+        ? `<div class="kpi"><b class="run-clock" data-start="${esc(t.runStartedAt)}" ${end ? `data-end="${end}"` : ""}>${fmtDur((end ?? Date.now()) - new Date(t.runStartedAt).getTime())}</b><span>Thời gian chạy</span></div>`
+        : `<div class="kpi"><b>—</b><span>Chưa chạy</span></div>`}
+      <div class="kpi" title="${esc(engineTip)}"><b>${fmtTok(t.tokens.input + t.tokens.output)}${t.tokensEstimated ? "*" : ""}</b><span>Token</span></div>
+      <div class="kpi eng-claude" title="Riêng Claude đã dùng trong phiên này${claudeUsage ? ` — ${fmtTok(claudeUsage.input)} in / ${fmtTok(claudeUsage.output)} out${claudeUsage.costUsd ? ` · ${fmtCost(claudeUsage.costUsd)}` : ""}` : ""}"><b>${fmtTok(claudeTok)}</b><span>Token Claude</span></div>
+      <div class="kpi" title="Claude CLI tự báo chi phí (theo giá API — gói Pro/Max không tính thêm). Gemini/Claude API chỉ tính nếu đặt giá trong .env. Muse không có số liệu."><b>${fmtCost(t.costUsd)}</b><span>Chi phí${t.costPartial ? " (ước tính)" : ""}</span></div>
+      ${t.paused ? `<span class="paused-pill">⏸ Đang tạm dừng</span>` : ""}
     </div>
     <div class="engines">${engines}</div>`;
   const pauseBtn = $("#pause-btn");
   pauseBtn.textContent = state.control.paused ? "▶ Resume" : "⏸ Pause";
   pauseBtn.classList.toggle("btn-resume", state.control.paused);
+  renderDoneBanner();
+  renderComposer();
 }
 
 function renderCompanyDirectives() {
   $("#company-directives").innerHTML = (state.control.directives || [])
-    .map((d) => `<span class="directive" title="${esc(fmtTime(d.at))}">📌 ${esc(d.text)} <button class="x" data-action="directive-remove" data-id="${esc(d.id)}" title="Gỡ chỉ thị">×</button></span>`)
+    .map((d) => directiveChip(d, fmtTime(d.at)))
     .join("");
 }
 
@@ -298,15 +306,97 @@ function renderApproveAll() {
   btn.dataset.count = String(n);
 }
 
+// ---------- composer, completion banner, theme ----------
+function planFinished() {
+  const t = state.telemetry;
+  return !!(state.plan?.status === "approved" && t && t.counts.total > 0 && t.counts.done === t.counts.total);
+}
+
+/** The new-project form is open when there is nothing running to look at; it folds away while a plan is in flight. */
+function renderComposer() {
+  const plan = state.plan;
+  const sig = `${plan?.id ?? ""}|${plan?.status ?? ""}|${planFinished()}`;
+  if (state.composer.sig !== sig) {
+    state.composer.sig = sig;
+    state.composer.manual = null;
+  }
+  const auto = !plan || plan.status === "failed" || plan.status === "discarded";
+  const open = state.composer.manual ?? auto;
+  $("#composer").classList.toggle("collapsed", !open);
+  const btn = $("#composer-toggle");
+  btn.setAttribute("aria-expanded", String(open));
+  btn.textContent = open ? "✕ Đóng khung dự án mới" : "＋ Dự án mới";
+  btn.classList.toggle("active", open);
+  // first paint lands in the right state without animating; later toggles slide
+  requestAnimationFrame(() => $("#composer").classList.remove("no-anim"));
+}
+
+function renderDoneBanner() {
+  const el = $("#done-banner");
+  const plan = state.plan;
+  const t = state.telemetry;
+  if (!planFinished() || localStorage.getItem("dash-banner-dismissed") === plan.id) {
+    el.hidden = true;
+    return;
+  }
+  const end = t.runEndedAt ? new Date(t.runEndedAt).getTime() : Date.now();
+  const dur = t.runStartedAt ? fmtDur(end - new Date(t.runStartedAt).getTime()) : "—";
+  const gh = plan.project?.githubUrl;
+  el.hidden = false;
+  el.innerHTML = `
+    <div class="db-icon" aria-hidden="true">✓</div>
+    <div class="db-main">
+      <div class="db-title">Dự án hoàn tất</div>
+      <div class="db-goal" title="${esc(plan.goal)}">${esc(plan.goal)}</div>
+      <div class="db-stats">
+        <span><b>${t.counts.done}/${t.counts.total}</b> task</span>
+        <span><b>${dur}</b> thời gian chạy</span>
+        <span><b>${fmtTok(t.tokens.input + t.tokens.output)}</b> token</span>
+        <span><b>${fmtCost(t.costUsd)}</b> chi phí${t.costPartial ? " ước tính" : ""}</span>
+      </div>
+    </div>
+    <div class="db-actions">
+      <button class="btn btn-soft" data-action="view" data-view="artifacts">📦 Xem sản phẩm</button>
+      <button class="btn btn-soft" data-action="view" data-view="timeline">📈 Timeline</button>
+      ${gh ? `<a class="btn btn-soft" href="${esc(gh)}" target="_blank" rel="noopener">GitHub ↗</a>` : ""}
+      <button class="btn btn-primary" data-action="composer-open">＋ Dự án mới</button>
+      <button class="btn btn-ghost btn-square" data-action="banner-dismiss" data-plan="${esc(plan.id)}" title="Ẩn banner">✕</button>
+    </div>`;
+}
+
+function setTheme(theme) {
+  document.documentElement.dataset.theme = theme;
+  localStorage.setItem("dash-theme", theme);
+  $("#theme-btn").textContent = theme === "light" ? "☾" : "☀";
+  scheduleEdges();
+}
+
 // ---------- cards ----------
+function initials(name) {
+  const words = String(name ?? "").replace(/^AI /, "").split(/[\s&·/-]+/).filter(Boolean);
+  if (!words.length) return "?";
+  return (words.length > 1 ? words[0][0] + words[1][0] : words[0].slice(0, 2)).toUpperCase();
+}
+/** Initials on a tinted disc: hue from the slot number so each agent is recognisable, ring colour from its tier. */
+function avatar(slot) {
+  const n = Number(String(slot.id).replace(/\D/g, "")) || 0;
+  const hue = (n * 47 + 190) % 360;
+  return `<span class="avatar tier-${slot.tier ?? 3}" style="--h:${hue}" title="${esc(slot.icon ?? "")} ${esc(slot.name)}" aria-hidden="true">${esc(initials(slot.name))}<span class="avatar-dot"></span></span>`;
+}
+/** A directive chip whose text is clamped to a few lines; clicking the text expands it. */
+function directiveChip(d, tip = "") {
+  const key = `dir:${d.id}`;
+  const open = state.open.has(key);
+  return `<span class="directive${open ? " expanded" : ""}"${tip ? ` title="${esc(tip)}"` : ""}><span class="d-text" data-action="expand" data-key="${esc(key)}" title="${open ? "Thu gọn" : "Bấm để xem đầy đủ"}">📌 ${esc(d.text)}</span><button class="x" data-action="directive-remove" data-id="${esc(d.id)}" title="Gỡ chỉ thị">×</button></span>`;
+}
 const STATE_ICON = { running: "▶", needs_review: "✋", blocked: "⛔", waiting_input: "⏳", ready: "●", paused: "⏸", done: "✓", idle: "○" };
 
 function cardSkeleton(slot) {
   return `
     <div class="card${slot.isBoss ? " card-boss" : ""}" data-slot="${slot.id}">
       <div class="card-header">
-        <span class="card-icon">${slot.icon}</span>
-        <span class="card-name" title="${esc(slot.name)}">${slot.id} · ${esc(slot.name.replace(/^AI /, ""))}</span>
+        ${avatar(slot)}
+        <span class="card-name" title="${esc(slot.name)}"><span class="card-role">${esc(slot.name.replace(/^AI /, ""))}</span><span class="card-id">${slot.id}</span></span>
         <span class="card-tools" data-part="tools"></span>
       </div>
       <div data-part="state"></div>
@@ -361,6 +451,11 @@ function taskBody(slot, t) {
     ? details(`ac:${t.id}`, `Tiêu chí nghiệm thu (${t.acceptanceCriteria.length})`, `<ul class="ac">${t.acceptanceCriteria.map((c) => `<li>${esc(c)}</li>`).join("")}</ul>`)
     : "";
   const logs = t.logs.length ? t.logs.slice(-3).map((l) => `<div class="log-line" title="${esc(l.text)}">${esc(l.at)}: ${esc(l.text)}</div>`).join("") : "";
+  const history = `
+    ${logs ? `<div class="logs">${logs}</div>` : ""}
+    ${t.lastError ? `<div class="feedback-box is-error">⚠ ${esc(t.lastError)}</div>` : ""}
+    ${alertsBlock(t)}
+    ${!t.waitingForYou && t.lastFeedback ? `<div class="feedback-box reject-hint">💬 ${esc(truncate(t.lastFeedback, 220))}</div>${t.lastFeedback.length > 220 ? details(`fb:${t.id}`, "Xem toàn bộ phản hồi", `<div class="feedback-box">${esc(t.lastFeedback)}</div>`) : ""}` : ""}`;
   const remaining = slot.queueRemaining ? `<span class="muted"> · còn ${slot.queueRemaining} trong hàng đợi</span>` : "";
   return `
     <div class="current" data-action="open-drawer" data-task="${esc(t.id)}" title="Bấm để xem đầy đủ output, prompt, artifact và lịch sử">
@@ -381,10 +476,15 @@ function taskBody(slot, t) {
     ${metricsLine(t)}
     ${t.queueState === "running" ? `<pre class="live" data-live="${esc(t.id)}">${esc(live || "…")}</pre>` : ""}
     ${ac}
-    <div class="logs">${logs}</div>
-    ${t.lastError ? `<div class="feedback-box is-error">⚠ ${esc(t.lastError)}</div>` : ""}
-    ${alertsBlock(t)}
-    ${!t.waitingForYou && t.lastFeedback ? `<div class="feedback-box reject-hint">💬 ${esc(truncate(t.lastFeedback, 220))}</div>${t.lastFeedback.length > 220 ? details(`fb:${t.id}`, "Xem toàn bộ phản hồi", `<div class="feedback-box">${esc(t.lastFeedback)}</div>`) : ""}` : ""}`;
+    ${t.queueState === "done" ? doneHistory(t, history) : history}`;
+}
+
+/** A finished task keeps its old warnings and logs, but folded away so the card reads as "done". */
+function doneHistory(t, html) {
+  const n = (t.logs.length ? 1 : 0) + (t.lastError ? 1 : 0) + (t.alerts?.length ?? 0) + (!t.waitingForYou && t.lastFeedback ? 1 : 0);
+  if (!n) return "";
+  const warn = (t.lastError ? 1 : 0) + (t.alerts ?? []).filter((a) => a.level === "warn").length;
+  return details(`hist:${t.id}`, `Lịch sử & ghi chú${warn ? ` · <span class="hist-warn">${warn} cảnh báo cũ</span>` : ""}`, html, "history");
 }
 
 function taskActions(t) {
@@ -444,6 +544,11 @@ function updateCard(slot) {
   if (!card) return;
   const t = selectedTask(slot);
   const st = !t && slot.isBoss && state.plan ? bossState(state.plan) : slot.state;
+  if (card.dataset.state && card.dataset.state !== st.kind) {
+    card.classList.remove("state-changed");
+    void card.offsetWidth; // restart the animation
+    card.classList.add("state-changed");
+  }
   card.dataset.state = st.kind;
   card.querySelector('[data-part="tools"]').innerHTML = `
     ${slot.isBoss ? `<span class="gate on" title="Kế hoạch của Sếp luôn chờ bạn duyệt">🔒</span>` : `<button class="gate ${slot.gated ? "on" : ""}" data-action="gate" data-slot="${slot.id}" data-enabled="${slot.gated ? "0" : "1"}" title="${slot.gated ? "Cổng duyệt đang BẬT: kết quả chỉ bàn giao sau khi bạn duyệt. Bấm để tắt." : "Cổng duyệt đang tắt: bàn giao ngay khi Claude đã duyệt. Bấm để bật."}">${slot.gated ? "🔒" : "🔓"}</button>`}
@@ -462,9 +567,9 @@ function updateCard(slot) {
     actions.innerHTML = taskActions(t);
   }
   card.querySelector('[data-part="queue"]').innerHTML = queueList(slot, t);
-  card.querySelector('[data-part="directives"]').innerHTML = slot.directives.length
-    ? `<div class="directive-chips">${slot.directives.map((d) => `<span class="directive">📌 ${esc(d.text)} <button class="x" data-action="directive-remove" data-id="${esc(d.id)}">×</button></span>`).join("")}</div>`
-    : "";
+  const chips = slot.directives.length ? `<div class="directive-chips">${slot.directives.map((d) => directiveChip(d)).join("")}</div>` : "";
+  card.querySelector('[data-part="directives"]').innerHTML =
+    chips && st.kind === "done" ? details(`dirs:${slot.id}`, `📌 Chỉ thị riêng (${slot.directives.length})`, chips, "history") : chips;
   const liveEl = card.querySelector("pre.live");
   if (liveEl) liveEl.scrollTop = liveEl.scrollHeight;
   applyFilter(card, slot);
@@ -565,13 +670,17 @@ function renderPlanPanel() {
       )
       .join("")}</div>`;
   }
+  const goalKey = `goal:${plan.id}`;
+  const goalOpen = state.open.has(goalKey);
+  const longGoal = (plan.goal?.length ?? 0) > 260 || (plan.summary?.length ?? 0) > 200;
   const sig = `${plan.id}|${plan.status}|${JSON.stringify(plan.project ?? null)}`;
   const prev = panel.querySelector('[data-part="plan-actions"]');
   const keep = prev && prev.dataset.sig === sig ? prev : null;
   panel.innerHTML = `
     <div class="panel-title">Mục tiêu & cây phân việc <span class="plan-status s-${plan.status}">${esc(PLAN_STATUS[plan.status] ?? plan.status)}</span></div>
-    <div class="plan-goal">${esc(plan.goal)}</div>
-    ${plan.summary ? `<div class="plan-summary">${esc(plan.summary)}</div>` : ""}
+    <div class="plan-goal${goalOpen ? "" : " clamp-3"}">${esc(plan.goal)}</div>
+    ${plan.summary ? `<div class="plan-summary${goalOpen ? "" : " clamp-2"}">${esc(plan.summary)}</div>` : ""}
+    ${longGoal ? `<button class="link-btn" data-action="expand" data-key="${esc(goalKey)}">${goalOpen ? "▲ Thu gọn" : "▼ Xem đầy đủ mục tiêu"}</button>` : ""}
     ${plan.reviewRounds ? `<div class="muted small">${plan.reviewRounds} vòng Claude ↔ Gemini${plan.usage ? ` · ${fmtTok(plan.usage.input + plan.usage.output)} tok${plan.usage.costUsd ? ` · ${fmtCost(plan.usage.costUsd)}` : ""}` : ""}</div>` : ""}
     ${body}
     <div data-part="plan-actions"></div>`;
@@ -634,7 +743,7 @@ function renderFlowPanel() {
     : `<li class="muted">Không có vòng bàn bạc/từ chối nào đang diễn ra.</li>`;
   const handoffs = ins.handoffs.length
     ? ins.handoffs
-        .map((h) => `<li><span class="flow-edge"><b data-hover-slot="${h.from}">${h.from}</b> → ${h.to.length ? h.to.map((s) => `<b data-hover-slot="${s}">${s}</b>`).join(", ") : "<i>(không ai phụ thuộc)</i>"}</span> <span class="muted">${esc(fmtTime(h.at))}</span><div class="flow-title">${esc(h.title)}</div></li>`)
+        .map((h) => `<li><span class="vtl-time">${esc(fmtTime(h.at))}</span><span class="flow-edge"><b data-hover-slot="${h.from}">${h.from}</b> → ${h.to.length ? h.to.map((s) => `<b data-hover-slot="${s}">${s}</b>`).join(", ") : "<i>(không ai phụ thuộc)</i>"}</span><div class="flow-title">${esc(h.title)}</div></li>`)
         .join("")
     : `<li class="muted">Chưa có bàn giao nào.</li>`;
   const waits = ins.waits.length
@@ -643,7 +752,7 @@ function renderFlowPanel() {
   panel.innerHTML = `
     <div class="panel-sub">Cảnh báo</div><ul class="flow-list">${alerts}</ul>
     <div class="panel-sub">Đang thảo luận / bị từ chối</div><ul class="flow-list">${discussionsHtml}</ul>
-    <div class="panel-sub">Bàn giao gần đây</div><ul class="flow-list">${handoffs}</ul>
+    <div class="panel-sub">Bàn giao gần đây</div><ul class="flow-list vtl">${handoffs}</ul>
     <div class="panel-sub">Đang chờ đầu vào</div><ul class="flow-list">${waits}</ul>`;
 }
 
@@ -1564,6 +1673,21 @@ document.addEventListener("click", async (e) => {
       return previewArtifact(ds.id);
     case "modal-close":
       return closeModal();
+    case "expand":
+      e.stopPropagation();
+      if (state.open.has(ds.key)) state.open.delete(ds.key);
+      else state.open.add(ds.key);
+      if (ds.key.startsWith("goal:")) return renderPlanPanel();
+      renderCompanyDirectives();
+      for (const slot of state.slots.values()) updateCard(slot);
+      return scheduleEdges();
+    case "composer-open":
+      state.composer.manual = true;
+      renderComposer();
+      return goalInput.focus();
+    case "banner-dismiss":
+      localStorage.setItem("dash-banner-dismissed", ds.plan);
+      return renderDoneBanner();
   }
   btn.disabled = true;
   try {
@@ -1756,6 +1880,14 @@ $("#run-all-btn").addEventListener("click", async () => {
   const githubRepo = $("#opt-github").checked && !$("#opt-github").disabled;
   if (await post("/api/run-all", { goal, projectDir, autoApprove, skipClaudeReviewWhenGreen, githubRepo })) toast("Đã giao mục tiêu cho Sếp — đang lập cây công việc.");
 });
+$("#composer-toggle").addEventListener("click", () => {
+  const open = !$("#composer").classList.contains("collapsed");
+  state.composer.manual = !open;
+  renderComposer();
+  if (!open) goalInput.focus();
+});
+$("#theme-btn").addEventListener("click", () => setTheme(document.documentElement.dataset.theme === "light" ? "dark" : "light"));
+setTheme(document.documentElement.dataset.theme || "dark");
 $("#pause-btn").addEventListener("click", async () => {
   await post(state.control.paused ? "/api/control/resume" : "/api/control/pause");
 });
@@ -1961,6 +2093,8 @@ function connect() {
   es.addEventListener("plan", (e) => {
     state.plan = JSON.parse(e.data);
     renderPlanPanel();
+    renderComposer();
+    renderDoneBanner();
     renderReviewBadges();
     if (state.inbox.open) renderInbox();
     const boss = [...state.slots.values()].find((s) => s.isBoss);

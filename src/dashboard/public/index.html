@@ -4,30 +4,52 @@
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>AI Agent Company</title>
+  <script>document.documentElement.dataset.theme = localStorage.getItem("dash-theme") || "dark";</script>
   <link rel="stylesheet" href="style.css" />
 </head>
 <body>
   <header class="topbar">
     <div class="brand">
-      <h1>AI Agent Company</h1>
-      <p class="topbar-sub">Sếp (AG-01) lập cây công việc → Gemini thẩm định → bạn duyệt → cả đội chạy song song, bàn giao cho nhau, bạn chốt từng kết quả.</p>
+      <div class="logo" aria-hidden="true">AI</div>
+      <div class="brand-text">
+        <h1>AI Agent Company</h1>
+        <p class="topbar-sub">Sếp lập cây việc → Gemini thẩm định → bạn duyệt → cả đội chạy song song → bạn chốt kết quả.</p>
+      </div>
     </div>
-    <div class="command">
-      <input id="goal-input" type="text" placeholder="Mục tiêu, ví dụ: Xây dựng hệ thống phân tích dữ liệu & dashboard theo dõi vận hành" />
-      <input id="project-dir-input" type="text" placeholder="Thư mục dự án (đường dẫn tuyệt đối, nên là thư mục riêng)" title="Nơi Muse ghi code và nơi chạy lệnh build/test của kế hoạch này" />
+    <div class="controls">
+      <span id="review-badges" class="review-badges"></span>
+      <button id="approve-all-btn" class="btn btn-approve" hidden></button>
+      <div class="btn-group" role="group" aria-label="Điều khiển luồng chạy">
+        <button id="pause-btn" class="btn btn-ghost" title="Không bắt đầu bước mới; các lượt đang chạy được làm nốt">⏸ Pause</button>
+        <button id="stop-btn" class="btn btn-ghost btn-danger-ghost" title="Huỷ ngay mọi lượt đang chạy (bước đó sẽ chạy lại khi Resume)">⏹ Stop</button>
+        <button id="reset-btn" class="btn btn-ghost" title="Bỏ gán task, xoá chỉ thị, huỷ kế hoạch đang chờ">↺ Reset</button>
+      </div>
+      <button id="composer-toggle" class="btn btn-soft" aria-expanded="true" aria-controls="composer">＋ Dự án mới</button>
+      <button id="theme-btn" class="btn btn-ghost btn-square" title="Đổi giao diện sáng / tối" aria-label="Đổi giao diện sáng / tối">◐</button>
+      <span id="conn" class="conn"></span>
+    </div>
+  </header>
+
+  <section class="composer collapsed no-anim" id="composer" aria-label="Tạo dự án mới">
+    <div class="composer-inner">
+      <div class="composer-head">
+        <span class="composer-title">Dự án mới</span>
+        <span class="muted small">Gõ mục tiêu — Sếp sẽ lập cây việc để bạn duyệt trước khi cả đội bắt tay vào làm.</span>
+      </div>
+      <input id="goal-input" class="input-lg" type="text" placeholder="Mục tiêu, ví dụ: Xây dựng hệ thống phân tích dữ liệu & dashboard theo dõi vận hành" />
+      <div class="composer-row">
+        <input id="project-dir-input" type="text" placeholder="Thư mục dự án (đường dẫn tuyệt đối, nên là thư mục riêng)" title="Nơi Muse ghi code và nơi chạy lệnh build/test của kế hoạch này" />
+        <button id="run-all-btn" class="btn btn-primary btn-lg">▶ Chạy luồng cả công ty</button>
+      </div>
       <div class="goal-options">
         <label class="check" title="Task qua kiểm tra, được Gemini & Claude duyệt và không có cảnh báo đỏ sẽ tự ship; task có cảnh báo vẫn chờ bạn. Dự án có git thì mỗi task là một commit, hoàn tác được."><input type="checkbox" id="opt-autoapprove" /> ⚡ Tự duyệt khi xanh</label>
         <label class="check" id="opt-github-label" title="Khi duyệt kế hoạch: tạo repo GitHub riêng tư cho dự án; mỗi task được duyệt sẽ được commit và push lên đó."><input type="checkbox" id="opt-github" checked /> Tạo repo GitHub riêng</label>
         <label class="check" title="Subtask mà Gemini đã duyệt, không có cảnh báo đỏ thì bỏ bước Claude review (task nghiệm thu và yêu cầu sửa của bạn luôn qua Claude). Tiết kiệm quota Claude."><input type="checkbox" id="opt-skipreview" /> Bỏ Claude review khi Gemini duyệt &amp; xanh</label>
       </div>
-      <button id="run-all-btn" class="btn btn-primary">▶ Chạy luồng cả công ty</button>
-      <button id="pause-btn" class="btn btn-ghost" title="Không bắt đầu bước mới; các lượt đang chạy được làm nốt">⏸ Pause</button>
-      <button id="stop-btn" class="btn btn-ghost btn-danger-ghost" title="Huỷ ngay mọi lượt đang chạy (bước đó sẽ chạy lại khi Resume)">⏹ Stop</button>
-      <button id="reset-btn" class="btn btn-ghost">Reset</button>
-      <span id="review-badges" class="review-badges"></span>
-      <button id="approve-all-btn" class="btn btn-approve" hidden></button>
     </div>
-  </header>
+  </section>
+
+  <section id="done-banner" class="done-banner" hidden aria-live="polite"></section>
 
   <section class="telemetry" id="telemetry" aria-label="Tóm tắt luồng chạy"></section>
 
@@ -48,14 +70,15 @@
       <button class="tab" data-action="view" data-view="seo">Auto Content SEO</button>
     </div>
     <div class="filters" id="filters">
+      <span class="bar-label">Lọc</span>
       <button class="filter active" data-action="filter" data-filter="all">Tất cả</button>
       <button class="filter" data-action="filter" data-filter="running">Đang chạy</button>
       <button class="filter" data-action="filter" data-filter="attention">Cần duyệt / Lỗi</button>
       <button class="filter" data-action="filter" data-filter="done">Đã xong</button>
+      <span class="filter-sep"></span>
       <button class="filter toggle" id="edges-toggle" data-action="toggle-edges" aria-pressed="false" title="Hiện mọi đường giao việc/bàn giao giữa các nhân sự">↔ Đường nối: <b>Tắt</b></button>
       <span id="focus-chip" class="focus-chip" hidden></span>
     </div>
-    <span id="conn" class="conn"></span>
   </nav>
 
   <main>
@@ -69,15 +92,15 @@
           </defs>
         </svg>
         <section class="tier">
-          <h2 class="tier-heading tier-heading-1">Sếp</h2>
+          <h2 class="tier-heading tier-heading-1"><span class="tier-dot"></span>Sếp</h2>
           <div class="tier-row row-boss" id="row-1"><aside id="plan-panel" class="side-panel plan-panel"></aside></div>
         </section>
         <section class="tier">
-          <h2 class="tier-heading tier-heading-2">Trưởng nhóm</h2>
+          <h2 class="tier-heading tier-heading-2"><span class="tier-dot"></span>Trưởng nhóm</h2>
           <div class="tier-row row-leads" id="row-2"><aside id="flow-panel" class="side-panel flow-panel"></aside></div>
         </section>
         <section class="tier">
-          <h2 class="tier-heading">Nhân viên</h2>
+          <h2 class="tier-heading tier-heading-3"><span class="tier-dot"></span>Nhân viên</h2>
           <div class="tier-grid" id="row-3"></div>
         </section>
       </div>
