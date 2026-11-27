@@ -41,7 +41,7 @@ describe("CEO requests reach the reviewers", () => {
     const cfg: PipelineConfig = { verify: { cwd: tmp(), commands: ["true"] }, maxImplementationAttempts: 2, maxReviewRejections: 2 };
     const task = createTask("Revise");
     task.stage = "checkpoint_final";
-    task.context.architectureSpec = "guide\nFILES: NOTES.md";
+    task.context.architectureSpec = "guide\nFILES: notes/*.md";
     requestRevision(task, "validate-xcodeproj.py must FAIL when SDKROOT is missing");
     const agents = { gemini: spy("gemini"), claude: spy("claude"), muse: createMockAgent("muse") };
     while (task.stage !== "checkpoint_final") await advance(task, agents, cfg);

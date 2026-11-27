@@ -3,8 +3,8 @@ import type { Agent, AgentResponse, RoleName, SendOptions, TaskContext } from ".
 /** A deterministic plan for dry runs: 3 epics, 6 subtasks, a few dependencies. */
 export const MOCK_PLAN = {
   summary: "Mock plan: data pipeline and model, content, and a quality/release track.",
-  // The mock engineer writes NOTES.md, so this really checks what it wrote.
-  verifyCommands: ["test -s NOTES.md"],
+  // The mock engineer writes notes/<task>.md, so this really checks what it wrote.
+  verifyCommands: ["ls notes/*.md"],
   epics: [
     {
       id: "E1",
@@ -42,6 +42,12 @@ export const MOCK_PLAN = {
     },
   ],
 };
+
+/** Where the mock engineer writes a task's note. */
+export function mockNotePath(title: string): string {
+  const slug = title.toLowerCase().normalize("NFD").replace(/[\u0300-\u036f]/g, "").replace(/đ/g, "d").replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "").slice(0, 40);
+  return `notes/${slug || "task"}.md`;
+}
 
 /** Moves the last movable task of the busiest same-tier queue to the least busy colleague. */
 function mockRebalance(prompt: string): { summary: string; moves: unknown[] } {
@@ -87,13 +93,15 @@ export function createMockAgent(role: RoleName): Agent {
           role,
           content:
             `Architecture spec for "${context.title}" (mock).\n\n` +
-            "Files: NOTES.md — a short implementation note naming the task.\n" +
-            "Build order: write NOTES.md, then run the plan's verification commands.\n" +
-            "Acceptance: each criterion is checked against NOTES.md by the verification step; no other files are needed for this dry run.\n" +
-            "FILES: NOTES.md",
+            `Files: ${mockNotePath(context.title)} — a short implementation note naming the task.\n` +
+            "Build order: write the note, then run the plan's verification commands.\n" +
+            "Acceptance: each criterion is checked against the note by the verification step; no other files are needed for this dry run.\n" +
+            "FILES: notes/*.md",
         };
       case "muse":
-        return { role, content: `FILE: NOTES.md\n\`\`\`md\n# ${context.title}\n\nMock implementation note.\n\`\`\`\n` };
+        // One file per task, like real work: tasks writing the same file
+        // would (rightly) trip the "overwritten by another task" check.
+        return { role, content: `FILE: ${mockNotePath(context.title)}\n\`\`\`md\n# ${context.title}\n\nMock implementation note.\n\`\`\`\n` };
       default:
         return { role, content: "" };
     }

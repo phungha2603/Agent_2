@@ -73,8 +73,8 @@ describe("pipeline", () => {
     await advance(task, a, cfg);
     expect(task.stage).toBe("verification");
     expect(task.implementationAttempts).toBe(1);
-    expect(task.context.implementationFiles).toEqual(["NOTES.md"]);
-    expect(readFileSync(path.join(cfg.verify.cwd, "NOTES.md"), "utf8")).toContain("Add dark mode toggle");
+    expect(task.context.implementationFiles).toEqual(["notes/add-dark-mode-toggle.md"]);
+    expect(readFileSync(path.join(cfg.verify.cwd, "notes/add-dark-mode-toggle.md"), "utf8")).toContain("Add dark mode toggle");
 
     await advance(task, a, cfg);
     expect(task.stage).toBe("review_gemini");

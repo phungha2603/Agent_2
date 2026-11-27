@@ -219,16 +219,16 @@ describe("plan project settings", () => {
     expect(plan.project?.warnings.join(" ")).toMatch(/chưa tồn tại/);
     expect(plan.project?.handoffOn).toBe("checkpoint_final"); // a new project keeps the company setting
     await waitFor(async () => (await c.planSnapshot())?.status === "awaiting_approval");
-    expect((await c.planSnapshot())?.project?.verifyCommands).toEqual(["test -s NOTES.md"]); // Claude's proposal
+    expect((await c.planSnapshot())?.project?.verifyCommands).toEqual(["ls notes/*.md"]); // Claude's proposal
 
     await c.updatePlanProject(plan.id, { verifyCommands: [" ", ""] });
     await expect(c.decidePlan(plan.id, true)).rejects.toThrow(/chưa có lệnh kiểm tra/);
     await expect(c.updatePlanProject(plan.id, { dir: "relative/path" })).rejects.toThrow(/tuyệt đối/);
 
-    await c.decidePlan(plan.id, true, undefined, { verifyCommands: ["test -s NOTES.md", "true"] });
+    await c.decidePlan(plan.id, true, undefined, { verifyCommands: ["ls notes/*.md", "true"] });
     const tasks = await allTasks(c);
     const detail = await c.taskDetail(tasks[0].id);
-    expect(detail.task.projectConfig).toMatchObject({ verifyCwd: projectDir, verifyCommands: ["test -s NOTES.md", "true"], handoffOn: "checkpoint_final" });
+    expect(detail.task.projectConfig).toMatchObject({ verifyCwd: projectDir, verifyCommands: ["ls notes/*.md", "true"], handoffOn: "checkpoint_final" });
   });
 
   it("warns when the project directory already holds other files", async () => {
@@ -252,7 +252,7 @@ describe("auto-approve and notifications", () => {
     const plan = await c.startPlan("Ship it", path.join(dir, "green"));
     await waitFor(async () => (await c.planSnapshot())?.status === "awaiting_approval");
     expect(notes).toContain("Kế hoạch chờ duyệt");
-    // The mock plan's own commands check NOTES.md, which the mock engineer writes: no red warning anywhere.
+    // The mock plan's own commands check notes/*.md, which the mock engineer writes: no red warning anywhere.
     await c.decidePlan(plan.id, true, undefined, { autoApprove: true, handoffOn: "checkpoint_final" });
     await waitFor(async () => (await allTasks(c)).length === 9 && (await allTasks(c)).every((x: any) => x.queueState === "done"), 20000);
     const t = (await allTasks(c))[0];
