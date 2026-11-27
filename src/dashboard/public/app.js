@@ -406,7 +406,9 @@ function avatar(slot) {
 function directiveChip(d, tip = "") {
   const key = `dir:${d.id}`;
   const open = state.open.has(key);
-  return `<span class="directive${open ? " expanded" : ""}"${tip ? ` title="${esc(tip)}"` : ""}><span class="d-text" data-action="expand" data-key="${esc(key)}" title="${open ? "Thu gọn" : "Bấm để xem đầy đủ"}">📌 ${esc(d.text)}</span><button class="x" data-action="directive-remove" data-id="${esc(d.id)}" title="Gỡ chỉ thị">×</button></span>`;
+  const staleTip = d.stale ? "Chỉ thị của kế hoạch cũ — không còn áp dụng." : "";
+  const title = [staleTip, tip].filter(Boolean).join(" · ");
+  return `<span class="directive${open ? " expanded" : ""}${d.stale ? " stale" : ""}"${title ? ` title="${esc(title)}"` : ""}><span class="d-text" data-action="expand" data-key="${esc(key)}" title="${open ? "Thu gọn" : "Bấm để xem đầy đủ"}">📌 ${d.stale ? "(kế hoạch cũ) " : ""}${esc(d.text)}</span><button class="x" data-action="directive-remove" data-id="${esc(d.id)}" title="Gỡ chỉ thị">×</button></span>`;
 }
 const STATE_ICON = { running: "▶", needs_review: "✋", blocked: "⛔", waiting_input: "⏳", ready: "●", paused: "⏸", done: "✓", idle: "○" };
 
@@ -1696,7 +1698,7 @@ function drawerOverview(d) {
       <textarea data-keep="steer-text" id="drawer-steer" rows="2" placeholder="Ví dụ: tập trung thêm đối thủ tại thị trường VN"></textarea>
       <label class="check"><input type="checkbox" data-keep="steer-redo" id="drawer-redo" /> làm lại phần đã thiết kế theo chỉ thị này</label>
       <button class="btn btn-small-inline" data-action="steer-drawer" data-slot="${esc(task.slotId)}">Gửi chỉ thị</button>
-      ${d.slotDirectives.length || d.companyDirectives.length ? `<div class="directive-chips">${[...d.companyDirectives, ...d.slotDirectives].map((x) => `<span class="directive">📌 ${x.slotId ? "" : "(cả đội) "}${esc(x.text)} <button class="x" data-action="directive-remove" data-id="${esc(x.id)}">×</button></span>`).join("")}</div>` : ""}
+      ${d.slotDirectives.length || d.companyDirectives.length ? `<div class="directive-chips">${[...d.companyDirectives, ...d.slotDirectives].map((x) => `<span class="directive${x.stale ? " stale" : ""}"${x.stale ? ' title="Chỉ thị của kế hoạch khác — không áp dụng cho task này."' : ""}>📌 ${x.stale ? "(kế hoạch cũ) " : ""}${x.slotId ? "" : "(cả đội) "}${esc(x.text)} <button class="x" data-action="directive-remove" data-id="${esc(x.id)}">×</button></span>`).join("")}</div>` : ""}
     </div>`;
 }
 

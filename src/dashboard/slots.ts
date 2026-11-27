@@ -41,6 +41,12 @@ export interface Directive {
   slotId: string | null;
   text: string;
   at: string;
+  /**
+   * The plan that was active when it was given: it then reaches only that
+   * plan's tasks, so a directive for one project never leaks into the next.
+   * Absent = given with no plan active, reaches every task.
+   */
+  planId?: string;
 }
 
 export interface DashboardState {

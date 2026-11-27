@@ -228,6 +228,27 @@ describe("CEO decisions and steering", () => {
     await c.removeDirective(d.id);
     expect(c.control().directives).toHaveLength(0);
   });
+
+  it("ties a directive to the plan active when it was given: other plans' tasks never see it, and it shows as stale once another plan is active", async () => {
+    const { c } = await setup();
+    const internals = c as any;
+    internals.state.activePlanId = "plan-old";
+    const d = await c.steer("AG-05", "Rewrite the Swift tests");
+    expect(d.planId).toBe("plan-old");
+    internals.state.activePlanId = null;
+    expect((await c.steer("AG-05", "Applies everywhere — no plan was active")).planId).toBeUndefined();
+    internals.state.activePlanId = "plan-old";
+
+    const forPlan = (planId?: string) =>
+      internals.directivesFor({ id: "t", slotId: "AG-05", planRef: planId ? { planId, epicId: "E1" } : undefined });
+    expect(forPlan("plan-old")).toEqual(["Rewrite the Swift tests", "Applies everywhere — no plan was active"]);
+    expect(forPlan("plan-new")).toEqual(["Applies everywhere — no plan was active"]);
+    expect(forPlan(undefined)).toEqual(["Applies everywhere — no plan was active"]);
+
+    expect((await c.slotSnapshot("AG-05")).directives.map((x: any) => x.stale)).toEqual([false, false]);
+    internals.state.activePlanId = "plan-new";
+    expect((await c.slotSnapshot("AG-05")).directives.map((x: any) => x.stale)).toEqual([true, false]);
+  });
 });
 
 describe("reassigning and prioritizing", () => {

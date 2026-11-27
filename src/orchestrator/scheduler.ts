@@ -283,6 +283,10 @@ export function shipWarnings(task: TaskRecord): string[] {
   return (task.alerts ?? []).filter((a) => a.level === "warn").map((a) => a.text);
 }
 
+function directiveApplies(d: Directive, task: TaskRecord): boolean {
+  return !d.planId || d.planId === task.planRef?.planId;
+}
+
 export class Company extends EventEmitter {
   readonly engines: Record<EngineName, Semaphore>;
   private readonly agents: Agents;
@@ -641,13 +645,19 @@ export class Company extends EventEmitter {
     if (slotId) this.requireSlot(slotId);
     const clean = text.trim();
     if (!clean) throw new UserError("Chỉ thị đang trống.");
-    const directive: Directive = { id: `d-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`, slotId, text: clean, at: nowIso() };
+    const directive: Directive = {
+      id: `d-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
+      slotId,
+      text: clean,
+      at: nowIso(),
+      ...(this.state.activePlanId ? { planId: this.state.activePlanId } : {}),
+    };
     await this.mutateState((s) => s.directives.push(directive));
     const scope = slotId ? [slotId] : SLOTS.map((s) => s.id);
     for (const sid of scope) {
       for (const id of this.state.slots[sid] ?? []) {
         const task = await this.load(id);
-        if (!task || isTerminal(task)) continue;
+        if (!task || isTerminal(task) || !directiveApplies(directive, task)) continue;
         trace(task, "CEO", "directive", `${slotId ? "" : "Company-wide: "}${clean}${redo ? " (redo requested)" : ""}`);
         if (redo) {
           if (this.workers.has(id)) task.redoRequested = clean;
@@ -1085,7 +1095,7 @@ export class Company extends EventEmitter {
   }
 
   control() {
-    return { paused: this.state.paused, directives: this.state.directives.filter((d) => !d.slotId), gates: this.state.gates };
+    return { paused: this.state.paused, directives: this.withStale(this.state.directives.filter((d) => !d.slotId)), gates: this.state.gates };
   }
 
   async slotSnapshot(slotId: string, index?: Index): Promise<SlotSnapshot> {
@@ -1126,7 +1136,7 @@ export class Company extends EventEmitter {
         problems: count("error", "rejected"),
       },
       queueRemaining: Math.max(0, unfinished - 1),
-      directives: this.state.directives.filter((d) => d.slotId === slot.id),
+      directives: this.withStale(this.state.directives.filter((d) => d.slotId === slot.id)),
       inFrom: [...new Set(all.flatMap((t) => t.inputsFrom.map((i) => i.slotId)))].filter((s) => s !== slot.id),
       outTo: [...new Set(all.flatMap((t) => t.outputsTo.map((o) => o.slotId)))].filter((s) => s !== slot.id),
       tasks: shown,
@@ -1354,8 +1364,8 @@ export class Company extends EventEmitter {
       snapshot: await this.taskSnapshot(task, idx),
       calls: await readCalls(taskId),
       artifacts: await this.listArtifacts(taskId),
-      slotDirectives: this.state.directives.filter((d) => d.slotId === (task.slotId ?? this.slotOf(taskId))),
-      companyDirectives: this.state.directives.filter((d) => !d.slotId),
+      slotDirectives: this.withStale(this.state.directives.filter((d) => d.slotId === (task.slotId ?? this.slotOf(taskId))), task),
+      companyDirectives: this.withStale(this.state.directives.filter((d) => !d.slotId), task),
     };
   }
 
@@ -1755,9 +1765,17 @@ export class Company extends EventEmitter {
     }
   }
 
+  /** Marks the directives that no longer reach anything: given for another plan than the task's (or the active one). */
+  private withStale(list: Directive[], task?: TaskRecord): (Directive & { stale: boolean })[] {
+    return list.map((d) => ({
+      ...d,
+      stale: task ? !directiveApplies(d, task) : Boolean(d.planId && d.planId !== this.state.activePlanId),
+    }));
+  }
+
   private directivesFor(task: TaskRecord): string[] | undefined {
     const slot = task.slotId ?? this.slotOf(task.id);
-    const list = this.state.directives.filter((d) => !d.slotId || d.slotId === slot).map((d) => d.text);
+    const list = this.state.directives.filter((d) => (!d.slotId || d.slotId === slot) && directiveApplies(d, task)).map((d) => d.text);
     return list.length ? list : undefined;
   }
 
