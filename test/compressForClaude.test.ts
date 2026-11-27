@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
-import { compressForClaude, condenseVerificationLog } from "../src/orchestrator/compressForClaude.js";
+import { compressForClaude } from "../src/orchestrator/compressForClaude.js";
+import { condenseVerificationLog, pruneContext } from "../src/orchestrator/contextPruning.js";
 import type { Agent, AgentResponse, TaskContext } from "../src/types.js";
 
 function stubGemini(reply: (prompt: string) => AgentResponse | Promise<AgentResponse>): Agent {
@@ -73,31 +74,34 @@ describe("compressForClaude", () => {
     expect(out.reviewFeedback).toEqual([bigFeedback]); // not silently dropped
   });
 
-  it("never sends the verification log to Gemini; trims it by code, keeping the evidence verbatim", async () => {
-    const passing = Array.from({ length: 150 }, (_, i) => `test_case_${i} (tests.test_other.T.test_case_${i}) ... ok`);
+  it("never sends the verification log to Gemini", async () => {
+    const neverCalled = stubGemini(() => {
+      throw new Error("should not have been called");
+    });
+    const ctx: TaskContext = { title: "T", verificationLog: "V".repeat(50_000) };
+    expect(await compressForClaude(neverCalled, ctx)).toEqual(ctx);
+  });
+
+  it("a review sees the written file's test lines even when they sit far from the end of a long log", () => {
+    const before = Array.from({ length: 60 }, (_, i) => `test_a${i} (test_other.T.test_a${i}) ... ok`);
+    const after = Array.from({ length: 150 }, (_, i) => `test_b${i} (test_other.T.test_b${i}) ... ok`);
     const log = [
       "$ python3 -m unittest discover -s tests -v",
-      ...passing,
-      "test_flip (tests.test_e3_integration.T.test_flip) ... ok",
-      "",
-      "----------------------------------------------------------------------",
-      "Ran 151 tests in 2.1s",
+      ...before,
+      "test_flip (test_e3_integration.T.test_flip) ... ok",
+      ...after,
+      "Ran 211 tests in 2.1s",
       "",
       "OK",
       "== Role checks (AG-08 QA Lead): OK ==",
     ].join("\n");
-    const neverCalled = stubGemini(() => {
-      throw new Error("should not have been called");
-    });
-    const ctx: TaskContext = { title: "T", verificationLog: log, implementationFiles: ["tests/test_e3_integration.py"] };
-
-    const out = await compressForClaude(neverCalled, ctx);
-    expect(out.verificationLog!.length).toBeLessThan(log.length / 5);
-    for (const line of ["$ python3 -m unittest discover -s tests -v", "test_flip (tests.test_e3_integration.T.test_flip) ... ok", "Ran 151 tests in 2.1s", "OK", "== Role checks (AG-08 QA Lead): OK =="]) {
-      expect(out.verificationLog).toContain(line);
+    expect(log.length).toBeGreaterThan(8000);
+    const seen = pruneContext("review_claude", { title: "T", verificationLog: log, implementationFiles: ["tests/test_e3_integration.py"] }).verificationLog!;
+    for (const line of ["$ python3 -m unittest discover -s tests -v", "test_flip (test_e3_integration.T.test_flip) ... ok", "Ran 211 tests in 2.1s", "OK", "== Role checks (AG-08 QA Lead): OK =="]) {
+      expect(seen).toContain(line);
     }
-    expect(out.verificationLog).not.toContain("test_case_42 ");
-    expect(out.verificationLog).toContain("(150 line(s) omitted)");
+    expect(seen).not.toContain("test_b42 ");
+    expect(seen).toContain("(150 line(s) omitted)");
   });
 
   it("keeps a failing command's output tail in full", () => {

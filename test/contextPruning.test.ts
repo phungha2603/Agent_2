@@ -13,7 +13,7 @@ function bigContext(): TaskContext {
     architectureSpec: "S".repeat(10_000),
     implementationDiff: "D".repeat(120_000),
     implementationFiles: ["a.ts"],
-    verificationLog: "L".repeat(50_000) + "THE ACTUAL FAILURE",
+    verificationLog: "$ npm test\n" + "L".repeat(50_000) + "\nFAILED: THE ACTUAL FAILURE",
     reviewFeedback: [],
   };
 }
