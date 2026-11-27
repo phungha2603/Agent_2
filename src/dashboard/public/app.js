@@ -3,6 +3,11 @@ const $ = (sel, root = document) => root.querySelector(sel);
 const $$ = (sel, root = document) => [...root.querySelectorAll(sel)];
 
 const goalInput = $("#goal-input");
+const fitGoalInput = () => {
+  goalInput.style.height = "auto";
+  goalInput.style.height = `${goalInput.scrollHeight + 2}px`;
+};
+goalInput.addEventListener("input", fitGoalInput);
 const toastEl = $("#toast");
 const LIVE_CHARS = 1500;
 

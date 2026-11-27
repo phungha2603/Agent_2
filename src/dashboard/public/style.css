@@ -826,7 +826,7 @@ button.engine:hover { border-color: var(--text-dim); }
   border-color: var(--accent);
   box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent) 22%, transparent);
 }
-#goal-input.input-lg { width: 100%; font-size: 15px; padding: 12px 14px; }
+#goal-input.input-lg { flex: none; width: 100%; font-size: 15px; padding: 12px 14px; margin-top: 0; line-height: 1.5; resize: vertical; min-height: 52px; max-height: 60vh; overflow-y: auto; box-sizing: border-box; }
 #project-dir-input { flex: 1 1 360px; padding: 10px 12px; font-size: 13.5px; }
 .goal-options { flex-wrap: wrap; gap: 8px 18px; font-size: 13px; }
 .check { font-size: 12.5px; }
