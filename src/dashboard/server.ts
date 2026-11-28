@@ -266,6 +266,13 @@ app.get("/api/video/file/:kind/:id/:name", (req, res) => {
   if (!file) return res.status(404).end();
   res.sendFile(file, (err) => err && !res.headersSent && res.status(404).end());
 });
+app.get("/api/video/lumreels/templates", route(async (_req, res) => res.json(await video.lumreelsTemplates())));
+app.get("/api/video/lumreels/thumb/:id", route(async (req, res) => {
+  const r = await video.lumreelsThumb(req.params.id);
+  if (!r.ok) return res.status(404).end();
+  res.type(r.headers.get("content-type") ?? "image/webp").setHeader("Cache-Control", "max-age=86400");
+  res.send(Buffer.from(await r.arrayBuffer()));
+}));
 app.post("/api/video/voices", express.raw({ type: () => true, limit: "20mb" }), route(async (req, res) => {
   ok(res, await video.addVoice(String(req.query.name ?? ""), req.body as Buffer, String(req.query.ext ?? "").toLowerCase()));
 }));

@@ -21,6 +21,7 @@ import type { VideoDeps } from "./integrations/video/service.js";
 import { createGeminiImages, createMfluxImages, createMockImages, createMockTts, createOpenverseImages, createVieneuTts } from "./integrations/video/providers.js";
 import { createPublisher } from "./integrations/video/publish.js";
 import { createRemotionRenderer } from "./integrations/video/render.js";
+import { createLumreels } from "./integrations/video/lumreels.js";
 
 function provider(name: string): "real" | "mock" {
   const v = (process.env[name] ?? "mock").toLowerCase();
@@ -311,6 +312,16 @@ export function buildVideoDeps(): VideoDeps {
     defaultVoice: process.env.VIDEO_VOICE || (ttsKind === "vieneu" ? "Hải Đăng" : "mock-female"),
     explainerStyle: process.env.VIDEO_EXPLAINER_STYLE || undefined,
     defaultPrivacy: privacy === "public" || privacy === "unlisted" ? privacy : "private",
+    lumreels:
+      process.env.LUMREELS_DIR || process.env.LUMREELS_URL
+        ? createLumreels({
+            baseUrl: process.env.LUMREELS_URL || undefined,
+            dir: process.env.LUMREELS_DIR || undefined,
+            // LumReels reads Vietnamese with VieNeu from its own Python; VieNeu's checkout has one with `vieneu` installed.
+            python: process.env.LUMREELS_PYTHON || (process.env.VIENEU_DIR ? path.join(process.env.VIENEU_DIR, ".venv/bin/python") : undefined),
+          })
+        : undefined,
+    lumreelsModel: process.env.LUMREELS_MODEL || "auto",
   };
 }
 

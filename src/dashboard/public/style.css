@@ -1356,3 +1356,9 @@ pre.live { font-size: 11px; border-radius: var(--radius-sm); }
 @media (max-width: 900px) { .vid-grid { grid-template-columns: 1fr; } .vid-media.long video { width: 100%; } }
 .vid-clone { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin-top: 8px; padding-top: 8px; border-top: 1px solid var(--card-border); }
 .vid-clone[hidden] { display: none; }
+.vid-lr { display: flex; flex-direction: column; gap: 6px; padding: 8px; border: 1px solid var(--card-border); border-radius: 8px; }
+.vid-lr[hidden], #vid-source-wrap[hidden] { display: none; }
+.vid-lr-pick { display: flex; gap: 12px; align-items: flex-start; }
+.vid-lr-pick img { width: 90px; aspect-ratio: 9 / 16; object-fit: cover; border-radius: 6px; border: 1px solid var(--card-border); background: var(--panel); }
+.vid-lr-side { display: flex; flex-direction: column; gap: 6px; flex: 1; min-width: 0; }
+.vid-lr-side select { max-width: 100%; }

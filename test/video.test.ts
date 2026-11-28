@@ -428,3 +428,95 @@ describe("mflux images", () => {
     await expect(img.generate("x", "/tmp/x.png", { format: "long" })).rejects.toThrow(/uv tool install mflux/);
   });
 });
+
+describe("LumReels", async () => {
+  const { lumreelsContent, lumreelsDuration, narrationMatch } = await import("../src/integrations/video/lumreels.js");
+  const script = {
+    ...goodScript,
+    scenes: [
+      { lines: [{ speaker: "narrator", text: "Ánh nắng trông màu trắng." }], visual: "x", onScreenText: "Ánh sáng trắng" },
+      { lines: [{ speaker: "narrator", text: "Ánh sáng xanh bị tán xạ mạnh hơn." }], visual: "y" },
+    ],
+  };
+
+  it("sends the approved lines numbered, to be read verbatim", () => {
+    const c = lumreelsContent(script);
+    expect(c).toContain("NGUYÊN VĂN");
+    expect(c).toContain("1. Ánh nắng trông màu trắng.");
+    expect(c).toContain("2. Ánh sáng xanh bị tán xạ mạnh hơn.");
+    expect(c).toContain("Ánh sáng trắng");
+    expect(lumreelsDuration(script)).toBeGreaterThanOrEqual(10);
+  });
+
+  it("measures how much of the script was read word for word", () => {
+    expect(narrationMatch(script, ["ánh nắng trông màu trắng", "Ánh sáng xanh bị tán xạ mạnh hơn!"])).toBe(1);
+    expect(narrationMatch(script, ["Ánh nắng trông màu trắng."])).toBe(0.5);
+  });
+
+  function fakeLumreels(opts: { failFirst?: boolean } = {}) {
+    const created: { content: string; voice: string; model: string }[] = [];
+    let fail = opts.failFirst ?? false;
+    const client = {
+      baseUrl: "http://lr",
+      templates: async () => [{ id: "011", name: "Giấy cắt dán", blurb: "", category: "faceless", genre: "", technique: ["svg"], narration: true }],
+      voices: async () => ["Hải Đăng", "Mai Anh"],
+      createJob: async (input: any) => (created.push(input), { id: `lr${created.length}`, status: "queued" }),
+      job: async (id: string) => {
+        if (fail) {
+          fail = false;
+          return { id, status: "error", error: "shader lỗi" };
+        }
+        return { id, status: "done" };
+      },
+      download: async (_id: string, out: string) => writeFile(out, "mp4"),
+      thumb: async () => new Response(""),
+      narration: async () => ["Câu mở đầu."],
+      close: () => {},
+    };
+    return { client, created };
+  }
+
+  it("builds the approved script with LumReels, skipping pictures and Remotion", async () => {
+    const lr = fakeLumreels();
+    const renderer = fakeRenderer();
+    const { svc } = await service({ lumreels: lr.client, renderer, ffmpeg: "/nonexistent/ffmpeg", defaultVoice: "Hải Đăng" });
+    const job = await svc.createExplainer({ topic: "Trời xanh", engine: "lumreels", templateId: "11", voice: "Mai Anh", format: "long" });
+    expect(job.format).toBe("short");
+    await until(() => job.stage === "script_review");
+    await svc.decideScript(job.id, "approve");
+    await until(() => job.stage === "final_review");
+    expect(job.output).toBe("lumreels-lr1.mp4");
+    expect(renderer.calls).toBe(0);
+    expect(lr.created[0]).toMatchObject({ voice: "Mai Anh", model: "auto" });
+    // The fake read back one line the mock script does not have: the CEO is warned before approving.
+    expect(job.progress.some((p) => p.text.includes("Lời đọc chỉ khớp 0%"))).toBe(true);
+    // The mock writer returns the same script after a revision: same content, so the finished LumReels video is reused.
+    await svc.decideFinal(job.id, "revise", "Ngắn hơn");
+    await until(() => job.stage === "script_review");
+    await svc.decideScript(job.id, "approve");
+    await until(() => job.stage === "final_review");
+    expect(lr.created.length).toBe(1);
+  });
+
+  it("a LumReels error fails the stage, and a retry starts a fresh LumReels job", async () => {
+    const lr = fakeLumreels({ failFirst: true });
+    const { svc } = await service({ lumreels: lr.client, ffmpeg: "/nonexistent/ffmpeg", defaultVoice: "Hải Đăng" });
+    const job = await svc.createExplainer({ topic: "Trời xanh", engine: "lumreels", templateId: "011" });
+    await until(() => job.stage === "script_review");
+    await svc.decideScript(job.id, "approve");
+    await until(() => job.stage === "failed");
+    expect(job.error).toMatch(/shader lỗi/);
+    await svc.retry(job.id);
+    await until(() => job.stage === "final_review");
+    expect(lr.created.length).toBe(2);
+  });
+
+  it("refuses a cloned voice, an unknown template, or no LumReels at all", async () => {
+    const lr = fakeLumreels();
+    const { svc } = await service({ lumreels: lr.client, defaultVoice: "Hải Đăng" });
+    await expect(svc.createExplainer({ topic: "Trời xanh", engine: "lumreels", templateId: "011", voice: "Giọng của tôi" })).rejects.toThrow(/giọng nhái/);
+    await expect(svc.createExplainer({ topic: "Trời xanh", engine: "lumreels", templateId: "999" })).rejects.toThrow(/Chọn một mẫu/);
+    const { svc: plain } = await service();
+    await expect(plain.createExplainer({ topic: "Trời xanh", engine: "lumreels", templateId: "011" })).rejects.toThrow(/LUMREELS_DIR/);
+  });
+});

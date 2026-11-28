@@ -2396,10 +2396,26 @@ function renderVideo() {
           <form id="vid-explainer-form" onsubmit="return false">
             <label class="panel-sub" for="vid-topic">Chủ đề</label>
             <input class="feedback-input" id="vid-topic" placeholder="vd: Vì sao máy bay bay được" />
+            <label class="panel-sub" for="vid-engine">Kiểu dựng</label>
+            <select id="vid-engine"><option value="slides">Ảnh + chuyển động (dọc hoặc ngang)</option><option value="lumreels">Motion graphics LumReels (chỉ dọc)</option></select>
+            <div id="vid-lr" class="vid-lr" hidden>
+              <div class="vid-lr-pick">
+                <img id="vid-lr-thumb" alt="" />
+                <div class="vid-lr-side">
+                  <label class="panel-sub">Mẫu <select id="vid-lr-template"><option value="">Đang tải mẫu…</option></select></label>
+                  <div id="vid-lr-blurb" class="muted small"></div>
+                  <label class="panel-sub">Claude viết cảnh <select id="vid-lr-model">
+                    <option value="auto">Tự chọn (Opus cho 3D/shader, Sonnet cho 2D)</option>
+                    <option value="sonnet">Sonnet</option><option value="opus">Opus (đẹp hơn, tốn hạn mức hơn)</option><option value="haiku">Haiku (nhanh, tiết kiệm)</option>
+                  </select></label>
+                </div>
+              </div>
+              <div class="muted small">Claude viết code từng cảnh rồi tự xem và sửa: khoảng 5–10 phút mỗi video, dùng hạn mức Claude của bạn. Lời đọc giữ nguyên văn kịch bản bạn đã duyệt; chỉ dùng giọng VieNeu có sẵn.</div>
+            </div>
             <div class="vid-row">
-              <label class="panel-sub">Định dạng <select id="vid-format"><option value="short">Ngắn dọc (~1 phút)</option><option value="long">Dài ngang (6–8 phút)</option></select></label>
+              <label class="panel-sub" id="vid-format-wrap">Định dạng <select id="vid-format"><option value="short">Ngắn dọc (~1 phút)</option><option value="long">Dài ngang (6–8 phút)</option></select></label>
               <label class="panel-sub">Giọng đọc <select id="vid-voice"></select></label>
-              <label class="panel-sub">Ảnh <select id="vid-source"><option value="stock">Ảnh thật Openverse (miễn phí)</option><option value="ai">Ảnh AI vẽ trên máy</option></select></label>
+              <label class="panel-sub" id="vid-source-wrap">Ảnh <select id="vid-source"><option value="stock">Ảnh thật Openverse (miễn phí)</option><option value="ai">Ảnh AI vẽ trên máy</option></select></label>
             </div>
             <label class="panel-sub" for="vid-notes">Ghi chú cho người viết (tuỳ chọn)</label>
             <textarea class="feedback-input" id="vid-notes" rows="2" placeholder="vd: dành cho học sinh cấp 2, giọng gần gũi"></textarea>
@@ -2437,6 +2453,7 @@ function renderVideo() {
     item(c.tts === "vieneu", c.tts === "vieneu" ? "Giọng VieNeu (chạy trên máy)" : "Giọng: giả lập (im lặng)", "VIENEU_DIR=đường dẫn tới VieNeu-TTS"),
     item(Boolean(c.images.stock), c.images.stock ? "Ảnh thật Openverse" : "Không dùng ảnh thật", "Openverse bật mặc định, không cần key; VIDEO_STOCK=none để tắt"),
     item(Boolean(c.images.ai) && c.images.ai !== "mock", { mflux: "Ảnh AI FLUX.2 (vẽ trên máy)", gemini: "Ảnh AI Gemini (tính phí)" }[c.images.ai] ?? (c.images.ai ? "Ảnh AI: giả lập" : "Không dùng ảnh AI"), "VIDEO_IMAGES=mflux|gemini|mock|none"),
+    item(c.lumreels, c.lumreels ? "LumReels (motion graphics)" : "Chưa nối LumReels", "LUMREELS_DIR=đường dẫn tới lumreels"),
     item(c.youtube, c.youtube ? "YouTube" : "Chưa nối YouTube", "YOUTUBE_CLIENT_ID/SECRET + npm run video:youtube-auth"),
     item(c.facebook, c.facebook ? "Facebook" : "Chưa nối Facebook", "FACEBOOK_PAGE_ID + FACEBOOK_PAGE_TOKEN"),
   ].join("") + `<span class="muted small">Rê chuột lên từng mục để xem biến cần đặt trong .env</span>`;
@@ -2446,6 +2463,9 @@ function renderVideo() {
     const keep = vsel.value;
     vsel.outerHTML = voiceSelect("voice", keep, c.defaultVoice).replace("<select", `<select id="vid-voice" data-key="${esc(vKey)}"`);
   }
+  $("#vid-engine").querySelector('[value="lumreels"]').disabled = !c.lumreels;
+  if (!c.lumreels && $("#vid-engine").value === "lumreels") $("#vid-engine").value = "slides";
+  syncVideoEngine();
   const clone = $("#vid-clone");
   clone.hidden = c.tts !== "vieneu";
   const src = $("#vid-source");
@@ -2495,6 +2515,47 @@ function renderVideo() {
   }
   for (const card of [...jobsBox.querySelectorAll("[data-vjob]")]) if (!seen.has(card.dataset.vjob)) card.remove();
 }
+
+/** The explainer form for the chosen engine: LumReels is vertical only and draws its own pictures. */
+function syncVideoEngine() {
+  const lr = $("#vid-engine")?.value === "lumreels";
+  $("#vid-lr").hidden = !lr;
+  $("#vid-source-wrap").hidden = lr;
+  const fmt = $("#vid-format");
+  if (lr) fmt.value = "short";
+  fmt.disabled = lr;
+  if (lr && !state.lumreelsTemplates) loadLumreelsTemplates();
+}
+
+async function loadLumreelsTemplates() {
+  state.lumreelsTemplates = [];
+  const res = await fetch("/api/video/lumreels/templates");
+  const list = res.ok ? await res.json() : [];
+  if (!res.ok) {
+    state.lumreelsTemplates = null;
+    return toast((await res.json().catch(() => ({}))).error || "Không tải được mẫu LumReels.");
+  }
+  state.lumreelsTemplates = list;
+  const groups = [["faceless", "Faceless · giải thích, kể chuyện"], ["ads", "Quảng cáo"], ["multi-style", "Đa phong cách"]];
+  const known = new Set(groups.map((g) => g[0]));
+  const opt = (t) => `<option value="${esc(t.id)}">${esc(t.id)} · ${esc(t.name)} — ${esc(t.genre)}${t.narration ? "" : " (mẫu không lời)"}</option>`;
+  $("#vid-lr-template").innerHTML =
+    groups.map(([k, label]) => `<optgroup label="${esc(label)}">${list.filter((t) => t.category === k).map(opt).join("")}</optgroup>`).join("") +
+    (list.some((t) => !known.has(t.category)) ? `<optgroup label="Khác">${list.filter((t) => !known.has(t.category)).map(opt).join("")}</optgroup>` : "");
+  showLumreelsTemplate();
+}
+
+function showLumreelsTemplate() {
+  const id = $("#vid-lr-template").value;
+  const t = (state.lumreelsTemplates ?? []).find((x) => x.id === id);
+  $("#vid-lr-thumb").src = id ? `/api/video/lumreels/thumb/${encodeURIComponent(id)}` : "";
+  $("#vid-lr-blurb").textContent = t ? `${t.blurb} Kỹ thuật: ${t.technique.join(", ")}.` : "";
+}
+
+document.addEventListener("change", (e) => {
+  if (e.target.id === "vid-engine") syncVideoEngine();
+  if (e.target.id === "vid-lr-template") showLumreelsTemplate();
+});
 
 function voiceSelect(k, value, def) {
   const voices = state.videoVoices ?? [];
@@ -2609,7 +2670,7 @@ function renderJobCard(job, d) {
   return `<div class="vid-job-head" data-action="vid-toggle" data-job="${id}">
       ${vidBadge(job.stage)} ${running ? `<span class="muted small">đang chạy</span>` : queued ? `<span class="muted small">trong hàng đợi</span>` : ""}
       <b>${job.script ? esc(job.script.title) : head}</b>
-      <span class="muted small">${series ? "" : "Giải thích · "}${job.format === "long" ? "dài ngang" : "ngắn dọc"}${job.words ? ` · ${job.words} từ` : ""} · ${esc(new Date(job.createdAt).toLocaleString("vi-VN"))}</span>
+      <span class="muted small">${series ? "" : "Giải thích · "}${job.lumreels ? `LumReels mẫu ${esc(job.lumreels.templateId)} ${esc(job.lumreels.templateName)} · ` : ""}${job.format === "long" ? "dài ngang" : "ngắn dọc"}${job.words ? ` · ${job.words} từ` : ""} · ${esc(new Date(job.createdAt).toLocaleString("vi-VN"))}</span>
       <span class="vid-tools">${tools}</span>
     </div>
     <div class="vid-job-body">
@@ -2644,7 +2705,9 @@ async function videoAction(action, ds) {
     return toast(`Đã thêm giọng "${name}" — chọn nó ở giọng dẫn truyện hoặc nhân vật.`);
   }
   if (action === "vid-explainer") {
-    const body = { topic: $("#vid-topic").value, format: $("#vid-format").value, imageSource: $("#vid-source").value, notes: $("#vid-notes").value, voice: $("#vid-voice").value };
+    const engine = $("#vid-engine").value;
+    const body = { topic: $("#vid-topic").value, format: $("#vid-format").value, imageSource: $("#vid-source").value, notes: $("#vid-notes").value, voice: $("#vid-voice").value, engine };
+    if (engine === "lumreels") Object.assign(body, { templateId: $("#vid-lr-template").value, model: $("#vid-lr-model").value });
     if (await post("/api/video/explainer", body)) {
       $("#vid-topic").value = "";
       $("#vid-notes").value = "";

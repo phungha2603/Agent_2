@@ -9,6 +9,8 @@ import { captionChunks, concatPcm, encodeWav, parseWav, wavDurationSec, type Pcm
 import type { ImageProvider, TtsProvider, Voice } from "./providers.js";
 import type { Publisher } from "./publish.js";
 import type { Renderer } from "./render.js";
+import { lumreelsContent, lumreelsDuration, narrationMatch, type LumreelsClient, type LumreelsTemplate } from "./lumreels.js";
+import { spawn } from "node:child_process";
 import { biblePrompt, mockWriter, outlinePrompt, parseBible, parseScript, researchPrompt, scriptPrompt, spokenWords } from "./script.js";
 import type { Character, Niche, SceneAsset, Script, Series, VideoFormat, VideoJob, VideoStage } from "./types.js";
 
@@ -39,9 +41,31 @@ export interface VideoDeps {
   defaultVoice: string;
   explainerStyle?: string;
   defaultPrivacy?: "public" | "unlisted" | "private";
+  /** Motion-graphics explainers through a local LumReels server (optional). */
+  lumreels?: LumreelsClient;
+  lumreelsModel?: string;
+  /** For the thumbnail of a LumReels video; unset = "ffmpeg" on PATH. */
+  ffmpeg?: string;
 }
 
-export type JobWithSource = VideoJob & { imageSource: ImageSource; failedStage?: VideoStage; /** Explainer narrator; empty = default. */ voice?: string };
+export interface LumreelsRef {
+  templateId: string;
+  templateName: string;
+  model: string;
+  jobId?: string;
+  /** Hash of what the LumReels job was made from: a rewritten script starts a new one. */
+  contentHash?: string;
+}
+
+export type JobWithSource = VideoJob & {
+  imageSource: ImageSource;
+  failedStage?: VideoStage;
+  /** Explainer narrator; empty = default. */
+  voice?: string;
+  /** "lumreels" = motion graphics by LumReels instead of pictures + Remotion. */
+  engine?: "slides" | "lumreels";
+  lumreels?: LumreelsRef;
+};
 
 const AUTO_STAGES: VideoStage[] = ["researching", "writing", "producing", "rendering", "publishing"];
 const MAX_PROGRESS = 200;
@@ -125,6 +149,7 @@ export class VideoService extends EventEmitter {
         facebook: this.deps.publisher.facebookReady,
         defaultPrivacy: this.deps.defaultPrivacy ?? "private",
         defaultVoice: this.deps.defaultVoice,
+        lumreels: Boolean(this.deps.lumreels),
       },
       running: this.running?.id ?? null,
       queued: [...this.queue],
@@ -241,9 +266,29 @@ export class VideoService extends EventEmitter {
 
   // ---------------- jobs ----------------
 
-  async createExplainer(input: { topic?: string; format?: string; notes?: string; imageSource?: string; voice?: string }): Promise<VideoJob> {
+  async createExplainer(input: { topic?: string; format?: string; notes?: string; imageSource?: string; voice?: string; engine?: string; templateId?: string; model?: string }): Promise<VideoJob> {
     const topic = (input.topic ?? "").trim();
     if (topic.length < 4) throw new UserError("Nhập chủ đề cần giải thích.");
+    if (input.engine === "lumreels") {
+      const lr = this.deps.lumreels;
+      if (!lr) throw new UserError("LumReels chưa cấu hình (LUMREELS_DIR).");
+      const tpl = (await lr.templates()).find((t) => t.id === String(input.templateId ?? "").padStart(3, "0"));
+      if (!tpl) throw new UserError("Chọn một mẫu LumReels.");
+      const voice = input.voice?.trim() || this.deps.defaultVoice;
+      const voices = await lr.voices();
+      if (!voices.includes(voice)) throw new UserError(`LumReels chỉ đọc được giọng VieNeu có sẵn (${voices.slice(0, 4).join(", ")}…) — giọng nhái chưa dùng được với LumReels.`);
+      const model = ["auto", "sonnet", "opus", "haiku"].includes(String(input.model)) ? String(input.model) : (this.deps.lumreelsModel ?? "auto");
+      return this.addJob({
+        niche: "explainer",
+        topic,
+        format: "short", // LumReels renders 9:16 only
+        notes: input.notes,
+        imageSource: "ai", // unused: LumReels draws the scenes itself
+        voice,
+        engine: "lumreels",
+        lumreels: { templateId: tpl.id, templateName: tpl.name, model },
+      });
+    }
     return this.addJob({ niche: "explainer", topic, format: parseFormat(input.format), notes: input.notes, imageSource: this.pickSource(input.imageSource, "explainer"), voice: input.voice?.trim() || undefined });
   }
 
@@ -475,7 +520,84 @@ export class VideoService extends EventEmitter {
     this.emit("finished", job);
   }
 
+  lumreelsTemplates(): Promise<LumreelsTemplate[]> {
+    if (!this.deps.lumreels) throw new UserError("LumReels chưa cấu hình (LUMREELS_DIR).");
+    return this.deps.lumreels.templates();
+  }
+
+  lumreelsThumb(id: string): Promise<Response> {
+    if (!this.deps.lumreels || !/^\d{3}$/.test(id)) throw new UserError("Không có mẫu này.");
+    return this.deps.lumreels.thumb(id);
+  }
+
+  /**
+   * LumReels builds the whole video from the approved lines (its own Claude
+   * call per scene, its own VieNeu voice, music and effects), so this stage
+   * ends at final_review without the picture/voice/Remotion steps.
+   */
+  private async produceLumreels(job: JobWithSource, signal: AbortSignal): Promise<void> {
+    const lr = this.deps.lumreels;
+    const ref = job.lumreels!;
+    if (!lr) throw new Error("LumReels không còn được cấu hình (LUMREELS_DIR).");
+    const script = job.script!;
+    const content = lumreelsContent(script);
+    const durationS = lumreelsDuration(script);
+    const voice = job.voice || this.deps.defaultVoice;
+    const contentHash = hash(content, ref.templateId, voice, ref.model, String(durationS));
+    if (!ref.jobId || ref.contentHash !== contentHash) {
+      const created = await lr.createJob({ templateId: ref.templateId, content, durationS, voice, model: ref.model });
+      Object.assign(ref, { jobId: created.id, contentHash });
+      await this.save();
+      this.log(job, `LumReels mẫu ${ref.templateId} "${ref.templateName}", ${durationS} giây, giọng ${voice}, model ${ref.model}: Claude đang viết cảnh (thường 5–10 phút)…`);
+    } else {
+      this.log(job, `Theo dõi tiếp video LumReels ${ref.jobId}…`);
+    }
+    const STATUS: Record<string, string> = { queued: "đang chờ", generating: "Claude viết cảnh", previewing: "xem thử và tự sửa", rendering: "dựng hình + âm thanh", waiting_agent: "chờ agent viết cảnh" };
+    const until = Date.now() + 90 * 60_000;
+    let last = "";
+    for (;;) {
+      if (signal.aborted) return;
+      const j = await lr.job(ref.jobId!);
+      if (j.status !== last) {
+        last = j.status;
+        if (STATUS[j.status]) this.log(job, `LumReels: ${STATUS[j.status]}…`);
+      }
+      if (j.status === "done") break;
+      if (j.status === "error") {
+        ref.jobId = undefined; // a retry starts a fresh LumReels job
+        throw new Error(`LumReels báo lỗi: ${j.error ?? "không rõ"}`);
+      }
+      if (j.status === "waiting_agent") throw new Error("LumReels không tìm thấy Claude Code để viết cảnh (chế độ agent).");
+      if (Date.now() > until) throw new Error("LumReels chạy quá 90 phút — xem nhật ký trong thư mục lumreels/jobs.");
+      await sleep(5000, signal);
+    }
+    const dir = this.jobDir(job.id);
+    await mkdir(dir, { recursive: true });
+    const name = `lumreels-${ref.jobId}.mp4`; // a new name per build, so the browser never shows a cached old cut
+    await lr.download(ref.jobId!, path.join(dir, name));
+    job.output = name;
+    job.thumbnail = (await this.frameAt(path.join(dir, name), path.join(dir, `thumb-${ref.jobId}.png`), durationS * 0.3)) ? `thumb-${ref.jobId}.png` : undefined;
+    const read = await lr.narration(ref.jobId!);
+    if (read) {
+      const share = narrationMatch(script, read);
+      this.log(job, share === 1 ? "Lời đọc khớp đúng nguyên văn kịch bản đã duyệt." : `⚠ Lời đọc chỉ khớp ${Math.round(share * 100)}% kịch bản đã duyệt — nghe kỹ trước khi đăng.`);
+    }
+    if (signal.aborted) return;
+    this.setStage(job, "final_review", "Video LumReels đã xong. Chờ bạn xem và quyết định đăng.");
+    this.emit("finished", job);
+  }
+
+  /** One frame as a PNG (the thumbnail of a LumReels video); false when ffmpeg is missing or fails. */
+  private frameAt(video: string, out: string, sec: number): Promise<boolean> {
+    return new Promise((resolve) => {
+      const p = spawn(this.deps.ffmpeg ?? "ffmpeg", ["-v", "error", "-y", "-ss", String(Math.max(0, sec)), "-i", video, "-frames:v", "1", out], { stdio: "ignore" });
+      p.on("error", () => resolve(false));
+      p.on("close", (code) => resolve(code === 0));
+    });
+  }
+
   private async produce(job: JobWithSource, signal: AbortSignal): Promise<void> {
+    if (job.engine === "lumreels") return this.produceLumreels(job, signal);
     const script = job.script!;
     const series = job.seriesId ? this.needSeries(job.seriesId) : undefined;
     const dir = this.jobDir(job.id);
@@ -641,7 +763,16 @@ export class VideoService extends EventEmitter {
     this.running?.abort.abort();
     this.deps.tts.close?.();
     this.deps.images.ai?.close?.();
+    this.deps.lumreels?.close();
   }
+}
+
+/** Waits, but returns early (without throwing) when the job is stopped. */
+function sleep(ms: number, signal: AbortSignal): Promise<void> {
+  return new Promise((resolve) => {
+    const t = setTimeout(resolve, ms);
+    signal.addEventListener("abort", () => (clearTimeout(t), resolve()), { once: true });
+  });
 }
 
 function parseFormat(v: string | undefined): VideoFormat {
