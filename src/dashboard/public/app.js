@@ -2113,6 +2113,7 @@ document.addEventListener("click", async (e) => {
         toast("Đã thêm bài học.");
       }
     }
+    if (action.startsWith("vid-")) await videoAction(action, ds);
     if (action === "promote") (await post(`/api/engines/${encodeURIComponent(ds.engine)}/promote`, { id: ds.id })) && toast("Đã đưa lượt này lên đầu hàng đợi.");
   } finally {
     btn.disabled = false;
@@ -2243,8 +2244,8 @@ $("#company-steer").addEventListener("keydown", (e) => e.key === "Enter" && $("#
 function setView(view) {
   state.view = view;
   $$(".tab[data-view]").forEach((b) => b.classList.toggle("active", b.dataset.view === view));
-  for (const v of ["org", "flow", "timeline", "roles", "artifacts", "seo"]) $(`#view-${v}`).hidden = v !== view;
-  $("#filters").classList.toggle("hidden-filters", view === "artifacts" || view === "seo" || view === "roles");
+  for (const v of ["org", "flow", "timeline", "roles", "artifacts", "seo", "video"]) $(`#view-${v}`).hidden = v !== view;
+  $("#filters").classList.toggle("hidden-filters", view === "artifacts" || view === "seo" || view === "roles" || view === "video");
   $("#g-tip").hidden = true;
   if (view === "org") scheduleEdges();
   if (view === "flow") renderFlowView();
@@ -2252,6 +2253,7 @@ function setView(view) {
   if (view === "artifacts") loadArtifacts();
   if (view === "roles") loadScoreboard();
   if (view === "seo") loadSeo();
+  if (view === "video") loadVideo();
 }
 
 // ---------- Auto Content SEO tab ----------
@@ -2346,6 +2348,354 @@ function renderSeo() {
         )
         .join("")}</tbody></table>`
     : `<div class="muted">Chưa có lượt nào.</div>`;
+}
+
+// ---------- Auto Video tab ----------
+const VID_STAGE = {
+  researching: ["q-running", "Đang nghiên cứu"],
+  writing: ["q-running", "Đang viết kịch bản"],
+  script_review: ["q-waiting_you", "Chờ duyệt kịch bản"],
+  producing: ["q-running", "Đang làm giọng + ảnh"],
+  rendering: ["q-running", "Đang dựng"],
+  final_review: ["q-waiting_you", "Chờ xem video"],
+  publishing: ["q-running", "Đang đăng"],
+  published: ["q-done", "Đã đăng"],
+  failed: ["q-error", "Lỗi"],
+  stopped: ["", "Đã dừng"],
+};
+const vidBadge = (s) => `<span class="qstate ${(VID_STAGE[s] ?? ["", s])[0]}">${esc((VID_STAGE[s] ?? ["", s])[1])}</span>`;
+const vidFile = (kind, id, name) => `/api/video/file/${kind}/${encodeURIComponent(id)}/${encodeURIComponent(name)}`;
+const VID_RUNNING = ["researching", "writing", "producing", "rendering", "publishing"];
+
+async function loadVideo() {
+  const [snap, voices] = await Promise.all([fetch("/api/video").then((r) => r.json()), state.videoVoices ? null : fetch("/api/video/voices").then((r) => (r.ok ? r.json() : []))]);
+  state.video = snap;
+  if (voices) state.videoVoices = voices;
+  renderVideo();
+}
+
+/** Forms are drawn once; series and job cards redraw only when their own data changed, keeping what you typed. */
+function renderVideo() {
+  const el = $("#view-video");
+  const d = state.video;
+  if (!el || !d) return;
+  if (!el.querySelector("#vid-explainer-form")) {
+    el.innerHTML = `
+      <div class="vid-grid">
+        <div class="panel vid-wide"><div id="vid-config" class="vid-config"></div>
+          <form id="vid-clone" class="vid-clone" onsubmit="return false" hidden>
+            <span class="panel-sub">Nhái giọng của bạn</span>
+            <input class="feedback-input vid-inline" id="vid-clone-name" placeholder="Tên giọng, vd: Giọng của tôi" />
+            <input type="file" id="vid-clone-file" accept=".wav,.mp3,.m4a,.flac,.ogg,audio/*" />
+            <button class="btn btn-small" data-action="vid-clone">Thêm giọng</button>
+            <span class="muted small">File 3–8 giây, nói rõ, ít tiếng ồn. Chỉ dùng giọng của bạn hoặc người đã đồng ý.</span>
+          </form>
+        </div>
+        <div class="panel vid-card">
+          <div class="panel-title">Video giải thích kiến thức</div>
+          <form id="vid-explainer-form" onsubmit="return false">
+            <label class="panel-sub" for="vid-topic">Chủ đề</label>
+            <input class="feedback-input" id="vid-topic" placeholder="vd: Vì sao máy bay bay được" />
+            <div class="vid-row">
+              <label class="panel-sub">Định dạng <select id="vid-format"><option value="short">Ngắn dọc (~1 phút)</option><option value="long">Dài ngang (6–8 phút)</option></select></label>
+              <label class="panel-sub">Giọng đọc <select id="vid-voice"></select></label>
+              <label class="panel-sub">Ảnh <select id="vid-source"><option value="stock">Ảnh thật Openverse (miễn phí)</option><option value="ai">Ảnh AI vẽ trên máy</option></select></label>
+            </div>
+            <label class="panel-sub" for="vid-notes">Ghi chú cho người viết (tuỳ chọn)</label>
+            <textarea class="feedback-input" id="vid-notes" rows="2" placeholder="vd: dành cho học sinh cấp 2, giọng gần gũi"></textarea>
+            <div class="decision-row"><button class="btn btn-primary" data-action="vid-explainer">Tạo video</button></div>
+          </form>
+        </div>
+        <div class="panel vid-card">
+          <div class="panel-title">Phim AI dài tập</div>
+          <form id="vid-series-form" onsubmit="return false">
+            <label class="panel-sub" for="vid-premise">Ý tưởng phim</label>
+            <textarea class="feedback-input" id="vid-premise" rows="3" placeholder="vd: Hai học sinh ở Hội An phát hiện chiếc đèn lồng có thể đưa người về quá khứ…"></textarea>
+            <div class="vid-row">
+              <label class="panel-sub">Thể loại <input class="feedback-input" id="vid-genre" placeholder="phiêu lưu, bí ẩn" /></label>
+              <label class="panel-sub">Định dạng <select id="vid-series-format"><option value="short">Ngắn dọc</option><option value="long">Dài ngang</option></select></label>
+            </div>
+            <label class="panel-sub" for="vid-style">Phong cách hình (tuỳ chọn, tiếng Anh)</label>
+            <input class="feedback-input" id="vid-style" placeholder="vd: 2D anime, soft cel shading, warm muted palette" />
+            <div class="decision-row"><button class="btn btn-primary" data-action="vid-series-create">Tạo phim (Claude dựng nhân vật)</button></div>
+          </form>
+        </div>
+        <div class="panel vid-wide">
+          <div class="panel-title">Các bộ phim</div>
+          <div id="vid-series"></div>
+        </div>
+        <div class="panel vid-wide">
+          <div class="panel-title">Video</div>
+          <div id="vid-jobs"></div>
+        </div>
+      </div>`;
+  }
+  const c = d.config;
+  const item = (ok, label, hint) => `<span class="vid-cfg ${ok ? "ok" : "off"}" title="${esc(hint)}">${ok ? "●" : "○"} ${esc(label)}</span>`;
+  $("#vid-config").innerHTML = [
+    item(c.writer === "real", c.writer === "real" ? "Gemini + Claude viết" : "Người viết: giả lập", "VIDEO_WRITER=real (cần GEMINI_PROVIDER=real và CLAUDE_PROVIDER=cli/api)"),
+    item(c.tts === "vieneu", c.tts === "vieneu" ? "Giọng VieNeu (chạy trên máy)" : "Giọng: giả lập (im lặng)", "VIENEU_DIR=đường dẫn tới VieNeu-TTS"),
+    item(Boolean(c.images.stock), c.images.stock ? "Ảnh thật Openverse" : "Không dùng ảnh thật", "Openverse bật mặc định, không cần key; VIDEO_STOCK=none để tắt"),
+    item(Boolean(c.images.ai) && c.images.ai !== "mock", { mflux: "Ảnh AI FLUX.2 (vẽ trên máy)", gemini: "Ảnh AI Gemini (tính phí)" }[c.images.ai] ?? (c.images.ai ? "Ảnh AI: giả lập" : "Không dùng ảnh AI"), "VIDEO_IMAGES=mflux|gemini|mock|none"),
+    item(c.youtube, c.youtube ? "YouTube" : "Chưa nối YouTube", "YOUTUBE_CLIENT_ID/SECRET + npm run video:youtube-auth"),
+    item(c.facebook, c.facebook ? "Facebook" : "Chưa nối Facebook", "FACEBOOK_PAGE_ID + FACEBOOK_PAGE_TOKEN"),
+  ].join("") + `<span class="muted small">Rê chuột lên từng mục để xem biến cần đặt trong .env</span>`;
+  const vsel = $("#vid-voice");
+  const vKey = `${(state.videoVoices ?? []).map((v) => v.name).join("|")}|${c.defaultVoice}`;
+  if (vsel.dataset.key !== vKey) {
+    const keep = vsel.value;
+    vsel.outerHTML = voiceSelect("voice", keep, c.defaultVoice).replace("<select", `<select id="vid-voice" data-key="${esc(vKey)}"`);
+  }
+  const clone = $("#vid-clone");
+  clone.hidden = c.tts !== "vieneu";
+  const src = $("#vid-source");
+  src.querySelector('[value="stock"]').disabled = !c.images.stock;
+  src.querySelector('[value="ai"]').disabled = !c.images.ai;
+  if (src.selectedOptions[0]?.disabled) src.value = c.images.stock ? "stock" : "ai";
+
+  const seriesBox = $("#vid-series");
+  const sKey = JSON.stringify([d.series, d.busySeries, state.videoVoices?.length]);
+  if (seriesBox.dataset.key !== sKey) {
+    seriesBox.dataset.key = sKey;
+    seriesBox.innerHTML = d.series.length ? d.series.map((s) => renderSeriesCard(s, d)).join("") : `<div class="muted">Chưa có phim nào. Nhập ý tưởng ở trên để Claude dựng nhân vật.</div>`;
+  }
+
+  const jobsBox = $("#vid-jobs");
+  if (!d.jobs.length) {
+    jobsBox.innerHTML = `<div class="muted">Chưa có video nào.</div>`;
+    return;
+  }
+  if (jobsBox.querySelector(".muted:only-child")) jobsBox.innerHTML = "";
+  const seen = new Set();
+  let prev = null;
+  for (const job of d.jobs) {
+    seen.add(job.id);
+    let card = jobsBox.querySelector(`[data-vjob="${CSS.escape(job.id)}"]`);
+    const key = `${job.updatedAt}|${d.running === job.id}|${d.queued.includes(job.id)}|${JSON.stringify(c)}`;
+    if (!card) {
+      card = document.createElement("div");
+      card.className = "vid-job";
+      card.dataset.vjob = job.id;
+      card.dataset.open = VID_RUNNING.includes(job.stage) || job.stage.endsWith("_review") ? "1" : "";
+    }
+    if (card.dataset.key !== key) {
+      const kept = [...card.querySelectorAll("textarea, select, input")].map((x) => [x.dataset.k, x.type === "checkbox" ? x.checked : x.value]);
+      card.innerHTML = renderJobCard(job, d);
+      for (const [k, v] of kept) {
+        const x = card.querySelector(`[data-k="${CSS.escape(k ?? "")}"]`);
+        if (x && k) x.type === "checkbox" ? (x.checked = v) : (x.value = v);
+      }
+      card.dataset.key = key;
+      const log = card.querySelector(".vid-log");
+      if (log) log.scrollTop = log.scrollHeight;
+    }
+    card.classList.toggle("open", Boolean(card.dataset.open));
+    if (prev ? prev.nextSibling !== card : jobsBox.firstChild !== card) prev ? prev.after(card) : jobsBox.prepend(card);
+    prev = card;
+  }
+  for (const card of [...jobsBox.querySelectorAll("[data-vjob]")]) if (!seen.has(card.dataset.vjob)) card.remove();
+}
+
+function voiceSelect(k, value, def) {
+  const voices = state.videoVoices ?? [];
+  const opts = [`<option value="">Mặc định (${esc(def)})</option>`, ...voices.map((v) => `<option value="${esc(v.name)}" ${v.name === value ? "selected" : ""}>${esc(v.name)} · ${esc(v.label ?? (v.gender === "FEMALE" ? "nữ" : v.gender === "MALE" ? "nam" : v.gender.toLowerCase()))}</option>`)];
+  return `<select data-k="${esc(k)}">${opts.join("")}</select>`;
+}
+
+function renderSeriesCard(s, d) {
+  const eps = d.jobs.filter((j) => j.seriesId === s.id);
+  const busy = d.busySeries.includes(s.id);
+  const portraitsMissing = s.characters.some((c) => !c.refImage);
+  return `<div class="vid-series" data-series="${esc(s.id)}">
+    <div class="vid-series-head">
+      <div><b>${esc(s.title)}</b> <span class="muted small">· ${esc(s.genre)} · ${s.format === "long" ? "dài ngang" : "ngắn dọc"} · ${eps.length} tập</span>
+        <div class="muted small">${esc(s.premise)}</div>
+        <div class="small">Phong cách: <input class="feedback-input vid-inline" data-k="style" value="${esc(s.style)}" /></div>
+        <div class="small">Giọng dẫn truyện: ${voiceSelect("narrator", s.narratorVoice, d.config.defaultVoice)}</div>
+      </div>
+    </div>
+    <div class="vid-chars">${s.characters
+      .map(
+        (ch, i) => `<div class="vid-char" data-char="${i}">
+          ${ch.refImage ? `<img src="${vidFile("series", s.id, ch.refImage)}" alt="${esc(ch.name)}" loading="lazy" />` : `<div class="vid-char-ph">Chưa có ảnh</div>`}
+          <input class="feedback-input" data-k="name-${i}" value="${esc(ch.name)}" aria-label="Tên" />
+          <textarea class="feedback-input" rows="3" data-k="look-${i}" aria-label="Ngoại hình (tiếng Anh)">${esc(ch.look)}</textarea>
+          <input class="feedback-input" data-k="pers-${i}" value="${esc(ch.personality)}" aria-label="Tính cách" />
+          ${voiceSelect(`voice-${i}`, ch.voice, d.config.defaultVoice)}
+        </div>`,
+      )
+      .join("")}</div>
+    <div class="decision-row">
+      <button class="btn btn-small" data-action="vid-series-save" data-series="${esc(s.id)}">Lưu nhân vật</button>
+      <button class="btn btn-small" data-action="vid-portraits" data-series="${esc(s.id)}" ${busy || !d.config.images.ai ? "disabled" : ""}>${busy ? "Đang tạo ảnh…" : portraitsMissing ? "Tạo ảnh nhân vật" : "Tạo lại ảnh thiếu"}</button>
+      <input class="feedback-input vid-inline" data-k="ep-topic" placeholder="Ý tưởng tập mới (để trống = Gemini tự nối tiếp)" />
+      <button class="btn btn-primary" data-action="vid-episode" data-series="${esc(s.id)}">Tập mới</button>
+    </div>
+  </div>`;
+}
+
+function renderScript(sc) {
+  return `<div class="vid-script">
+    <div><b>${esc(sc.title)}</b></div>
+    <div class="muted small vid-pre">${esc(sc.description)}</div>
+    <div class="small">Thẻ: ${sc.tags.map((t) => `<code>${esc(t)}</code>`).join(" ")} · Chữ thumbnail: <b>${esc(sc.thumbnailText)}</b></div>
+    ${sc.summary ? `<div class="small">Tóm tắt tập: ${esc(sc.summary)}</div>` : ""}
+    <ol class="vid-scenes">${sc.scenes
+      .map(
+        (s) => `<li>${s.lines.map((l) => `<div>${l.speaker !== "narrator" ? `<b>${esc(l.speaker)}:</b> ` : ""}${esc(l.text)}</div>`).join("")}
+          <div class="muted small">Hình: ${esc(s.visual)}${s.onScreenText ? ` · Chữ trên hình: ${esc(s.onScreenText)}` : ""}</div></li>`,
+      )
+      .join("")}</ol>
+  </div>`;
+}
+
+function renderJobCard(job, d) {
+  const series = job.seriesId ? d.series.find((s) => s.id === job.seriesId) : null;
+  const head = series ? `${esc(series.title)} · Tập ${job.episode}` : esc(job.topic);
+  const id = esc(job.id);
+  const running = d.running === job.id;
+  const queued = d.queued.includes(job.id);
+  let body = "";
+  if (job.stage === "script_review" && job.script) {
+    body = `${renderScript(job.script)}
+      <details class="small"><summary>${series ? "Dàn ý của Gemini" : "Bản nghiên cứu của Gemini"}</summary><div class="vid-pre">${esc(job.research ?? "")}</div></details>
+      <textarea class="feedback-input" rows="2" data-k="fb" placeholder="Cần sửa gì? (bắt buộc khi bấm Yêu cầu sửa)"></textarea>
+      <div class="decision-row">
+        <button class="btn btn-primary" data-action="vid-script" data-act="approve" data-job="${id}">Duyệt, làm video</button>
+        <button class="btn btn-small" data-action="vid-script" data-act="revise" data-job="${id}">Yêu cầu sửa</button>
+        <button class="btn btn-ghost" data-action="vid-script" data-act="reject" data-job="${id}">Bỏ</button>
+      </div>`;
+  } else if (job.stage === "final_review" || job.stage === "published" || (job.stage === "failed" && job.output)) {
+    const yt = job.publish.youtube;
+    const fb = job.publish.facebook;
+    const post = (name, p) => (p ? `<div class="small">${name}: <a href="${esc(p.url)}" target="_blank" rel="noopener">${esc(p.url)}</a>${p.views != null ? ` · <b>${Number(p.views).toLocaleString("vi-VN")}</b> lượt xem` : ""}${p.error ? ` <span class="muted">(${esc(p.error)})</span>` : ""}</div>` : "");
+    const canPublish = job.stage === "final_review" || job.stage === "published" || job.failedStage === "publishing";
+    body = `<div class="vid-media ${job.format}">
+        ${job.output ? `<video controls preload="metadata" src="${vidFile("job", job.id, job.output)}" poster="${job.thumbnail ? vidFile("job", job.id, job.thumbnail) : ""}"></video>` : ""}
+        <div class="vid-media-side">
+          ${job.thumbnail ? `<img class="vid-thumb" src="${vidFile("job", job.id, job.thumbnail)}" alt="Thumbnail" />` : ""}
+          ${job.output ? `<a class="btn btn-small" href="${vidFile("job", job.id, job.output)}" download>Tải MP4</a>` : ""}
+          ${post("YouTube", yt)}${post("Facebook", fb)}
+          ${yt || fb ? `<button class="btn btn-small" data-action="vid-stats" data-job="${id}">Cập nhật lượt xem</button>` : ""}
+        </div>
+      </div>
+      ${job.script ? `<details class="small"><summary>Kịch bản</summary>${renderScript(job.script)}</details>` : ""}
+      ${
+        canPublish && (!yt || !fb)
+          ? `<div class="vid-publish">
+          ${!yt ? `<label class="check"><input type="checkbox" data-k="yt" ${d.config.youtube ? "checked" : "disabled"} /> YouTube</label>` : ""}
+          ${!fb ? `<label class="check"><input type="checkbox" data-k="fb-on" ${d.config.facebook ? "checked" : "disabled"} /> Facebook</label>` : ""}
+          <select data-k="privacy">${["private", "unlisted", "public"].map((p) => `<option value="${p}" ${p === d.config.defaultPrivacy ? "selected" : ""}>${{ private: "Riêng tư", unlisted: "Không công khai", public: "Công khai" }[p]}</option>`).join("")}</select>
+          <button class="btn btn-primary" data-action="vid-publish" data-job="${id}" ${d.config.youtube || d.config.facebook ? "" : "disabled title=\"Chưa nối YouTube/Facebook\""}>Đăng</button>
+        </div>`
+          : ""
+      }
+      ${
+        job.stage === "final_review"
+          ? `<textarea class="feedback-input" rows="2" data-k="fb" placeholder="Muốn sửa gì? Video sẽ viết lại kịch bản theo ghi chú này"></textarea>
+        <div class="decision-row">
+          <button class="btn btn-small" data-action="vid-final" data-act="revise" data-job="${id}">Yêu cầu sửa</button>
+          <button class="btn btn-ghost" data-action="vid-final" data-act="reject" data-job="${id}">Bỏ video</button>
+        </div>`
+          : ""
+      }`;
+  }
+  const log = `<pre class="live vid-log">${esc(job.progress.map((p) => `${fmtTime(p.at)}  ${p.text}`).join("\n"))}</pre>`;
+  const tools = [
+    VID_RUNNING.includes(job.stage) || job.stage.endsWith("_review") ? `<button class="btn btn-small-inline btn-danger-ghost" data-action="vid-stop" data-job="${id}">Dừng</button>` : "",
+    job.stage === "failed" ? `<button class="btn btn-small-inline" data-action="vid-retry" data-job="${id}">Chạy lại</button>` : "",
+    job.stage === "failed" || job.stage === "stopped" ? `<button class="btn btn-small-inline btn-danger-ghost" data-action="vid-remove" data-job="${id}">Xoá</button>` : "",
+  ].join("");
+  return `<div class="vid-job-head" data-action="vid-toggle" data-job="${id}">
+      ${vidBadge(job.stage)} ${running ? `<span class="muted small">đang chạy</span>` : queued ? `<span class="muted small">trong hàng đợi</span>` : ""}
+      <b>${job.script ? esc(job.script.title) : head}</b>
+      <span class="muted small">${series ? "" : "Giải thích · "}${job.format === "long" ? "dài ngang" : "ngắn dọc"}${job.words ? ` · ${job.words} từ` : ""} · ${esc(new Date(job.createdAt).toLocaleString("vi-VN"))}</span>
+      <span class="vid-tools">${tools}</span>
+    </div>
+    <div class="vid-job-body">
+      ${job.error ? `<div class="feedback-box is-error">${esc(job.error)}</div>` : ""}
+      ${body}
+      <details class="small" ${VID_RUNNING.includes(job.stage) ? "open" : ""}><summary>Nhật ký</summary>${log}</details>
+    </div>`;
+}
+
+async function videoAction(action, ds) {
+  const card = ds.job ? document.querySelector(`[data-vjob="${CSS.escape(ds.job)}"]`) : null;
+  const val = (k, root = card) => root?.querySelector(`[data-k="${k}"]`);
+  if (action === "vid-toggle") {
+    card.dataset.open = card.dataset.open ? "" : "1";
+    card.classList.toggle("open", Boolean(card.dataset.open));
+    return;
+  }
+  if (action === "vid-clone") {
+    const file = $("#vid-clone-file").files[0];
+    const name = $("#vid-clone-name").value.trim();
+    if (!file || !name) return toast("Chọn file ghi âm và đặt tên giọng.");
+    const ext = (file.name.split(".").pop() || "").toLowerCase();
+    toast("Đang gửi giọng mẫu cho VieNeu…");
+    const res = await fetch(`/api/video/voices?name=${encodeURIComponent(name)}&ext=${encodeURIComponent(ext)}`, { method: "POST", body: file });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) return toast(data.error || `Lỗi ${res.status}`);
+    $("#vid-clone-name").value = "";
+    $("#vid-clone-file").value = "";
+    state.videoVoices = null;
+    $("#vid-series").dataset.key = "";
+    await loadVideo();
+    return toast(`Đã thêm giọng "${name}" — chọn nó ở giọng dẫn truyện hoặc nhân vật.`);
+  }
+  if (action === "vid-explainer") {
+    const body = { topic: $("#vid-topic").value, format: $("#vid-format").value, imageSource: $("#vid-source").value, notes: $("#vid-notes").value, voice: $("#vid-voice").value };
+    if (await post("/api/video/explainer", body)) {
+      $("#vid-topic").value = "";
+      $("#vid-notes").value = "";
+      toast("Đã tạo video — Gemini nghiên cứu, rồi Claude viết kịch bản để bạn duyệt.");
+    }
+  }
+  if (action === "vid-series-create") {
+    toast("Claude đang dựng nhân vật — mất khoảng một phút.");
+    const body = { premise: $("#vid-premise").value, genre: $("#vid-genre").value, style: $("#vid-style").value, format: $("#vid-series-format").value };
+    if (await post("/api/video/series", body)) {
+      $("#vid-premise").value = "";
+      toast("Đã tạo phim. Xem lại nhân vật, chọn giọng, rồi bấm Tạo ảnh nhân vật.");
+    }
+  }
+  const sRoot = ds.series ? document.querySelector(`[data-series="${CSS.escape(ds.series)}"].vid-series`) : null;
+  if (action === "vid-series-save") {
+    const chars = [...sRoot.querySelectorAll(".vid-char")].map((el) => {
+      const i = el.dataset.char;
+      return { name: val(`name-${i}`, el).value, look: val(`look-${i}`, el).value, personality: val(`pers-${i}`, el).value, voice: val(`voice-${i}`, el).value };
+    });
+    const body = { characters: chars, style: val("style", sRoot).value, narratorVoice: val("narrator", sRoot).value };
+    if (await post(`/api/video/series/${encodeURIComponent(ds.series)}`, body)) toast("Đã lưu. Nhân vật đổi ngoại hình sẽ cần tạo lại ảnh.");
+  }
+  if (action === "vid-portraits") {
+    toast("Đang tạo ảnh nhân vật…");
+    if (await post(`/api/video/series/${encodeURIComponent(ds.series)}/portraits`)) toast("Đã có ảnh nhân vật — các cảnh sẽ vẽ theo ảnh này.");
+  }
+  if (action === "vid-episode") {
+    if (await post(`/api/video/series/${encodeURIComponent(ds.series)}/episode`, { topic: val("ep-topic", sRoot).value })) {
+      val("ep-topic", sRoot).value = "";
+      toast("Đã tạo tập mới.");
+    }
+  }
+  if (action === "vid-script" || action === "vid-final") {
+    const feedback = val("fb")?.value ?? "";
+    if (ds.act === "reject" && !confirm("Bỏ video này?")) return;
+    if (await post(`/api/video/jobs/${encodeURIComponent(ds.job)}/${action === "vid-script" ? "script" : "final"}`, { action: ds.act, feedback })) {
+      if (val("fb")) val("fb").value = "";
+    }
+  }
+  if (action === "vid-publish") {
+    const body = { youtube: Boolean(val("yt")?.checked), facebook: Boolean(val("fb-on")?.checked), privacy: val("privacy")?.value };
+    const where = [body.youtube && "YouTube", body.facebook && "Facebook"].filter(Boolean).join(" + ");
+    if (!where) return toast("Chọn nơi đăng.");
+    if (!confirm(`Đăng video này lên ${where} (${val("privacy").selectedOptions[0].textContent})?`)) return;
+    if (await post(`/api/video/jobs/${encodeURIComponent(ds.job)}/publish`, body)) toast("Đang tải lên…");
+  }
+  if (action === "vid-stats") (await post(`/api/video/jobs/${encodeURIComponent(ds.job)}/stats`)) && toast("Đã cập nhật lượt xem.");
+  if (action === "vid-retry") await post(`/api/video/jobs/${encodeURIComponent(ds.job)}/retry`);
+  if (action === "vid-stop") confirm("Dừng video này?") && (await post(`/api/video/jobs/${encodeURIComponent(ds.job)}/stop`));
+  if (action === "vid-remove") confirm("Xoá video này khỏi danh sách?") && (await post(`/api/video/jobs/${encodeURIComponent(ds.job)}/remove`));
 }
 
 // ---------- roles: playbook drawer & scoreboard ----------
@@ -2626,6 +2976,10 @@ function connect() {
   es.addEventListener("contentseo", (e) => {
     state.seo = JSON.parse(e.data);
     if (state.view === "seo") renderSeo();
+  });
+  es.addEventListener("video", (e) => {
+    state.video = JSON.parse(e.data);
+    if (state.view === "video") renderVideo();
   });
   es.addEventListener("live", (e) => {
     const { id, stage, start, text } = JSON.parse(e.data);

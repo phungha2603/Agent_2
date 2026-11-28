@@ -2,10 +2,11 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import express, { type NextFunction, type Request, type Response } from "express";
 import { Company, isUserError, UserError } from "../orchestrator/scheduler.js";
-import { buildAgents, buildPipelineConfig, buildProjectConfigSnapshot, buildSchedulerSettings } from "../config.js";
+import { buildAgents, buildPipelineConfig, buildProjectConfigSnapshot, buildSchedulerSettings, buildVideoDeps } from "../config.js";
 import { createMacNotifier } from "./notify.js";
 import { createGithubOps } from "../verify/gitProject.js";
 import { ContentSeoService } from "../integrations/contentSeo.js";
+import { VideoService } from "../integrations/video/service.js";
 import { basicAuth, isLoopback } from "./auth.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -42,6 +43,7 @@ const company = new Company({
 });
 
 const contentSeo = process.env.CONTENTSEO_DIR?.trim() ? new ContentSeoService(process.env.CONTENTSEO_DIR.trim()) : undefined;
+const video = new VideoService(buildVideoDeps());
 
 const app = express();
 app.disable("x-powered-by");
@@ -127,6 +129,11 @@ company.on("rebalance", debounced(SLOT_DEBOUNCE_MS, () => broadcast("rebalance",
 company.on("live", (chunk) => broadcast("live", chunk));
 company.on("lessons", debounced(SLOT_DEBOUNCE_MS, async () => broadcast("lessons", await company.lessonsSummary())));
 contentSeo?.on("change", debounced(300, () => broadcast("contentseo", contentSeo.snapshot())));
+video.on("change", debounced(300, () => broadcast("video", video.snapshot())));
+video.on("finished", (job) => {
+  const what: Record<string, string> = { script_review: "Kịch bản chờ duyệt", final_review: "Video chờ xem", published: "Đã đăng", failed: "Lỗi" };
+  if (what[job.stage]) notifier?.(`Auto Video · ${what[job.stage]}`, job.script?.title ?? job.topic ?? "");
+});
 contentSeo?.on("finished", (run) => {
   const what = { done: "Xong", partial: "Xong một phần", quota: "Dừng vì hết quota Gemini", failed: "Lỗi", stopped: "Đã dừng", running: "" }[run.status as string] ?? run.status;
   notifier?.(`Content SEO · ${what}`, `${run.domain} / ${run.keyword}${run.result ? ` — ${run.result} bài` : ""}`);
@@ -250,6 +257,33 @@ app.post("/api/contentseo/bot/start", route(async (_req, res) => ok(res, needCon
 app.post("/api/contentseo/bot/stop", route(async (_req, res) => ok(res, needContentSeo().stopBot())));
 app.post("/api/contentseo/check", route(async (_req, res) => ok(res, await needContentSeo().check())));
 
+// ---------- Auto Video tab ----------
+app.get("/api/video", (_req, res) => res.json(video.snapshot()));
+app.get("/api/video/voices", route(async (_req, res) => res.json(await video.voices())));
+app.get("/api/video/file/:kind/:id/:name", (req, res) => {
+  const kind = req.params.kind === "series" ? "series" : "job";
+  const file = video.filePath(kind, req.params.id, req.params.name);
+  if (!file) return res.status(404).end();
+  res.sendFile(file, (err) => err && !res.headersSent && res.status(404).end());
+});
+app.post("/api/video/voices", express.raw({ type: () => true, limit: "20mb" }), route(async (req, res) => {
+  ok(res, await video.addVoice(String(req.query.name ?? ""), req.body as Buffer, String(req.query.ext ?? "").toLowerCase()));
+}));
+app.post("/api/video/explainer", route(async (req, res) => ok(res, { job: await video.createExplainer(req.body ?? {}) })));
+app.post("/api/video/series", route(async (req, res) => ok(res, { series: await video.createSeries(req.body ?? {}) })));
+app.post("/api/video/series/:id", route(async (req, res) => ok(res, { series: await video.updateSeries(req.params.id, req.body ?? {}) })));
+app.post("/api/video/series/:id/portraits", route(async (req, res) => ok(res, { series: await video.makePortraits(req.params.id) })));
+app.post("/api/video/series/:id/episode", route(async (req, res) => ok(res, { job: await video.createEpisode(req.params.id, req.body ?? {}) })));
+app.post("/api/video/jobs/:id/script", route(async (req, res) => ok(res, await video.decideScript(req.params.id, String(req.body?.action), str(req.body?.feedback)))));
+app.post("/api/video/jobs/:id/final", route(async (req, res) => ok(res, await video.decideFinal(req.params.id, String(req.body?.action), str(req.body?.feedback)))));
+app.post("/api/video/jobs/:id/publish", route(async (req, res) =>
+  ok(res, await video.publish(req.params.id, { youtube: req.body?.youtube === true, facebook: req.body?.facebook === true, privacy: str(req.body?.privacy) })),
+));
+app.post("/api/video/jobs/:id/retry", route(async (req, res) => ok(res, await video.retry(req.params.id))));
+app.post("/api/video/jobs/:id/stop", route(async (req, res) => ok(res, await video.stop(req.params.id))));
+app.post("/api/video/jobs/:id/remove", route(async (req, res) => ok(res, await video.remove(req.params.id))));
+app.post("/api/video/jobs/:id/stats", route(async (req, res) => ok(res, await video.refreshStats(req.params.id))));
+
 app.post("/api/reset", route(async (_req, res) => ok(res, await company.reset())));
 
 app.use((err: Error, _req: Request, res: Response, _next: NextFunction) => {
@@ -259,6 +293,7 @@ app.use((err: Error, _req: Request, res: Response, _next: NextFunction) => {
 
 await company.init();
 await contentSeo?.init();
+await video.init();
 const server = app.listen(PORT, HOST, () => {
   console.log(`AI Company dashboard: http://${isLoopback(HOST) ? "localhost" : HOST}:${PORT}${AUTH_USER && AUTH_PASSWORD ? " (login required)" : ""}`);
 });
@@ -267,6 +302,7 @@ const shutdown = async () => {
   server.close();
   for (const c of clients) c.end();
   contentSeo?.close();
+  video.close();
   await company.close();
   process.exit(0);
 };

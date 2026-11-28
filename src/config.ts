@@ -1,6 +1,8 @@
 import "dotenv/config";
 import { createRoleSupport } from "./org/runtime.js";
+import os from "node:os";
 import path from "node:path";
+import { fileURLToPath } from "node:url";
 import type { ProjectConfig } from "./types.js";
 import type { Agents } from "./orchestrator/pipeline.js";
 import type { PipelineConfig, VisualConfig } from "./orchestrator/pipeline.js";
@@ -14,6 +16,11 @@ import { screenshotBuildOutput } from "./verify/screenshot.js";
 import { DEFAULT_SYNC_EXCLUDE, type IsolationConfig } from "./verify/workspace.js";
 import type { SchedulerSettings } from "./orchestrator/scheduler.js";
 import type { Price } from "./agents/limited.js";
+import type { Agent } from "./types.js";
+import type { VideoDeps } from "./integrations/video/service.js";
+import { createGeminiImages, createMfluxImages, createMockImages, createMockTts, createOpenverseImages, createVieneuTts } from "./integrations/video/providers.js";
+import { createPublisher } from "./integrations/video/publish.js";
+import { createRemotionRenderer } from "./integrations/video/render.js";
 
 function provider(name: string): "real" | "mock" {
   const v = (process.env[name] ?? "mock").toLowerCase();
@@ -228,4 +235,85 @@ function requireEnv(name: string): string {
   const v = process.env[name];
   if (!v) throw new Error(`Missing required env var ${name} (set it in .env, or switch that role back to mock).`);
   return v;
+}
+
+/**
+ * The Auto Video tab's own agents and providers. Its Gemini and Claude are
+ * separate instances from the company's (and never Muse), so a video job
+ * never takes a slot in the agents' queues. Every provider falls back to a
+ * mock, so the tab runs end to end before any key is set.
+ */
+export function buildVideoDeps(): VideoDeps {
+  const writer = (process.env.VIDEO_WRITER ?? (provider("GEMINI_PROVIDER") === "real" && claudeProvider() !== "mock" ? "real" : "mock")).toLowerCase();
+  const dataDir = path.resolve(process.cwd(), "data/video");
+  let gemini: Agent | null = null;
+  let claude: Agent | null = null;
+  if (writer === "real") {
+    gemini = createGeminiAgent({ apiKeys: geminiApiKeys(), model: process.env.VIDEO_GEMINI_MODEL || process.env.GEMINI_MODEL });
+    claude =
+      claudeProvider() === "api"
+        ? createClaudeAgent({ apiKey: requireEnv("ANTHROPIC_API_KEY"), model: process.env.VIDEO_CLAUDE_MODEL || process.env.CLAUDE_MODEL })
+        : createClaudeCliAgent({
+            command: process.env.CLAUDE_CLI_COMMAND,
+            model: process.env.VIDEO_CLAUDE_MODEL || process.env.CLAUDE_MODEL,
+            cwd: dataDir,
+            stream: false,
+            timeoutSec: num("CLAUDE_CLI_TIMEOUT_SEC", 900),
+            tools: "", // the prompt carries everything; no file access needed
+          });
+  }
+
+  const ttsKind = (process.env.VIDEO_TTS ?? (process.env.VIENEU_DIR || process.env.VIENEU_URL ? "vieneu" : "mock")).toLowerCase();
+  const tts =
+    ttsKind === "vieneu"
+      ? createVieneuTts({
+          baseUrl: process.env.VIENEU_URL || undefined,
+          dir: process.env.VIENEU_DIR || undefined,
+          apiKey: process.env.VIENEU_API_KEY || undefined,
+          voicesDir: path.join(dataDir, "voices"),
+        })
+      : createMockTts();
+
+  const aiKind = (process.env.VIDEO_IMAGES ?? "mock").toLowerCase();
+  const ai =
+    aiKind === "mflux"
+      ? createMfluxImages({
+          python: process.env.MFLUX_PYTHON || path.join(os.homedir(), ".local/share/uv/tools/mflux/bin/python"),
+          script: fileURLToPath(new URL("./integrations/video/mflux_worker.py", import.meta.url)),
+          quantize: num("MFLUX_QUANTIZE", 8),
+          steps: num("MFLUX_STEPS", 4),
+        })
+      : aiKind === "gemini"
+        ? createGeminiImages({ apiKeys: geminiApiKeys(), model: process.env.GEMINI_IMAGE_MODEL })
+        : aiKind === "none"
+          ? undefined
+          : createMockImages();
+  // Openverse needs no key; VIDEO_STOCK=none turns real photos off.
+  const stock = process.env.VIDEO_STOCK === "none" ? undefined : createOpenverseImages();
+
+  const ytId = process.env.YOUTUBE_CLIENT_ID;
+  const ytSecret = process.env.YOUTUBE_CLIENT_SECRET;
+  const fbPage = process.env.FACEBOOK_PAGE_ID;
+  const fbToken = process.env.FACEBOOK_PAGE_TOKEN;
+  const privacy = process.env.VIDEO_DEFAULT_PRIVACY;
+
+  return {
+    dataDir,
+    gemini,
+    claude,
+    tts,
+    images: { ai, stock },
+    renderer: createRemotionRenderer(),
+    publisher: createPublisher({
+      youtube: ytId && ytSecret ? { clientId: ytId, clientSecret: ytSecret, tokenFile: youtubeTokenFile() } : undefined,
+      facebook: fbPage && fbToken ? { pageId: fbPage, pageToken: fbToken, graphVersion: process.env.FACEBOOK_GRAPH_VERSION || undefined } : undefined,
+    }),
+    defaultVoice: process.env.VIDEO_VOICE || (ttsKind === "vieneu" ? "Hải Đăng" : "mock-female"),
+    explainerStyle: process.env.VIDEO_EXPLAINER_STYLE || undefined,
+    defaultPrivacy: privacy === "public" || privacy === "unlisted" ? privacy : "private",
+  };
+}
+
+export function youtubeTokenFile(): string {
+  return path.resolve(process.cwd(), "data/video/youtube-token.json");
 }

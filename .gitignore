@@ -5,3 +5,4 @@ data/tasks/*.json
 data/visual/*.png
 data/dashboard.json
 data/workspaces/
+data/video/
