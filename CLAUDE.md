@@ -44,6 +44,11 @@ Tab Auto Video chạy bằng các dự án mã nguồn mở dưới đây, đề
 
 Đã cân nhắc và **không dùng**: Google TTS (tốn phí), Pexels (ngừng cấp key mới), edge-tts (dịch vụ Microsoft không chính thức), VieGem-ASR · viet-tts · v-tts · F5-TTS-Vietnamese · viXTTS · fish-speech · FLUX.2-klein-9B (model cấm thương mại).
 
+Dự phòng khi repo gốc đóng hoặc bị xoá:
+- Ba repo đã fork về `github.com/phungha2603/{VieNeu-TTS,mflux,lumreels}`; hai bản clone trên máy có remote `fork`.
+- Model sao lưu nguyên vẹn ở `~/AI-Models-Backup/` (có `README.md` hướng dẫn khôi phục); `.env` đặt `HF_HUB_OFFLINE=1` nên VieNeu, mflux, LumReels chỉ đọc model trên máy (đã thử chạy cả hai khi offline).
+- Model mới (lần đầu dùng một model khác) phải tạm bỏ `HF_HUB_OFFLINE` để tải về, rồi sao lưu lại.
+
 Cập nhật một repo: vào thư mục của nó `git pull` (hoặc `uv tool upgrade mflux`), chạy thử một video, rồi sửa cột phiên bản ở bảng này. Model đã tải nằm trong `~/.cache/huggingface/hub`: xoá thư mục đó là phải tải lại từ Hugging Face.
 
 ## Quy ước và bẫy
