@@ -1,52 +1,129 @@
-import { mkdir, readFile, writeFile } from "node:fs/promises";
+import { mkdir, readFile } from "node:fs/promises";
 import { existsSync } from "node:fs";
 import path from "node:path";
 import type { Stage } from "../types.js";
+import { writeFileAtomic } from "../store/atomicWrite.js";
+import { ROLES, type TeamId } from "../org/roles.js";
 
 export interface SlotDef {
   id: string; // "AG-01"
   name: string;
   icon: string;
+  /** Org-chart rank: 1 = boss (exactly one), 2 = team lead, 3 = staff. */
+  tier: 1 | 2 | 3;
+  team: TeamId;
 }
 
-export const SLOTS: SlotDef[] = [
-  { id: "AG-01", name: "AI Product Lead", icon: "🚀" },
-  { id: "AG-02", name: "AI Market Researcher", icon: "🔍" },
-  { id: "AG-03", name: "AI Data Engineer", icon: "🗄️" },
-  { id: "AG-04", name: "AI Data Scientist", icon: "🧠" },
-  { id: "AG-05", name: "AI Backend Architect", icon: "🏗️" },
-  { id: "AG-06", name: "AI Frontend / 3D UI", icon: "🖥️" },
-  { id: "AG-07", name: "AI Automation Ops", icon: "⚙️" },
-  { id: "AG-08", name: "AI QA & Security", icon: "🛡️" },
-  { id: "AG-09", name: "AI Content & SEO", icon: "📢" },
-  { id: "AG-10", name: "AI Release Manager", icon: "🚩" },
-];
+export const TIER_LABELS: Record<1 | 2 | 3, string> = {
+  1: "Sếp",
+  2: "Trưởng nhóm",
+  3: "Nhân viên",
+};
 
-/** Where each slot's assigned task lives, persisted across server restarts. */
-export type DashboardState = Record<string, string | null>; // slotId -> taskId | null
+/**
+ * The department slots, ranked into 3 tiers and grouped into teams — defined
+ * in src/org/roles.ts together with each role's playbook, model tier and
+ * checks. AG-01 is the sole tier-1 "boss": when "Chạy luồng cả công ty" is
+ * used, the company-wide goal is handed to it, and it plans a work tree whose
+ * epics go to team leads and subtasks to staff. Running a slot on its own
+ * (the "Chạy riêng khung này" button) is unaffected by tier — any slot can
+ * still be run individually with whatever goal is typed into the shared input.
+ */
+export const SLOTS: SlotDef[] = ROLES.map(({ id, name, icon, tier, team }) => ({ id, name, icon, tier, team }));
+
+/**
+ * Which tasks each slot holds (oldest first) and which plan, if any, the
+ * boss is currently showing — persisted across server restarts.
+ */
+export interface Directive {
+  id: string;
+  /** null = for the whole company. */
+  slotId: string | null;
+  text: string;
+  at: string;
+  /**
+   * The plan that was active when it was given: it then reaches only that
+   * plan's tasks, so a directive for one project never leaks into the next.
+   * Absent = given with no plan active, reaches every task.
+   */
+  planId?: string;
+}
+
+export interface DashboardState {
+  slots: Record<string, string[]>;
+  activePlanId: string | null;
+  /** Slots whose results only hand off after the CEO approves them (approval gates). */
+  gates: Record<string, boolean>;
+  directives: Directive[];
+  paused: boolean;
+}
+
+/** QA, security and release are the natural gates; the CEO can toggle any slot. */
+export const DEFAULT_GATED_SLOTS = ROLES.filter((r) => r.gatedByDefault).map((r) => r.id);
 
 const STATE_PATH = path.resolve(process.cwd(), "data/dashboard.json");
 
+function emptyState(): DashboardState {
+  return {
+    slots: Object.fromEntries(SLOTS.map((s) => [s.id, []])),
+    activePlanId: null,
+    gates: Object.fromEntries(SLOTS.map((s) => [s.id, DEFAULT_GATED_SLOTS.includes(s.id)])),
+    directives: [],
+    paused: false,
+  };
+}
+
+/**
+ * Accepts both the current shape and the old one (a flat slotId -> taskId |
+ * null map, one task per slot), so an existing data/dashboard.json keeps its
+ * assignments after upgrading.
+ */
+function normalize(parsed: any): DashboardState {
+  const state = emptyState();
+  const isV2 = parsed && typeof parsed === "object" && parsed.slots && typeof parsed.slots === "object";
+  const source: Record<string, unknown> = isV2 ? parsed.slots : (parsed ?? {});
+  for (const s of SLOTS) {
+    const v = source[s.id];
+    state.slots[s.id] = Array.isArray(v) ? v.filter((x): x is string => typeof x === "string") : typeof v === "string" ? [v] : [];
+  }
+  state.activePlanId = isV2 && typeof parsed.activePlanId === "string" ? parsed.activePlanId : null;
+  if (isV2 && parsed.gates && typeof parsed.gates === "object") {
+    for (const s of SLOTS) if (typeof parsed.gates[s.id] === "boolean") state.gates[s.id] = parsed.gates[s.id];
+  }
+  if (isV2 && Array.isArray(parsed.directives)) {
+    state.directives = parsed.directives.filter((d: any) => d && typeof d.text === "string" && typeof d.id === "string");
+  }
+  state.paused = isV2 && parsed.paused === true;
+  return state;
+}
+
 export async function loadDashboardState(): Promise<DashboardState> {
   if (!existsSync(STATE_PATH)) {
-    const empty: DashboardState = Object.fromEntries(SLOTS.map((s) => [s.id, null]));
-    return empty;
+    return emptyState();
   }
   const raw = await readFile(STATE_PATH, "utf8");
-  const parsed = JSON.parse(raw) as DashboardState;
-  for (const s of SLOTS) if (!(s.id in parsed)) parsed[s.id] = null;
-  return parsed;
+  try {
+    return normalize(JSON.parse(raw));
+  } catch (err) {
+    // A corrupted or empty file (e.g. the process was killed mid-write
+    // before writes went through writeFileAtomic) should degrade to "no
+    // slots assigned" rather than crash the whole dashboard server on
+    // every single request. The next save overwrites it with valid JSON.
+    console.error(`data/dashboard.json is corrupted (${(err as Error).message}) — treating it as empty.`);
+    return emptyState();
+  }
 }
 
 export async function saveDashboardState(state: DashboardState): Promise<void> {
   await mkdir(path.dirname(STATE_PATH), { recursive: true });
-  await writeFile(STATE_PATH, JSON.stringify(state, null, 2), "utf8");
+  await writeFileAtomic(STATE_PATH, JSON.stringify(state, null, 2));
 }
 
 const STAGE_ORDER: Stage[] = [
   "ideation",
   "checkpoint_idea",
   "architecture",
+  "architecture_review",
   "implementation",
   "verification",
   "review_gemini",
@@ -73,6 +150,8 @@ export function deriveStatus(stage: Stage | undefined): SlotStatus {
     case "ideation":
     case "architecture":
       return { label: "Planning", colorClass: "blue", progress };
+    case "architecture_review":
+      return { label: "Design Review", colorClass: "blue", progress };
     case "checkpoint_idea":
     case "checkpoint_final":
       return { label: "Waiting", colorClass: "yellow", progress };

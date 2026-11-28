@@ -62,3 +62,68 @@ export class HttpStatusError extends Error {
     this.retryAfterMs = retryAfterMs;
   }
 }
+
+/** Rotates through a pool of API keys, remembering which one is "current" across calls. */
+export interface KeyPool {
+  readonly size: number;
+  current(): string;
+  /** Advances to the next key (wraps around) — call this after a 429 on the current one. */
+  rotate(): void;
+  /** Removes the current key for good (it was rejected as invalid); false if it was the last one. */
+  drop(): boolean;
+}
+
+export function createKeyPool(initialKeys: string[]): KeyPool {
+  if (initialKeys.length === 0) throw new Error("createKeyPool requires at least one key");
+  const keys = [...initialKeys];
+  let i = 0;
+  return {
+    get size() {
+      return keys.length;
+    },
+    current() {
+      return keys[i];
+    },
+    rotate() {
+      i = (i + 1) % keys.length;
+    },
+    drop() {
+      if (keys.length <= 1) return false;
+      const [gone] = keys.splice(i, 1);
+      i = i % keys.length;
+      console.warn(`Gemini key …${gone.slice(-4)} was rejected (401/403) and is removed from the rotation until the server restarts.`);
+      return true;
+    },
+  };
+}
+
+/**
+ * Runs `fn` with the pool's current key. On a 429 it rotates to the next key
+ * and retries immediately (no backoff — a sibling key's quota is unrelated),
+ * up to once per key in the pool. If every key is rate-limited, rethrows the
+ * last error so the caller's own retry/backoff (e.g. withRetry) takes over.
+ */
+export async function withKeyRotation<T>(pool: KeyPool, fn: (apiKey: string) => Promise<T>): Promise<T> {
+  let lastErr: unknown;
+  for (let i = 0; i < pool.size; i++) {
+    const apiKey = pool.current();
+    try {
+      return await fn(apiKey);
+    } catch (err) {
+      lastErr = err;
+      const status = (err as { status?: number } | undefined)?.status;
+      if (status === 429 && pool.size > 1) {
+        pool.rotate();
+        continue;
+      }
+      // An invalid key never starts working: drop it and try the next one
+      // now, instead of failing every call that lands on it.
+      if ((status === 401 || status === 403) && pool.drop()) {
+        i -= 1;
+        continue;
+      }
+      throw err;
+    }
+  }
+  throw lastErr;
+}

@@ -1,8 +1,34 @@
-import type { Agent, AgentResponse, HistoryEntry, ProjectConfig, RoleName, Stage, TaskRecord } from "../types.js";
+import type {
+  Agent,
+  AgentResponse,
+  FeedbackEntry,
+  HistoryEntry,
+  ProjectConfig,
+  RoleName,
+  SendOptions,
+  Stage,
+  TaskAlert,
+  TaskContext,
+  TaskRecord,
+  TraceEntry,
+} from "../types.js";
 import type { VerifyConfig } from "../verify/runner.js";
 import { runVerification } from "../verify/runner.js";
 import { newTaskId } from "../store/taskStore.js";
 import { parseFileBlocks, writeFiles } from "../apply/applyFiles.js";
+import { readFile } from "node:fs/promises";
+import path from "node:path";
+import { checkFiles, checkWrittenFiles, formatFileProblems } from "../verify/fileChecks.js";
+import { prepareShadow, type IsolationConfig } from "../verify/workspace.js";
+import { failureDigest } from "../verify/failureDigest.js";
+import { sendReview, VERDICT_INSTRUCTION } from "../agents/verdict.js";
+import { pruneContext } from "./contextPruning.js";
+import { applyArchitectureRevision } from "./archRevision.js";
+import { compressForClaude } from "./compressForClaude.js";
+import { collectProjectFiles } from "./projectFiles.js";
+import { MaxTurnsReached } from "../agents/claude-cli.js";
+import type { RoleCheckFinding, RoleCheckInput } from "../verify/roleChecks.js";
+import type { GuidanceStage } from "../org/playbooks.js";
 
 export function createTask(title: string, projectConfig?: ProjectConfig): TaskRecord {
   const now = new Date().toISOString();
@@ -15,8 +41,37 @@ export function createTask(title: string, projectConfig?: ProjectConfig): TaskRe
     history: [],
     implementationAttempts: 0,
     reviewRejections: 0,
+    architectureRounds: 0,
+    autoRecoveries: 0,
     projectConfig,
   };
+}
+
+export interface PlannedTaskInput {
+  title: string;
+  slotId: string;
+  ideaBrief: string;
+  acceptanceCriteria: string[];
+  sharedBrief: string;
+  planRef: { planId: string; epicId: string; subtaskId?: string };
+}
+
+/**
+ * A task created from a plan the CEO already approved. That approval stands
+ * in for checkpoint_idea, so it starts at architecture with the plan's
+ * description as its brief — not at ideation, which would have Gemini
+ * re-invent a brief the human already signed off on.
+ */
+export function createPlannedTask(input: PlannedTaskInput, projectConfig?: ProjectConfig): TaskRecord {
+  const task = createTask(input.title, projectConfig);
+  task.stage = "architecture";
+  task.slotId = input.slotId;
+  task.planRef = input.planRef;
+  task.context.ideaBrief = input.ideaBrief;
+  task.context.acceptanceCriteria = input.acceptanceCriteria;
+  task.context.sharedBrief = input.sharedBrief;
+  log(task, "architecture", "ceo", `Created from approved plan ${input.planRef.planId} — starts at architecture (the plan approval covers the idea checkpoint).`);
+  return task;
 }
 
 export interface Agents {
@@ -46,42 +101,159 @@ export interface VisualConfig {
   captureScreenshot: (opts: { cwd: string; buildDir: string; outPath: string; waitMs?: number }) => Promise<string>;
 }
 
+/**
+ * What a task's role adds to the pipeline (see src/org/runtime.ts): its
+ * playbook for each step, its own verification checks, and which Claude
+ * model its calls use. Optional — without it every task runs role-agnostic.
+ */
+export interface RoleSupport {
+  guidance(task: TaskRecord, stage: GuidanceStage): Promise<string | undefined>;
+  checks(task: TaskRecord, input: RoleCheckInput): Promise<RoleCheckFinding[]>;
+  claudeModel(task: TaskRecord, purpose: "architecture" | "review"): string | undefined;
+  label(task: TaskRecord): string | undefined;
+}
+
 export interface PipelineConfig {
   verify: VerifyConfig;
+  /** Role playbooks, checks and model routing for tasks that belong to a role. */
+  roles?: RoleSupport;
+  /**
+   * When set, verification runs in a shadow copy of the project and the
+   * engineer's files reach the project only once it passes. Unset keeps the
+   * old behavior (write into the project, verify there).
+   */
+  isolation?: IsolationConfig;
+  /** Claude model per step (CLAUDE_MODEL_ARCHITECTURE / _REVIEW); unset = the agent's own model. */
+  claudeModels?: { architecture?: string; review?: string };
   maxImplementationAttempts: number;
   maxReviewRejections: number;
+  /** Safety ceiling on Claude/Gemini architecture discussion rounds (default 20 — meant to never be hit in practice). */
+  maxArchitectureRounds?: number;
+  /**
+   * When implementation/review budgets run out, send the task back to
+   * architecture (with all the accumulated feedback) this many times before
+   * giving up as "rejected". Default 0.
+   */
+  maxAutoRecoveries?: number;
   visual?: VisualConfig;
 }
+
+export interface AdvanceHooks {
+  onChunk?: (text: string) => void;
+  signal?: AbortSignal;
+}
+
+export function trace(task: TaskRecord, by: string, kind: TraceEntry["kind"], text: string): void {
+  (task.trace ??= []).push({ at: new Date().toISOString(), by, kind, text });
+}
+
+/**
+ * Claude's architecture and sign-off calls may read the project on disk
+ * (read-only), run from the task's own project directory — so the guide and
+ * the final ruling rest on the files actually there, not on the engineer's
+ * description of them.
+ */
+const READ_ONLY_TOOLS = "Read,Grep,Glob";
+
+const READ_FILES_NOTE =
+  "The current contents of the project files this task names are included below. You can open other project files with the Read, Grep and Glob tools (your working directory is the project), but each file you open costs a full round trip — open only what you genuinely need and isn't already included. " +
+  "If those tools are not available to you, everything you need is in this message: never write out a tool call as text.";
+
+const NO_TOOLS_NOTE =
+  "You have no tools in this step: judge from what is in this message — the diff, the verification log the orchestrator ran, and the context. Never write out a tool call as text. ";
+
+/** Turn budget for Claude's file-reading architecture calls; on reaching it, the call is redone without tools. */
+const ARCH_MAX_TURNS = Number(process.env.CLAUDE_CLI_MAX_TURNS) || 8;
+
+const CEO_REQUESTS_RULE =
+  "If CEO requests or CEO directives are listed above, go through every one of them: for each, say whether it is done and point at the evidence (which file, what it now contains). If any one is not done, reject — however good the rest is. ";
+
+const EVIDENCE_RULE =
+  "Evidence rule: the only proof that the code builds and its tests pass is the verification log the orchestrator ran on this machine (shown first, labelled as such). " +
+  "Anything the engineer says about having run, tested or verified things in its own environment is an unverified claim and counts for nothing. ";
+
+const FILES_LINE_RULE =
+  "End the guide with one line listing every file the engineer may create or change, exactly in this form: `FILES: path/one.ext, path/two.ext` (paths relative to the project root; `*` matches within one path segment, e.g. `scripts/*.sh`). " +
+  "The engineer may not write any other file, so leave out files that must stay as they are (and anything a CEO directive says not to touch). " +
+  "The engineer cannot read the project: for each existing file it must change, include in the guide that file's current content, or the exact parts it must keep, so it doesn't rebuild the file from an outdated copy.";
+
+/** Shortest first-draft guide accepted; anything shorter is a note about the guide, not the guide. */
+const MIN_SPEC_CHARS = 200;
+/** Extra tries Claude gets when its architecture reply isn't a usable guide, before the stage errors out. */
+const SPEC_RETRIES = 2;
+/** A tool call written out as text — what Claude produces when it wants a tool it can't run. */
+export const FAKE_TOOL_CALL_RE =
+  /<\/?(?:function_calls|invoke|tool_use|xai:function_call)\b|<parameter name=|<param name=|^\s*\*\*Tool: \w+\*\*|^\s*\*\*\d+ tool uses?\*\*/im;
 
 const PROMPTS = {
   ideation:
     "You are the ideation lead. Propose a concrete idea/feature brief for this task: goals, target users, rough scope. Keep it short. " +
+    "If shared plan context or acceptance criteria are included below, the brief must stay inside them. " +
     "If feedback from a previous round is included below, this is a revision of the brief itself — rewrite it to actually reflect the new direction the feedback describes, replacing anything in the old brief that now contradicts it, not just appending a note.",
   architecture:
     "You are the architecture lead and mentor to the engineer (Muse), who writes all the code — you do NOT write code yourself. " +
-    "Write a precise, step-by-step implementation guide, not just a high-level spec: exact file list with what each one is responsible for, exact function/method signatures, the order to build things in, plain pseudocode for any non-trivial logic, and common mistakes to avoid. " +
-    "Write it the way you'd personally walk a capable but unfamiliar engineer through building this, so there's as little left to guess as possible. " +
-    "If feedback from a previous round is included below, this is a revision: write a full updated guide that actually changes to address that feedback — don't repeat the previous design unchanged.",
+    "Write a concise implementation guide: file list with what each one is responsible for, the build order, and how each acceptance criterion will be met and which test proves it. " +
+    "Give exact function/method signatures and pseudocode only for the one or two genuinely trickiest parts of the logic — for everything else, a clear one- or two-line description of what a file does is enough; don't spell out the obvious. " +
+    "You'll get a chance to go deep on exactly the part that needs it if Gemini pushes back on this round, so there's no need to over-specify everything up front. " +
+    "If upstream handoffs are listed, build on those files and interfaces instead of recreating them. " +
+    READ_FILES_NOTE +
+    " Your reply itself is the guide — the complete document, not a note about what you'll do next. " +
+    FILES_LINE_RULE,
+  architectureRevision:
+    "You are revising the architecture guide above after Gemini's feedback (below). Reply with ONLY a unified diff against the exact guide shown above — no prose before or after, don't restate the whole guide. " +
+    "Go as deep and precise as the fix actually needs — exact function signatures, pseudocode, step-by-step logic for the specific part(s) you're changing, even though the original guide was kept concise; this is exactly the moment to add that depth. " +
+    "Leave everything you're not changing out of the diff entirely. Use this exact unified diff format (--- / +++ header lines, @@ -start,count +start,count @@ hunk headers, a few lines of unchanged context, '-' for removed lines, '+' for added lines):\n" +
+    "---\n+++\n@@ -12,3 +12,5 @@\n unchanged context line\n-old line\n+new line\n+another new line\n unchanged context line\n" +
+    READ_FILES_NOTE,
+  architectureReview:
+    "REVIEW: You are discussing this architecture spec with Claude before any code gets written — Muse hasn't started yet. " +
+    "Read it against the idea brief and the acceptance criteria (every criterion must have a clear way to be met and tested). If it's solid, approve it. If something is missing, ambiguous, risky, or could be designed better, reject and say exactly what to add or change — name the specific section, file, or interface and what you'd write instead, since Claude will revise the spec and you'll read the new version next round. " +
+    "There is no limit on how many rounds this can take — only approve once you'd actually be comfortable seeing this built exactly as written. " +
+    "An empty or placeholder spec (e.g. only a note that Claude will check something first) must be rejected. " +
+    "If CEO requests or CEO directives are listed above, the guide must cover every one of them; reject a guide that leaves one out. " +
+    VERDICT_INSTRUCTION,
   implementation:
-    "You are the engineer. Implement the following architecture spec in code.\n" +
+    "You are the engineer. Implement the following architecture spec in code, making sure every acceptance criterion listed is met (with a test where possible).\n" +
     "For every file you create or change, write a line starting with exactly:\n" +
     "FILE: relative/path/to/file.ext\n" +
-    "followed by the FULL contents of that file (not a diff), then the next FILE: line for the next file. " +
-    "Do not skip writing a file's contents, and do not just describe what a file would contain.",
+    "followed by the FULL contents of that file (not a diff) inside ONE fenced code block: a line of three backticks (plus the language) before it and a line of three backticks after it. " +
+    "If the file itself contains a line of three backticks (e.g. a Markdown file with code samples), fence it with four or more backticks instead. " +
+    "Only what is inside each file's code block is written to disk — put any explanation, notes or logs outside the code blocks, never inside them. " +
+    "Do not skip writing a file's contents, and do not just describe what a file would contain. " +
+    "Write only the files on the guide's `FILES:` line — a reply that writes any other file is rejected as a whole. " +
+    "The orchestrator builds and tests the files on the user's machine itself after you reply; whatever you ran in your own environment is not taken as proof that anything works.",
   reviewGemini:
-    "REVIEW: Review this implementation against the idea brief and verification log. " +
+    "REVIEW: Review this implementation against the idea brief, the acceptance criteria (each listed criterion must be demonstrably met — name any that isn't), and the verification log. " +
     "If a reference style image and a screenshot of the running implementation are attached, compare them directly — " +
     "say concretely where the screenshot matches or deviates from the reference's look (composition, color, mood, missing/extra elements), not just whether the code builds. " +
-    "Approve or reject, with reasons.",
+    EVIDENCE_RULE +
+    CEO_REQUESTS_RULE +
+    "Approve or reject, with reasons. " +
+    VERDICT_INSTRUCTION,
   reviewClaude:
-    "REVIEW: Final sign-off review, as the mentor who wrote the architecture guide. Check the implementation matches that guide and passed verification. " +
-    "If you reject, don't just say what's wrong — give precise, step-by-step instructions for exactly how to fix it (which file, which function, what the corrected logic should look like), as if correcting a student's work directly, so the engineer can act on it without guessing. " +
-    "Approve or reject, with reasons.",
-  reviewGeminiFallback:
-    "REVIEW: Gemini, the usual independent reviewer for this round, is temporarily unavailable, so you are standing in to give that independent review before this reaches your own final sign-off later. " +
-    "Review this implementation against the idea brief and verification log as a separate check from your eventual sign-off — focus on whether it actually does what was asked, not just whether it compiles. " +
-    "Approve or reject, with reasons.",
+    "REVIEW: Final sign-off review, as the mentor who wrote the architecture guide. Check the implementation matches that guide, meets every listed acceptance criterion, and passed verification. " +
+    "If feedback from the independent reviewer is included above, you decide for yourself whether it's actually correct before ruling — don't just rubber-stamp it: you may agree with it, or overrule it and approve anyway (say briefly why). " +
+    "If you reject — whether because you agree with that feedback or found your own issue — don't just say what's wrong: give precise, step-by-step instructions for exactly how to fix it (which file, which function, what the corrected logic should look like), as if correcting a student's work directly, so the engineer can act on it without guessing. " +
+    "You are always the one who makes this call, not the independent reviewer. " +
+    EVIDENCE_RULE +
+    CEO_REQUESTS_RULE +
+    NO_TOOLS_NOTE +
+    "Approve or reject, with reasons. " +
+    VERDICT_INSTRUCTION,
+  reviewClaudeFallback:
+    "REVIEW: Gemini, the usual independent reviewer, is temporarily unavailable — you are doing the whole review yourself this round, both the independent check and your own final sign-off, in one pass (there's no separate second opinion to defer to here, so rule on your own judgment). " +
+    "Review this implementation against the idea brief, the acceptance criteria (each listed criterion must be demonstrably met — name any that isn't), the architecture guide you wrote, and the verification log. " +
+    "If a reference style image and a screenshot of the running implementation are attached, compare them directly — say concretely where the screenshot matches or deviates from the reference's look. " +
+    "This is your own final decision. If you reject, don't just say what's wrong: give precise, step-by-step instructions for exactly how to fix it (which file, which function, what the corrected logic should look like), as if correcting a student's work directly, so the engineer can act on it without guessing. " +
+    EVIDENCE_RULE +
+    CEO_REQUESTS_RULE +
+    NO_TOOLS_NOTE +
+    "Approve or reject, with reasons. " +
+    VERDICT_INSTRUCTION,
 };
+
+/** Longest slice of earlier feedback carried into an automatic-recovery note. */
+const RECOVERY_FEEDBACK_CHARS = 6000;
 
 /** The verify settings this task actually runs with — its own snapshot if it has one, else the live config (old tasks). */
 function resolveVerify(task: TaskRecord, config: PipelineConfig): VerifyConfig {
@@ -113,9 +285,104 @@ function resolveVisual(task: TaskRecord, config: PipelineConfig): VisualConfig |
   };
 }
 
-function log(task: TaskRecord, stage: Stage, by: RoleName, summary: string): void {
+/** Records (or replaces, per kind) a warning the CEO sees on the card and at the final checkpoint. */
+export function setAlert(task: TaskRecord, kind: TaskAlert["kind"], level: TaskAlert["level"], text: string): void {
+  task.alerts = [...(task.alerts ?? []).filter((a) => a.kind !== kind), { kind, level, at: new Date().toISOString(), stage: task.stage, text }];
+}
+
+function clearAlert(task: TaskRecord, kind: TaskAlert["kind"]): void {
+  if (task.alerts?.some((a) => a.kind === kind)) task.alerts = task.alerts.filter((a) => a.kind !== kind);
+}
+
+/** Why a reply can't be used as the architecture guide, or undefined if it can. */
+export function specProblem(spec: string, opts: { requireLength: boolean }): string | undefined {
+  if (FAKE_TOOL_CALL_RE.test(spec)) {
+    return "it contains a tool call written out as text instead of the guide itself";
+  }
+  const len = spec.trim().length;
+  if (opts.requireLength && len < MIN_SPEC_CHARS) {
+    return `it is only ${len} characters — a note about the guide, not the guide`;
+  }
+  if (opts.requireLength && !allowedFilesFrom(spec)) {
+    return "it has no closing `FILES: ...` line listing the files the engineer may write";
+  }
+  return undefined;
+}
+
+/** The file patterns on the guide's last `FILES:` line, or undefined if it has none (older guides: no limit). */
+export function allowedFilesFrom(spec: string | undefined): string[] | undefined {
+  const lines = [...(spec ?? "").matchAll(/^[ \t>*_`-]*FILES:[*_`]*[ \t]*(.+)$/gim)];
+  if (!lines.length) return undefined;
+  const list = lines[lines.length - 1][1]
+    .split(",")
+    .map((p) => p.replace(/[`*_]+$/g, "").replace(/^[`]+|[`]+$/g, "").trim())
+    .filter(Boolean);
+  return list.length ? list : undefined;
+}
+
+/** Whether `file` is one of the allowed patterns (`*` = within one segment, `**` = across segments). */
+export function fileAllowed(file: string, patterns: string[]): boolean {
+  const norm = (p: string) => p.replace(/^\.\//, "");
+  return patterns.some((pat) => {
+    const re = norm(pat)
+      .split(/(\*\*|\*)/)
+      .map((part) => (part === "**" ? ".*" : part === "*" ? "[^/]*" : part.replace(/[.+?^${}()|[\]\\]/g, "\\$&")))
+      .join("");
+    return new RegExp(`^${re}$`).test(norm(file));
+  });
+}
+
+/** Options for Claude's file-reading calls: the task's own project directory, read-only tools, a turn budget. */
+function claudeReadOpts(task: TaskRecord, config: PipelineConfig, opts: SendOptions): SendOptions {
+  return { ...opts, cwd: resolveVerify(task, config).cwd, tools: READ_ONLY_TOOLS, maxTurns: ARCH_MAX_TURNS, model: config.roles?.claudeModel(task, "architecture") ?? config.claudeModels?.architecture };
+}
+
+/**
+ * Review calls get no tools: the diff, the orchestrator's own verification
+ * log and the automatic on-disk check are the evidence, and file browsing
+ * multiplied a review's input tokens many times over (one review: 814k).
+ */
+function claudeReviewOpts(task: TaskRecord, config: PipelineConfig, opts: SendOptions): SendOptions {
+  return { ...opts, cwd: resolveVerify(task, config).cwd, tools: "", model: config.roles?.claudeModel(task, "review") ?? config.claudeModels?.review };
+}
+
+export function log(task: TaskRecord, stage: Stage, by: RoleName, summary: string): void {
   const entry: HistoryEntry = { stage, at: new Date().toISOString(), by, summary };
   task.history.push(entry);
+}
+
+const FEEDBACK_LOG_MAX = 12;
+const FEEDBACK_ENTRY_CHARS = 2000;
+
+/** Keeps every send-back on the task (reviewFeedback only holds the latest) — the raw material for role lessons. */
+export function recordFeedback(task: TaskRecord, by: string, kind: FeedbackEntry["kind"], text: string): void {
+  const log = (task.feedbackLog ??= []);
+  log.push({ at: new Date().toISOString(), by, kind, text: text.slice(0, FEEDBACK_ENTRY_CHARS) });
+  if (log.length > FEEDBACK_LOG_MAX) log.splice(0, log.length - FEEDBACK_LOG_MAX);
+}
+
+/**
+ * A step's prompt with the task role's playbook added. It goes after the
+ * step's own instructions (callers and agents key on the prompt's first
+ * word, e.g. "REVIEW:") and before a review's closing verdict instruction,
+ * so the reply format the parser relies on stays the last thing asked.
+ */
+export function withRole(prompt: string, guidance: string | undefined): string {
+  if (!guidance) return prompt;
+  if (prompt.endsWith(VERDICT_INSTRUCTION)) {
+    return `${prompt.slice(0, prompt.length - VERDICT_INSTRUCTION.length)}${guidance}\n${VERDICT_INSTRUCTION}`;
+  }
+  return prompt + guidance;
+}
+
+async function roleGuidance(task: TaskRecord, config: Pick<PipelineConfig, "roles"> | undefined, stage: GuidanceStage): Promise<string | undefined> {
+  try {
+    return await config?.roles?.guidance(task, stage);
+  } catch (err) {
+    // A missing or unreadable playbook must never stop the work itself.
+    log(task, task.stage, "system", `Role playbook unavailable (${(err as Error).message}) — continuing without it.`);
+    return undefined;
+  }
 }
 
 /** Generates the reference image once (if this task's visual review is on and it hasn't been made yet). */
@@ -131,6 +398,57 @@ async function ensureReferenceImage(task: TaskRecord, config: PipelineConfig): P
   }
 }
 
+/**
+ * Out of implementation/review budget. Repeated failure to build or pass
+ * review usually means the guide itself is the problem, so before giving
+ * up, send it back to Claude with everything the attempts learned — a
+ * revised architecture, not just another identical retry.
+ */
+function exhaustBudget(task: TaskRecord, config: PipelineConfig, reason: string): void {
+  const used = task.autoRecoveries ?? 0;
+  const max = config.maxAutoRecoveries ?? 0;
+  if (used >= max) {
+    task.stage = "rejected";
+    return;
+  }
+  task.autoRecoveries = used + 1;
+  const previous = (task.context.reviewFeedback ?? []).join("\n").slice(-RECOVERY_FEEDBACK_CHARS);
+  task.context.reviewFeedback = [
+    `Automatic recovery ${used + 1}/${max}: the engineer could not get this to pass (${reason}) after ` +
+      `${task.implementationAttempts} implementation attempt(s) and ${task.reviewRejections} review rejection(s). ` +
+      `Most recent feedback:\n${previous}\n\n` +
+      "Revise the implementation guide so the next attempt succeeds: be far more explicit exactly where it kept failing, and simplify where you can.",
+  ];
+  task.implementationAttempts = 0;
+  task.reviewRejections = 0;
+  task.architectureRounds = 0;
+  log(task, task.stage, "system", `Budget exhausted (${reason}) — automatic recovery ${used + 1}/${max}: back to architecture with all accumulated feedback.`);
+  trace(task, "System", "recovery", `Out of attempts (${reason}); sent back to Claude to revise the architecture (${used + 1}/${max}).`);
+  task.stage = "architecture";
+}
+
+/**
+ * Claude's ruling on a review (approve it, or reject with feedback and —
+ * budget allowing — another shot at implementation). Shared by the normal
+ * review_claude stage and the Gemini-down fallback in review_gemini, which
+ * has Claude rule on the spot instead of making a second, separate Claude
+ * call into review_claude right after its own first one.
+ */
+function applyReviewVerdict(task: TaskRecord, config: PipelineConfig, res: AgentResponse, feedbackLabel: string): void {
+  if (res.verdict === "approve") {
+    task.stage = "checkpoint_final";
+    return;
+  }
+  task.reviewRejections += 1;
+  task.context.reviewFeedback = [`${feedbackLabel}:\n${res.content}`];
+  recordFeedback(task, /gemini/i.test(feedbackLabel) && !/claude/i.test(feedbackLabel) ? "gemini" : "claude", "review", res.content);
+  if (task.reviewRejections < config.maxReviewRejections) {
+    task.stage = "implementation";
+  } else {
+    exhaustBudget(task, config, "review kept rejecting");
+  }
+}
+
 /** Terminal stages, or stages that need a human decision before they can proceed. */
 export function isWaitingForHuman(task: TaskRecord): boolean {
   return task.stage === "checkpoint_idea" || task.stage === "checkpoint_final";
@@ -141,14 +459,173 @@ export function isTerminal(task: TaskRecord): boolean {
 }
 
 /**
+ * Asks Muse for the implementation and records the reply (and the bumped
+ * attempt count) on the task — no filesystem writes yet. Split out of the
+ * "implementation" stage so the scheduler can run this chat call without
+ * holding the shared workspace lock; only applyImplementation below, which
+ * actually touches disk, needs it.
+ */
+export async function draftImplementation(task: TaskRecord, agents: Agents, hooks: AdvanceHooks = {}, config?: Pick<PipelineConfig, "roles">): Promise<void> {
+  const opts: SendOptions = { onChunk: hooks.onChunk, taskId: task.id, signal: hooks.signal };
+  const feedback = task.context.reviewFeedback?.length
+    ? `\n\nAddress this feedback from the previous attempt:\n${task.context.reviewFeedback.join("\n")}`
+    : "";
+  // The engineer can't read the project: give it the current contents of
+  // the files it may write, instead of letting it rebuild them from memory.
+  task.context.projectFiles = await collectProjectFiles(task, task.projectConfig?.verifyCwd, allowedFilesFrom(task.context.architectureSpec) ?? []);
+  const role = await roleGuidance(task, config, "implementation");
+  const res = await agents.muse.send(PROMPTS.implementation + (role ?? "") + feedback, pruneContext("implementation", task.context), opts);
+  task.context.implementationDiff = res.content;
+  task.implementationAttempts += 1;
+}
+
+/**
+ * An implementation attempt that produced nothing usable (no files, or files
+ * refused before writing). It uses up one attempt like a failed build does —
+ * it never moves on to verification, where an unrelated passing test suite
+ * could wave it through.
+ */
+function failAttempt(task: TaskRecord, config: PipelineConfig, reason: string, feedback: string): void {
+  task.context.implementationFiles = [];
+  task.context.reviewFeedback = [feedback];
+  log(task, task.stage, "system", `Implementation attempt #${task.implementationAttempts} rejected before writing anything: ${reason}.`);
+  if (task.implementationAttempts < config.maxImplementationAttempts) {
+    task.stage = "implementation";
+  } else {
+    exhaustBudget(task, config, reason);
+  }
+}
+
+/**
+ * Writes the files draftImplementation already fetched and moves on to
+ * verification — but only if every file is fenced and passes the content
+ * checks; otherwise nothing at all is written and the attempt counts as
+ * failed. Touches the shared project directory — callers should hold the
+ * workspace lock across this (and, without releasing it in between, across
+ * the verification that immediately follows).
+ */
+export async function applyImplementation(task: TaskRecord, config: PipelineConfig): Promise<void> {
+  const files = parseFileBlocks(task.context.implementationDiff ?? "");
+  if (files.length === 0) {
+    setAlert(task, "no_files", "info", `Lượt viết code #${task.implementationAttempts} không có file nào (Muse không trả về khối "FILE:") — đã bắt viết lại.`);
+    failAttempt(
+      task,
+      config,
+      'the reply had no "FILE:" blocks',
+      'Your previous reply contained no files: nothing was written to disk. Reply with every file as a "FILE: path" line followed by its full contents in a fenced code block.',
+    );
+    return;
+  }
+  const unfenced = files.filter((f) => !f.fenced).map((f) => ({ path: f.path, problems: ["its contents are not inside a complete fenced code block (missing, or never closed), so they can't be told apart from prose"] }));
+  const allowed = allowedFilesFrom(task.context.architectureSpec);
+  const outside = allowed
+    ? files
+        .filter((f) => !fileAllowed(f.path, allowed))
+        .map((f) => ({ path: f.path, problems: [`not on the guide's FILES: line (${allowed.join(", ")}) — only those files may be written`] }))
+    : [];
+  const broken = await checkFiles(files.filter((f) => f.fenced));
+  const problems = [...outside, ...unfenced, ...broken];
+  if (problems.length) {
+    setAlert(
+      task,
+      "files_rejected",
+      "info",
+      `Lượt viết code #${task.implementationAttempts} có ${problems.length} file hỏng hoặc sai định dạng (${problems.map((p) => p.path).join(", ")}) — không ghi file nào, đã bắt viết lại.`,
+    );
+    failAttempt(
+      task,
+      config,
+      `${problems.length} file(s) failed the pre-write checks`,
+      `None of your files were written: these failed the checks run before writing anything to disk. Fix them and send ALL files again, each fenced.\n${formatFileProblems(problems)}`,
+    );
+    return;
+  }
+  if (config.isolation) {
+    // Nothing touches the project yet: verification writes these into its
+    // own copy and promotes them only if every check passes.
+    task.context.implementationFiles = files.map((f) => f.path);
+    log(
+      task,
+      task.stage,
+      "muse",
+      `Implementation attempt #${task.implementationAttempts}: ${files.length} file(s) ready for verification in an isolated copy of the project: ${files.map((f) => f.path).join(", ")}.`,
+    );
+    task.stage = "verification";
+    return;
+  }
+  const written = await writeFiles(resolveVerify(task, config).cwd, files);
+  task.context.implementationFiles = written;
+  log(task, task.stage, "muse", `Implementation attempt #${task.implementationAttempts}: wrote ${written.length} file(s): ${written.join(", ")}.`);
+  task.stage = "verification";
+}
+
+/**
+ * With the plan's option on, a plain subtask Gemini approved with no red
+ * warning doesn't also need Claude's sign-off. Integration tasks (where the
+ * pieces meet) and CEO revisions (where Claude checks each request) always
+ * get it.
+ */
+function claudeReviewSkippable(task: TaskRecord): boolean {
+  if (!task.projectConfig?.skipClaudeReviewWhenGreen) return false;
+  if (!task.planRef?.subtaskId) return false;
+  if (task.context.ceoRequests?.length) return false;
+  return !(task.alerts ?? []).some((a) => a.level === "warn");
+}
+
+/**
+ * Before anyone reviews this attempt, checks its files on disk still hold
+ * what the engineer wrote. If another task has written over one since, the
+ * reviewers would be judging something that isn't what's in the project.
+ */
+async function flagOverwrittenFiles(task: TaskRecord, config: PipelineConfig): Promise<void> {
+  const root = resolveVerify(task, config).cwd;
+  const changed: string[] = [];
+  for (const f of attemptFiles(task)) {
+    const onDisk = await readFile(path.join(root, f.path), "utf8").catch(() => undefined);
+    if (onDisk !== f.content) changed.push(f.path);
+  }
+  if (changed.length) {
+    setAlert(task, "files_overwritten", "warn", `File trên đĩa đã khác với bản task này viết (có thể bị task khác ghi đè): ${changed.join(", ")} — review có thể không khớp với dự án.`);
+    log(task, task.stage, "system", `Files changed on disk since this attempt wrote them: ${changed.join(", ")}.`);
+  } else {
+    clearAlert(task, "files_overwritten");
+  }
+}
+
+/** This attempt's files, re-read from the engineer's reply (the reply is the record; nothing else holds them before promotion). */
+function attemptFiles(task: TaskRecord) {
+  const wanted = new Set(task.context.implementationFiles ?? []);
+  return parseFileBlocks(task.context.implementationDiff ?? "").filter((f) => f.fenced && wanted.has(f.path));
+}
+
+/**
+ * The verification commands' output never mentions any file this attempt
+ * wrote: they may well be testing something else (a leftover project in the
+ * same directory once "passed" every task this way).
+ */
+function coversWrittenFiles(log: string, commands: string[], files: string[]): boolean {
+  if (!files.length) return true;
+  const haystack = `${commands.join("\n")}\n${log}`;
+  return files.some((f) => {
+    const base = f.split("/").pop()!;
+    const stem = base.replace(/\.[^.]+$/, "");
+    const top = f.includes("/") ? f.split("/")[0] : "";
+    return haystack.includes(base) || (stem.length >= 4 && haystack.includes(stem)) || (top.length >= 3 && haystack.includes(`${top}/`));
+  });
+}
+
+/**
  * Runs the current stage's action and moves the task to its next stage.
  * Must not be called while isWaitingForHuman(task) or isTerminal(task) — use
  * resolveCheckpoint for the former.
  */
-export async function advance(task: TaskRecord, agents: Agents, config: PipelineConfig): Promise<TaskRecord> {
+export async function advance(task: TaskRecord, agents: Agents, config: PipelineConfig, hooks: AdvanceHooks = {}): Promise<TaskRecord> {
+  const opts: SendOptions = { onChunk: hooks.onChunk, taskId: task.id, signal: hooks.signal };
+  const ctx = (stage: Stage): TaskContext => pruneContext(stage, task.context);
+
   switch (task.stage) {
     case "ideation": {
-      const res = await agents.gemini.send(PROMPTS.ideation, task.context);
+      const res = await agents.gemini.send(withRole(PROMPTS.ideation, await roleGuidance(task, config, "ideation")), ctx("ideation"), opts);
       task.context.ideaBrief = res.content;
       log(task, task.stage, "gemini", "Idea brief drafted.");
       await ensureReferenceImage(task, config);
@@ -157,61 +634,166 @@ export async function advance(task: TaskRecord, agents: Agents, config: Pipeline
     }
 
     case "architecture": {
-      const res = await agents.claude.send(PROMPTS.architecture, task.context);
-      task.context.architectureSpec = res.content;
-      log(task, task.stage, "claude", "Architecture spec written.");
+      const revising = Boolean(task.context.reviewFeedback?.length) && Boolean(task.context.architectureSpec);
+      const claudeOpts = claudeReadOpts(task, config, opts);
+      task.context.projectFiles = await collectProjectFiles(task, resolveVerify(task, config).cwd, allowedFilesFrom(task.context.architectureSpec) ?? []);
+      const archContext = await compressForClaude(agents.gemini, ctx("architecture"), opts.signal);
+      // Out of turns while reading files means no answer at all: ask once
+      // more without tools, from the file contents already included.
+      const sendArch = async (prompt: string): Promise<AgentResponse> => {
+        try {
+          return await agents.claude.send(prompt, archContext, claudeOpts);
+        } catch (err) {
+          if (!(err instanceof MaxTurnsReached)) throw err;
+          log(task, task.stage, "system", `Claude used its ${ARCH_MAX_TURNS}-turn file-reading budget without answering — asking again without tools, from the included file contents.`);
+          return agents.claude.send(
+            `${prompt}\n\nYour file-reading budget for this step is used up: write the complete answer now from what is in this message.`,
+            archContext,
+            { ...claudeOpts, tools: "", maxTurns: undefined },
+          );
+        }
+      };
+      // Retries a reply that isn't a usable guide (a fake tool call, or a
+      // one-line "I'll check the files first") instead of passing it on as
+      // the spec — that once gave Muse an empty guide to build from.
+      const askClaude = async (prompt: string, requireLength: boolean): Promise<string> => {
+        let problem: string | undefined;
+        for (let attempt = 0; attempt <= SPEC_RETRIES; attempt++) {
+          const note = problem ? `\n\nYour previous reply could not be used: ${problem}. Reply with the complete guide itself this time.` : "";
+          const res = await sendArch(prompt + note);
+          problem = specProblem(res.content, { requireLength });
+          if (!problem) {
+            if (attempt > 0) {
+              setAlert(task, "spec_rewritten", "info", `Claude phải viết lại bản thiết kế ${attempt} lần vì bản trước không dùng được (trống hoặc chỉ là lệnh gọi công cụ giả).`);
+            }
+            return res.content;
+          }
+          log(task, task.stage, "system", `Claude's architecture reply was not usable (${problem}) — asking again.`);
+        }
+        throw new Error(`Claude did not produce a usable architecture guide after ${SPEC_RETRIES + 1} tries: ${problem}.`);
+      };
+      const archRole = await roleGuidance(task, config, "architecture");
+      if (!revising) {
+        task.context.architectureSpec = await askClaude(withRole(PROMPTS.architecture, archRole), true);
+        log(task, task.stage, "claude", "Architecture spec written.");
+      } else {
+        const reply = await askClaude(withRole(PROMPTS.architectureRevision, archRole), false);
+        const { spec, patched } = applyArchitectureRevision(task.context.architectureSpec!, reply);
+        task.context.architectureSpec = spec;
+        log(
+          task,
+          task.stage,
+          "claude",
+          patched ? "Architecture spec revised (applied as a diff)." : "Architecture spec revised (Claude sent the full updated guide instead of a diff).",
+        );
+      }
       // Also checked here, not just in ideation: a task can reach
       // architecture for the first time well after ideation (e.g. the
-      // visual loop was turned on partway through, or this is a
-      // checkpoint_final redesign), and this is still the right moment to
-      // have a reference image before implementation starts.
+      // visual loop was turned on partway through, it was created from a
+      // plan, or this is a checkpoint_final redesign), and this is still
+      // the right moment to have a reference image before implementation.
       await ensureReferenceImage(task, config);
-      task.stage = "implementation";
+      task.context.reviewFeedback = [];
+      task.stage = "architecture_review";
+      return task;
+    }
+
+    case "architecture_review": {
+      const res = await sendReview(agents.gemini, withRole(PROMPTS.architectureReview, await roleGuidance(task, config, "architecture_review")), ctx("architecture_review"), opts);
+      log(task, task.stage, "gemini", `Verdict: ${res.verdict}.`);
+      if (res.verdict === "approve") {
+        task.context.reviewFeedback = [];
+        task.stage = "implementation";
+      } else {
+        task.architectureRounds = (task.architectureRounds ?? 0) + 1;
+        const maxRounds = config.maxArchitectureRounds ?? 20;
+        task.context.reviewFeedback = [`Gemini's architecture feedback (round ${task.architectureRounds}):\n${res.content}`];
+        recordFeedback(task, "gemini", "architecture", res.content);
+        task.stage = task.architectureRounds < maxRounds ? "architecture" : "rejected";
+      }
       return task;
     }
 
     case "implementation": {
-      const feedback = task.context.reviewFeedback?.length
-        ? `\n\nAddress this feedback from the previous attempt:\n${task.context.reviewFeedback.join("\n")}`
-        : "";
-      const res = await agents.muse.send(PROMPTS.implementation + feedback, task.context);
-      task.context.implementationDiff = res.content;
-      task.implementationAttempts += 1;
-
-      const files = parseFileBlocks(res.content);
-      if (files.length === 0) {
-        task.context.implementationFiles = [];
-        log(
-          task,
-          task.stage,
-          "system",
-          `Implementation attempt #${task.implementationAttempts}: reply had no "FILE:" blocks — nothing was written to disk.`,
-        );
-      } else {
-        const written = await writeFiles(resolveVerify(task, config).cwd, files);
-        task.context.implementationFiles = written;
-        log(
-          task,
-          task.stage,
-          "muse",
-          `Implementation attempt #${task.implementationAttempts}: wrote ${written.length} file(s): ${written.join(", ")}.`,
-        );
-      }
-      task.stage = "verification";
+      await draftImplementation(task, agents, hooks, config);
+      await applyImplementation(task, config);
       return task;
     }
 
     case "verification": {
       const verify = resolveVerify(task, config);
-      const result = await runVerification(verify);
+      const files = task.context.implementationFiles ?? [];
+      const staged = config.isolation ? attemptFiles(task) : [];
+      // Rebuilt on every run (not kept from the implementation step), so a
+      // restart between the two stages can't verify a stale copy.
+      const runCwd = config.isolation ? await prepareShadow(verify.cwd, config.isolation, staged) : verify.cwd;
+      const result = await runVerification({ cwd: runCwd, commands: verify.commands });
+      if (config.isolation) {
+        result.log = `(Run in an isolated copy of the project, ${runCwd} — the project itself is only updated if verification passes.)\n${result.log}`;
+      }
+      if (!verify.commands.length) {
+        setAlert(task, "verify_unconfigured", "warn", "Task này không có lệnh kiểm tra nào — không thể chứng minh code chạy được.");
+      } else {
+        clearAlert(task, "verify_unconfigured");
+      }
+      // Always, whatever the project's own commands cover: every file this
+      // attempt wrote must still parse as its language.
+      const broken = await checkWrittenFiles(runCwd, files);
+      if (broken.length) {
+        result.passed = false;
+        result.log += `\n\n== Syntax check of the files written this attempt: ${broken.length} FAILED ==\n${formatFileProblems(broken)}`;
+        setAlert(task, "files_broken", "warn", `Kiểm tra cú pháp thất bại ở ${broken.length} file vừa ghi: ${broken.map((b) => b.path).join(", ")}.`);
+      } else {
+        if (files.length) result.log += `\n\n== Syntax check of the ${files.length} file(s) written this attempt: OK ==`;
+        clearAlert(task, "files_broken");
+      }
+      // The role's own checks (secrets, stubs, tests, iOS destination …) on the files this attempt wrote.
+      const findings = config.roles ? await config.roles.checks(task, { cwd: runCwd, files, commands: verify.commands }).catch((err: Error) => {
+        log(task, task.stage, "system", `Role checks could not run (${err.message}) — skipped.`);
+        return [] as RoleCheckFinding[];
+      }) : [];
+      const roleName = config.roles?.label(task) ?? "role";
+      const failed = findings.filter((f) => f.level === "fail");
+      const warned = findings.filter((f) => f.level === "warn");
+      if (failed.length) {
+        result.passed = false;
+        result.log += `\n\n== Role checks (${roleName}): ${failed.length} FAILED ==\n${failed.map((f) => `- [${f.check}] ${f.text}`).join("\n")}`;
+        setAlert(task, "role_checks", "warn", `Kiểm tra theo vai trò ${roleName} thất bại: ${failed.map((f) => f.text).join(" ")}`);
+        recordFeedback(task, "system", "role_check", failed.map((f) => f.text).join("\n"));
+      } else {
+        if (findings.length || (config.roles && files.length)) result.log += `\n\n== Role checks (${roleName}): OK ==`;
+        clearAlert(task, "role_checks");
+      }
+      if (warned.length) {
+        result.log += `\n\n== Role checks (${roleName}): ${warned.length} warning(s) for the reviewers and the CEO ==\n${warned.map((f) => `- [${f.check}] ${f.text}`).join("\n")}`;
+        setAlert(task, "role_warnings", "warn", warned.map((f) => f.text).join(" "));
+      } else {
+        clearAlert(task, "role_warnings");
+      }
+      if (result.passed && !coversWrittenFiles(result.log, verify.commands, files)) {
+        setAlert(
+          task,
+          "verify_coverage",
+          "warn",
+          `Log của lệnh kiểm tra (${verify.commands.join(" && ")}) không nhắc tới file nào vừa ghi — có thể lệnh đang kiểm tra thứ khác, không phải code của task này.`,
+        );
+      } else if (result.passed) {
+        clearAlert(task, "verify_coverage");
+      }
       task.context.verificationLog = result.log;
       log(task, task.stage, "system", result.passed ? "Verification passed." : "Verification FAILED.");
+      if (result.passed && config.isolation && staged.length) {
+        const promoted = await writeFiles(verify.cwd, staged);
+        log(task, task.stage, "system", `Promoted ${promoted.length} verified file(s) into the project: ${promoted.join(", ")}.`);
+      } else if (!result.passed && config.isolation) {
+        log(task, task.stage, "system", "Nothing from this attempt was written to the project (verification failed in the isolated copy).");
+      }
       if (result.passed) {
         const visual = resolveVisual(task, config);
         if (visual) {
           try {
             await visual.captureScreenshot({
-              cwd: verify.cwd,
+              cwd: runCwd,
               buildDir: visual.buildDir,
               outPath: visual.screenshotPath,
               waitMs: visual.screenshotWaitMs,
@@ -224,61 +806,74 @@ export async function advance(task: TaskRecord, agents: Agents, config: Pipeline
         }
         task.stage = "review_gemini";
       } else if (task.implementationAttempts < config.maxImplementationAttempts) {
-        task.context.reviewFeedback = [`Verification failed:\n${result.log}`];
+        task.context.reviewFeedback = [`Verification failed:\n${failureDigest(result.log)}`];
         task.stage = "implementation";
       } else {
-        task.stage = "rejected";
+        task.context.reviewFeedback = [`Verification failed:\n${failureDigest(result.log)}`];
+        exhaustBudget(task, config, "verification kept failing");
       }
       return task;
     }
 
     case "review_gemini": {
+      await flagOverwrittenFiles(task, config);
       // Gemini is the independent reviewer for this stage, but its free
       // tier can go down for stretches (rate limits, server overload) —
       // when it's genuinely exhausted its own retry budget (not just a
-      // single blip), Claude stands in for this one round rather than
-      // leaving the task stuck waiting on a service that may not come
-      // back soon. This is a stand-in for a round, not a permanent
-      // reassignment: the next task (or even a later round of this one,
-      // after a loop back through implementation) tries Gemini again.
-      let res: AgentResponse;
-      let reviewer: RoleName;
+      // single blip), Claude stands in rather than leaving the task stuck
+      // waiting on a service that may not come back soon. This is a
+      // stand-in for a round, not a permanent reassignment: the next task
+      // (or even a later round of this one) tries Gemini again.
       try {
-        res = await agents.gemini.send(PROMPTS.reviewGemini, task.context);
-        reviewer = "gemini";
+        const res = await sendReview(agents.gemini, withRole(PROMPTS.reviewGemini, await roleGuidance(task, config, "review")), ctx("review_gemini"), opts);
+        log(task, task.stage, "gemini", `Verdict: ${res.verdict}.`);
+        clearAlert(task, "gemini_down");
+        // Whatever this independent review's verdict, it goes to Claude next —
+        // nothing here loops back to implementation directly. Claude (the
+        // mentor who wrote the architecture guide) decides for itself whether
+        // the feedback holds up, and is the only one who can actually send the
+        // task back to implementation (see review_claude below).
+        task.context.reviewFeedback = res.verdict === "reject" ? [`Gemini review feedback:\n${res.content}`] : [];
+        if (res.verdict === "approve" && claudeReviewSkippable(task)) {
+          log(task, task.stage, "system", "Claude's final review skipped: Gemini approved, nothing is flagged, and this is neither an integration task nor a CEO revision (plan option).");
+          trace(task, "System", "note", "Claude review skipped — Gemini approved a green subtask (plan option).");
+          task.stage = "checkpoint_final";
+          return task;
+        }
+        task.stage = "review_claude";
+        return task;
       } catch (err) {
         log(
           task,
           task.stage,
           "system",
-          `Gemini review unavailable (${(err as Error).message}) — Claude is standing in for this round's independent review.`,
+          `Gemini review unavailable (${(err as Error).message}) — Claude is doing the independent check and its own final sign-off together in one combined round, instead of two separate Claude calls.`,
         );
-        res = await agents.claude.send(PROMPTS.reviewGeminiFallback, task.context);
-        reviewer = "claude";
+        // Not run through compressForClaude: Gemini just failed (that's why
+        // we're here), so asking it to compress first would only add its
+        // own retry/backoff delay on top of an already-unavailable service.
+        setAlert(
+          task,
+          "gemini_down",
+          "warn",
+          `Gemini không review được (${(err as Error).message.slice(0, 160)}) — chỉ có Claude review, không có ý kiến độc lập thứ hai.`,
+        );
+        const res = await sendReview(agents.claude, withRole(PROMPTS.reviewClaudeFallback, await roleGuidance(task, config, "review")), ctx("review_gemini"), claudeReviewOpts(task, config, opts));
+        log(task, task.stage, "claude", `Verdict: ${res.verdict} (standing in for Gemini).`);
+        applyReviewVerdict(task, config, res, "Claude (standing in for Gemini) review feedback");
+        return task;
       }
-      log(task, task.stage, reviewer, `Verdict: ${res.verdict ?? "unknown"}.`);
-      if (res.verdict === "approve") {
-        task.context.reviewFeedback = [];
-        task.stage = "review_claude";
-      } else {
-        task.reviewRejections += 1;
-        const reviewerLabel = reviewer === "gemini" ? "Gemini" : "Claude (standing in for Gemini)";
-        task.context.reviewFeedback = [`${reviewerLabel} review feedback:\n${res.content}`];
-        task.stage = task.reviewRejections < config.maxReviewRejections ? "implementation" : "rejected";
-      }
-      return task;
     }
 
     case "review_claude": {
-      const res = await agents.claude.send(PROMPTS.reviewClaude, task.context);
-      log(task, task.stage, "claude", `Verdict: ${res.verdict ?? "unknown"}.`);
-      if (res.verdict === "approve") {
-        task.stage = "checkpoint_final";
-      } else {
-        task.reviewRejections += 1;
-        task.context.reviewFeedback = [`Claude review feedback:\n${res.content}`];
-        task.stage = task.reviewRejections < config.maxReviewRejections ? "implementation" : "rejected";
-      }
+      const res = await sendReview(
+        agents.claude,
+        withRole(PROMPTS.reviewClaude, await roleGuidance(task, config, "review")),
+        await compressForClaude(agents.gemini, ctx("review_claude"), opts.signal),
+        claudeReviewOpts(task, config, opts),
+      );
+      log(task, task.stage, "claude", `Verdict: ${res.verdict}.`);
+      applyReviewVerdict(task, config, res, "Claude review feedback");
       return task;
     }
 
@@ -302,6 +897,7 @@ export function resolveCheckpoint(task: TaskRecord, approved: boolean, feedback?
     log(task, task.stage, "ceo", approved ? "Shipped." : "Sent back for a redesign.");
     if (approved) {
       task.stage = "done";
+      task.context.ceoRequests = [];
     } else {
       // Route all the way back through ideation, not just architecture: a
       // human rejecting at the final checkpoint after both agents already
@@ -318,11 +914,40 @@ export function resolveCheckpoint(task: TaskRecord, approved: boolean, feedback?
       task.stage = "ideation";
       task.implementationAttempts = 0;
       task.reviewRejections = 0;
+      task.architectureRounds = 0;
+      task.autoRecoveries = 0;
     }
   }
   if (!approved && feedback) {
     task.context.reviewFeedback = [feedback];
+    (task.context.ceoRequests ??= []).push(feedback);
+    recordFeedback(task, "ceo", "ceo", feedback);
   }
+  if (task.stage !== "done") task.alerts = [];
+  return task;
+}
+
+/**
+ * The lighter alternative to rejecting at the final checkpoint: the design
+ * is fine, the result needs specific changes. Goes back to implementation
+ * with the CEO's request, keeping the idea brief and architecture — unlike
+ * a rejection, which reopens the whole direction through ideation.
+ */
+export function requestRevision(task: TaskRecord, feedback: string): TaskRecord {
+  if (task.stage !== "checkpoint_final") {
+    throw new Error(`Only a task waiting for final approval can be sent back for a revision (stage: ${task.stage}).`);
+  }
+  const request = feedback.trim() || "Revise the result: it doesn't meet the acceptance criteria yet.";
+  task.implementationAttempts = 0;
+  task.reviewRejections = 0;
+  task.autoRecoveries = 0;
+  task.context.reviewFeedback = [`CEO revision request (keep the architecture; change exactly this):\n${request}`];
+  (task.context.ceoRequests ??= []).push(request);
+  recordFeedback(task, "ceo", "ceo", request);
+  log(task, task.stage, "ceo", `Revision requested: ${request}`);
+  task.alerts = [];
+  trace(task, "CEO", "revise", `Sent back to implementation for a revision: ${request}`);
+  task.stage = "implementation";
   return task;
 }
 
@@ -340,10 +965,12 @@ export function retryFromRejected(task: TaskRecord, opts: { note?: string; clear
   }
   task.implementationAttempts = 0;
   task.reviewRejections = 0;
+  task.autoRecoveries = 0;
   if (opts.clearFeedback) {
     task.context.reviewFeedback = [];
   }
   task.stage = "implementation";
+  task.alerts = [];
   log(task, task.stage, "ceo", opts.note ?? "Retrying implementation with a fresh budget.");
   return task;
 }
@@ -362,8 +989,12 @@ export function amendShippedTask(task: TaskRecord, change: string): TaskRecord {
   }
   task.implementationAttempts = 0;
   task.reviewRejections = 0;
+  task.architectureRounds = 0;
+  task.autoRecoveries = 0;
   task.context.reviewFeedback = [change];
+  task.context.ceoRequests = [change];
   task.stage = "architecture";
+  task.alerts = [];
   log(task, task.stage, "ceo", `Amending shipped task: ${change}`);
   return task;
 }

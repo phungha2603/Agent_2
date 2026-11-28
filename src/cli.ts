@@ -27,6 +27,7 @@ const STAGE_LABEL: Record<string, string> = {
   ideation: "Gemini is drafting the idea",
   checkpoint_idea: "Waiting on you: approve the idea?",
   architecture: "Claude is writing the architecture spec",
+  architecture_review: "Gemini is discussing the architecture spec with Claude",
   implementation: "Muse is implementing",
   verification: "Running real verification commands",
   review_gemini: "Gemini is reviewing the implementation",

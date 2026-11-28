@@ -1,78 +1,317 @@
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import express from "express";
-import { SLOTS, deriveStatus, loadDashboardState } from "./slots.js";
-import { enqueueDecision, enqueueRun, enqueueRunAll, queueLength, resetAllSlots } from "./runner.js";
-import { loadTask, taskExists } from "../store/taskStore.js";
-import type { HistoryEntry, TaskRecord } from "../types.js";
+import express, { type NextFunction, type Request, type Response } from "express";
+import { Company, isUserError, UserError } from "../orchestrator/scheduler.js";
+import { buildAgents, buildPipelineConfig, buildProjectConfigSnapshot, buildSchedulerSettings, buildVideoDeps } from "../config.js";
+import { createMacNotifier } from "./notify.js";
+import { createGithubOps } from "../verify/gitProject.js";
+import { ContentSeoService } from "../integrations/contentSeo.js";
+import { VideoService } from "../integrations/video/service.js";
+import { basicAuth, isLoopback } from "./auth.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const PORT = Number(process.env.DASHBOARD_PORT ?? 4000);
+// Loopback by default: reachable from this machine only (and from a tunnel
+// or reverse proxy running on it). Exposing it on a network interface is an
+// explicit choice, and then a login is required — see below.
+const HOST = process.env.DASHBOARD_HOST || "127.0.0.1";
+const AUTH_USER = process.env.DASHBOARD_USER;
+const AUTH_PASSWORD = process.env.DASHBOARD_PASSWORD;
+const SLOT_DEBOUNCE_MS = 120;
+
+if (!isLoopback(HOST) && !(AUTH_USER && AUTH_PASSWORD)) {
+  console.error(
+    `Refusing to listen on ${HOST} without a login: anyone who reaches the dashboard can make the agents write and run code. ` +
+      "Set DASHBOARD_USER and DASHBOARD_PASSWORD, or keep DASHBOARD_HOST=127.0.0.1 behind a tunnel/proxy.",
+  );
+  process.exit(1);
+}
+const SUMMARY_DEBOUNCE_MS = 400;
+
+const notifier = createMacNotifier();
+
+// One set of agents for the whole process: in particular one Muse MCP
+// server, so there's only ever one Chrome on the Muse profile.
+const company = new Company({
+  agents: buildAgents(),
+  pipeline: buildPipelineConfig(),
+  settings: buildSchedulerSettings(),
+  projectConfig: buildProjectConfigSnapshot,
+  notify: notifier,
+  projectsRoot: process.env.PROJECTS_ROOT?.trim() || undefined,
+  github: process.env.GITHUB_PROJECTS === "0" ? undefined : createGithubOps({ visibility: process.env.GITHUB_PROJECTS_VISIBILITY === "public" ? "public" : "private" }),
+});
+
+const contentSeo = process.env.CONTENTSEO_DIR?.trim() ? new ContentSeoService(process.env.CONTENTSEO_DIR.trim()) : undefined;
+const video = new VideoService(buildVideoDeps());
 
 const app = express();
-app.use(express.json());
+app.disable("x-powered-by");
+// For uptime checks; says nothing about the company.
+app.get("/healthz", (_req, res) => res.json({ ok: true }));
+if (AUTH_USER && AUTH_PASSWORD) app.use(basicAuth(AUTH_USER, AUTH_PASSWORD));
+app.use(express.json({ limit: "1mb" }));
 app.use(express.static(path.join(__dirname, "public")));
 
-function miniLogs(task: TaskRecord | undefined): { at: string; text: string }[] {
-  if (!task) return [];
-  return task.history
-    .slice(-3)
-    .map((h: HistoryEntry) => ({ at: new Date(h.at).toTimeString().slice(0, 5), text: h.summary }));
+/** Express 4 doesn't catch rejected promises — without this, one bad request crashes the server. */
+const route = (fn: (req: Request, res: Response) => Promise<unknown>) => (req: Request, res: Response, next: NextFunction) => {
+  fn(req, res).catch(next);
+};
+const str = (v: unknown) => (typeof v === "string" ? v : undefined);
+
+app.get("/api/status", route(async (_req, res) => res.json(await company.statusSnapshot())));
+app.get("/api/timeline", route(async (_req, res) => res.json(await company.timeline())));
+app.get("/api/scoreboard", route(async (_req, res) => res.json(await company.scoreboard())));
+app.get("/api/roles/:id", route(async (req, res) => res.json(await company.roleDetail(req.params.id))));
+app.get("/api/tasks/:id/detail", route(async (req, res) => res.json(await company.taskDetail(req.params.id))));
+app.get("/api/artifacts", route(async (_req, res) => res.json(await company.listArtifacts())));
+app.get("/api/projects", route(async (_req, res) => res.json(await company.projects())));
+app.get("/api/projects/:id/guide", route(async (req, res) => {
+  const guide = await company.projectGuide(req.params.id);
+  if (req.query.download) {
+    res.setHeader("Content-Disposition", `attachment; filename="${guide.filename.replace(/"/g, "")}"`);
+    res.type("text/markdown").send(guide.content);
+  } else {
+    res.json(guide);
+  }
+}));
+app.get("/api/artifacts/content", route(async (req, res) => {
+  const art = await company.artifactContent(String(req.query.taskId), String(req.query.kind) as any, str(req.query.path));
+  if (req.query.download) {
+    res.setHeader("Content-Disposition", `attachment; filename="${art.filename.replace(/"/g, "")}"`);
+    res.type("text/plain").send(art.content);
+  } else {
+    res.json(art);
+  }
+}));
+
+// ---- Server-Sent Events: one card at a time, instead of polling the whole grid ----
+const clients = new Set<Response>();
+const broadcast = (event: string, data: unknown) => {
+  const frame = `event: ${event}\ndata: ${JSON.stringify(data)}\n\n`;
+  for (const c of clients) c.write(frame);
+};
+
+function debounced(ms: number, fn: () => Promise<void> | void): () => void {
+  let timer: NodeJS.Timeout | null = null;
+  return () => {
+    if (timer) return;
+    timer = setTimeout(async () => {
+      timer = null;
+      if (clients.size) await Promise.resolve(fn()).catch(() => {});
+    }, ms);
+  };
 }
 
-app.get("/api/status", async (_req, res) => {
-  const state = await loadDashboardState();
-  const slots = await Promise.all(
-    SLOTS.map(async (slot) => {
-      const taskId = state[slot.id];
-      const task = taskId && taskExists(taskId) ? await loadTask(taskId) : undefined;
-      const status = deriveStatus(task?.stage);
-      return {
-        id: slot.id,
-        name: slot.name,
-        icon: slot.icon,
-        taskId: taskId ?? null,
-        title: task?.context.title ?? null,
-        stage: task?.stage ?? null,
-        ...status,
-        waitingForYou: task ? ["checkpoint_idea", "checkpoint_final"].includes(task.stage) : false,
-        checkpointBrief: task?.stage === "checkpoint_idea" ? task.context.ideaBrief : undefined,
-        lastFeedback: task?.context.reviewFeedback?.join("\n") || undefined,
-        logs: miniLogs(task),
-      };
-    }),
+// Telemetry and the bottleneck/handoff summary depend on every slot — recompute them at most a few times a second.
+const pushSummary = debounced(SUMMARY_DEBOUNCE_MS, async () => {
+  broadcast("telemetry", await company.telemetry());
+  broadcast("insights", await company.insights());
+  broadcast("control", company.control());
+});
+
+const pendingSlots = new Map<string, NodeJS.Timeout>();
+company.on("slot", (slotId: string) => {
+  pushSummary();
+  if (pendingSlots.has(slotId)) return;
+  pendingSlots.set(
+    slotId,
+    setTimeout(async () => {
+      pendingSlots.delete(slotId);
+      if (clients.size) broadcast("slot", await company.slotSnapshot(slotId).catch(() => null));
+    }, SLOT_DEBOUNCE_MS),
   );
-  res.json({ slots, queueLength: queueLength() });
+});
+company.on("plan", debounced(SLOT_DEBOUNCE_MS, async () => broadcast("plan", await company.planSnapshot())));
+company.on("engines", debounced(SLOT_DEBOUNCE_MS, () => broadcast("engines", company.engineSnapshot())));
+company.on("control", pushSummary);
+company.on("rebalance", debounced(SLOT_DEBOUNCE_MS, () => broadcast("rebalance", company.rebalanceSnapshot())));
+company.on("live", (chunk) => broadcast("live", chunk));
+company.on("lessons", debounced(SLOT_DEBOUNCE_MS, async () => broadcast("lessons", await company.lessonsSummary())));
+contentSeo?.on("change", debounced(300, () => broadcast("contentseo", contentSeo.snapshot())));
+video.on("change", debounced(300, () => broadcast("video", video.snapshot())));
+video.on("finished", (job) => {
+  const what: Record<string, string> = { script_review: "Kịch bản chờ duyệt", final_review: "Video chờ xem", published: "Đã đăng", failed: "Lỗi" };
+  if (what[job.stage]) notifier?.(`Auto Video · ${what[job.stage]}`, job.script?.title ?? job.topic ?? "");
+});
+contentSeo?.on("finished", (run) => {
+  const what = { done: "Xong", partial: "Xong một phần", quota: "Dừng vì hết quota Gemini", failed: "Lỗi", stopped: "Đã dừng", running: "" }[run.status as string] ?? run.status;
+  notifier?.(`Content SEO · ${what}`, `${run.domain} / ${run.keyword}${run.result ? ` — ${run.result} bài` : ""}`);
 });
 
-app.post("/api/slots/:id/run", (req, res) => {
-  const slot = SLOTS.find((s) => s.id === req.params.id);
-  if (!slot) return res.status(404).json({ error: "unknown slot" });
-  enqueueRun(slot.id, req.body?.goal);
-  res.json({ ok: true });
+app.get("/api/events", (req, res) => {
+  res.writeHead(200, { "Content-Type": "text/event-stream", "Cache-Control": "no-cache", Connection: "keep-alive" });
+  res.write("retry: 3000\n\n");
+  clients.add(res);
+  const ping = setInterval(() => res.write(": ping\n\n"), 25000);
+  req.on("close", () => {
+    clearInterval(ping);
+    clients.delete(res);
+  });
 });
 
-app.post("/api/slots/:id/decision", (req, res) => {
-  const slot = SLOTS.find((s) => s.id === req.params.id);
-  if (!slot) return res.status(404).json({ error: "unknown slot" });
-  const approved = Boolean(req.body?.approved);
-  const feedback = typeof req.body?.feedback === "string" ? req.body.feedback : undefined;
-  enqueueDecision(slot.id, approved, feedback);
-  res.json({ ok: true });
+// ---- commands ----
+const ok = (res: Response, extra?: object | void) => res.json({ ok: true, ...(extra ?? {}) });
+
+app.post("/api/slots/:id/run", route(async (req, res) => ok(res, await company.runSlot(req.params.id, str(req.body?.goal)))));
+app.post("/api/slots/:id/gate", route(async (req, res) => ok(res, await company.setGate(req.params.id, Boolean(req.body?.enabled)))));
+
+app.post("/api/tasks/:id/decision", route(async (req, res) => {
+  const action = str(req.body?.action) ?? (req.body?.approved ? "approve" : "reject");
+  if (!["approve", "reject", "revise"].includes(action)) return res.status(400).json({ error: "action phải là approve, reject hoặc revise" });
+  await company.decide(req.params.id, action as "approve" | "reject" | "revise", str(req.body?.feedback), {
+    confirmWarnings: req.body?.confirmWarnings === true,
+  });
+  ok(res);
+}));
+app.post("/api/tasks/:id/retry", route(async (req, res) => ok(res, await company.retryTask(req.params.id))));
+app.post("/api/tasks/:id/move", route(async (req, res) => {
+  await company.moveTask(req.params.id, String(req.body?.toSlot), req.body?.position === "top" ? "top" : "bottom");
+  ok(res);
+}));
+app.post("/api/approve-all", route(async (_req, res) => ok(res, { approved: await company.approveAllWaiting() })));
+
+app.post("/api/steer", route(async (req, res) => {
+  const directive = await company.steer(str(req.body?.slotId) ?? null, String(req.body?.text ?? ""), Boolean(req.body?.redo));
+  ok(res, { directive });
+}));
+app.post("/api/steer/:id/remove", route(async (req, res) => ok(res, await company.removeDirective(req.params.id))));
+
+app.post("/api/artifacts/send", route(async (req, res) => {
+  const result = await company.sendArtifact(
+    { taskId: String(req.body?.taskId), kind: req.body?.kind, path: str(req.body?.path) },
+    String(req.body?.toSlot),
+    str(req.body?.note),
+  );
+  ok(res, result);
+}));
+
+app.post("/api/engines/:engine/promote", route(async (req, res) => {
+  await company.promote(req.params.engine as any, String(req.body?.id ?? ""));
+  ok(res);
+}));
+app.post("/api/roles/:id/lessons", route(async (req, res) => ok(res, { lesson: await company.addRoleLesson(req.params.id, str(req.body?.text) ?? "") })));
+app.post("/api/lessons/:id/:decision", route(async (req, res) => {
+  const decision = req.params.decision;
+  if (decision !== "accept" && decision !== "dismiss" && decision !== "remove") return res.status(400).json({ error: "decision phải là accept, dismiss hoặc remove" });
+  ok(res, { lesson: await company.decideRoleLesson(req.params.id, decision, str(req.body?.text) || undefined) });
+}));
+app.post("/api/rebalance", route(async (_req, res) => ok(res, { proposal: await company.proposeRebalance() })));
+app.post("/api/rebalance/:id/apply", route(async (req, res) => {
+  const indexes = Array.isArray(req.body?.indexes) ? req.body.indexes.map(Number) : undefined;
+  ok(res, await company.applyRebalance(req.params.id, indexes));
+}));
+app.post("/api/rebalance/dismiss", route(async (_req, res) => ok(res, company.dismissRebalance())));
+
+app.post("/api/control/pause", route(async (_req, res) => ok(res, await company.pause())));
+app.post("/api/control/resume", route(async (_req, res) => ok(res, await company.resume())));
+app.post("/api/control/stop", route(async (_req, res) => ok(res, await company.stop())));
+
+app.post("/api/run-all", route(async (req, res) => {
+  const goal = (str(req.body?.goal) ?? "").trim();
+  if (!goal) return res.status(400).json({ error: "Thiếu mục tiêu." });
+  const plan = await company.startPlan(goal, str(req.body?.projectDir), {
+    autoApprove: req.body?.autoApprove === true,
+    skipClaudeReviewWhenGreen: req.body?.skipClaudeReviewWhenGreen === true,
+    githubRepo: req.body?.githubRepo === true,
+  });
+  ok(res, { planId: plan.id });
+}));
+/** { dir?, verifyCommands? } from a request body — commands as a list or as one command per line. */
+function planProject(body: any): {
+  dir?: string;
+  verifyCommands?: string[];
+  handoffOn?: "done" | "checkpoint_final";
+  autoApprove?: boolean;
+  skipClaudeReviewWhenGreen?: boolean;
+  githubRepo?: boolean;
+} {
+  const dir = str(body?.projectDir);
+  const raw = body?.verifyCommands;
+  const verifyCommands = Array.isArray(raw)
+    ? raw.filter((c: unknown): c is string => typeof c === "string")
+    : typeof raw === "string"
+      ? raw.split("\n")
+      : undefined;
+  const handoff = str(body?.handoffOn);
+  const handoffOn = handoff === "done" || handoff === "checkpoint_final" ? handoff : undefined;
+  const autoApprove = typeof body?.autoApprove === "boolean" ? body.autoApprove : undefined;
+  const skipClaudeReviewWhenGreen = typeof body?.skipClaudeReviewWhenGreen === "boolean" ? body.skipClaudeReviewWhenGreen : undefined;
+  const githubRepo = typeof body?.githubRepo === "boolean" ? body.githubRepo : undefined;
+  return { dir, verifyCommands, handoffOn, autoApprove, skipClaudeReviewWhenGreen, githubRepo };
+}
+app.post("/api/plan/:id/project", route(async (req, res) => ok(res, await company.updatePlanProject(req.params.id, planProject(req.body)))));
+app.post("/api/plan/:id/decision", route(async (req, res) =>
+  ok(res, await company.decidePlan(req.params.id, Boolean(req.body?.approved), str(req.body?.feedback), planProject(req.body))),
+));
+app.post("/api/plan/:id/retry", route(async (req, res) => ok(res, await company.retryPlan(req.params.id))));
+// ---------- Auto Content SEO tab (an existing project, run as-is) ----------
+app.get("/api/contentseo", (_req, res) => res.json(contentSeo ? contentSeo.snapshot() : null));
+const needContentSeo = () => {
+  if (!contentSeo) throw new UserError("Chưa cấu hình CONTENTSEO_DIR trong .env.");
+  return contentSeo;
+};
+app.post("/api/contentseo/run", route(async (req, res) => ok(res, await needContentSeo().startRun({ domain: str(req.body?.domain), keyword: str(req.body?.keyword), links: req.body?.links }))));
+app.post("/api/contentseo/run/stop", route(async (_req, res) => ok(res, needContentSeo().stopRun())));
+app.post("/api/contentseo/bot/start", route(async (_req, res) => ok(res, needContentSeo().startBot())));
+app.post("/api/contentseo/bot/stop", route(async (_req, res) => ok(res, needContentSeo().stopBot())));
+app.post("/api/contentseo/check", route(async (_req, res) => ok(res, await needContentSeo().check())));
+
+// ---------- Auto Video tab ----------
+app.get("/api/video", (_req, res) => res.json(video.snapshot()));
+app.get("/api/video/voices", route(async (_req, res) => res.json(await video.voices())));
+app.get("/api/video/file/:kind/:id/:name", (req, res) => {
+  const kind = req.params.kind === "series" ? "series" : "job";
+  const file = video.filePath(kind, req.params.id, req.params.name);
+  if (!file) return res.status(404).end();
+  res.sendFile(file, (err) => err && !res.headersSent && res.status(404).end());
+});
+app.get("/api/video/lumreels/templates", route(async (_req, res) => res.json(await video.lumreelsTemplates())));
+app.get("/api/video/lumreels/thumb/:id", route(async (req, res) => {
+  const r = await video.lumreelsThumb(req.params.id);
+  if (!r.ok) return res.status(404).end();
+  res.type(r.headers.get("content-type") ?? "image/webp").setHeader("Cache-Control", "max-age=86400");
+  res.send(Buffer.from(await r.arrayBuffer()));
+}));
+app.post("/api/video/voices", express.raw({ type: () => true, limit: "20mb" }), route(async (req, res) => {
+  ok(res, await video.addVoice(String(req.query.name ?? ""), req.body as Buffer, String(req.query.ext ?? "").toLowerCase()));
+}));
+app.post("/api/video/explainer", route(async (req, res) => ok(res, { job: await video.createExplainer(req.body ?? {}) })));
+app.post("/api/video/series", route(async (req, res) => ok(res, { series: await video.createSeries(req.body ?? {}) })));
+app.post("/api/video/series/:id", route(async (req, res) => ok(res, { series: await video.updateSeries(req.params.id, req.body ?? {}) })));
+app.post("/api/video/series/:id/portraits", route(async (req, res) => ok(res, { series: await video.makePortraits(req.params.id) })));
+app.post("/api/video/series/:id/episode", route(async (req, res) => ok(res, { job: await video.createEpisode(req.params.id, req.body ?? {}) })));
+app.post("/api/video/jobs/:id/script", route(async (req, res) => ok(res, await video.decideScript(req.params.id, String(req.body?.action), str(req.body?.feedback)))));
+app.post("/api/video/jobs/:id/final", route(async (req, res) => ok(res, await video.decideFinal(req.params.id, String(req.body?.action), str(req.body?.feedback)))));
+app.post("/api/video/jobs/:id/publish", route(async (req, res) =>
+  ok(res, await video.publish(req.params.id, { youtube: req.body?.youtube === true, facebook: req.body?.facebook === true, privacy: str(req.body?.privacy) })),
+));
+app.post("/api/video/jobs/:id/retry", route(async (req, res) => ok(res, await video.retry(req.params.id))));
+app.post("/api/video/jobs/:id/stop", route(async (req, res) => ok(res, await video.stop(req.params.id))));
+app.post("/api/video/jobs/:id/remove", route(async (req, res) => ok(res, await video.remove(req.params.id))));
+app.post("/api/video/jobs/:id/stats", route(async (req, res) => ok(res, await video.refreshStats(req.params.id))));
+
+app.post("/api/reset", route(async (_req, res) => ok(res, await company.reset())));
+
+app.use((err: Error, _req: Request, res: Response, _next: NextFunction) => {
+  if (!isUserError(err)) console.error(err);
+  res.status(isUserError(err) ? 400 : 500).json({ error: err.message });
 });
 
-app.post("/api/run-all", (req, res) => {
-  const goal = typeof req.body?.goal === "string" ? req.body.goal.trim() : "";
-  if (!goal) return res.status(400).json({ error: "missing goal" });
-  enqueueRunAll(goal);
-  res.json({ ok: true });
+await company.init();
+await contentSeo?.init();
+await video.init();
+const server = app.listen(PORT, HOST, () => {
+  console.log(`AI Company dashboard: http://${isLoopback(HOST) ? "localhost" : HOST}:${PORT}${AUTH_USER && AUTH_PASSWORD ? " (login required)" : ""}`);
 });
 
-app.post("/api/reset", async (_req, res) => {
-  await resetAllSlots();
-  res.json({ ok: true });
-});
-
-app.listen(PORT, () => {
-  console.log(`AI Company dashboard: http://localhost:${PORT}`);
-});
+const shutdown = async () => {
+  server.close();
+  for (const c of clients) c.end();
+  contentSeo?.close();
+  video.close();
+  await company.close();
+  process.exit(0);
+};
+process.on("SIGINT", shutdown);
+process.on("SIGTERM", shutdown);

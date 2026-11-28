@@ -1,6 +1,6 @@
 import { mkdir, writeFile } from "node:fs/promises";
 import path from "node:path";
-import { HttpStatusError, withRetry } from "./retry.js";
+import { HttpStatusError, createKeyPool, withKeyRotation, withRetry } from "./retry.js";
 
 export interface GeminiImageGenerator {
   /** Generates an image from a prompt and writes it to outPath (PNG). Returns outPath. */
@@ -16,28 +16,34 @@ const DEFAULT_IMAGE_MODEL = "gemini-2.5-flash-image";
  * the default isn't available on your account; check which models support
  * image output at https://aistudio.google.com.
  */
-export function createGeminiImageGenerator(opts: { apiKey: string; model?: string }): GeminiImageGenerator {
+export function createGeminiImageGenerator(opts: { apiKeys: string[]; model?: string }): GeminiImageGenerator {
   const model = opts.model ?? DEFAULT_IMAGE_MODEL;
+  const keyPool = createKeyPool(opts.apiKeys);
   return {
     async generate(prompt: string, outPath: string): Promise<string> {
+      // Round-robin dispatch, same reasoning as createGeminiAgent: spread
+      // calls across the pool instead of sticking to one key until it 429s.
+      keyPool.rotate();
       const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent`;
-      const data = await withRetry(async () => {
-        const res = await fetch(url, {
-          method: "POST",
-          headers: {
-            "Content-Type": "application/json",
-            "x-goog-api-key": opts.apiKey,
-          },
-          body: JSON.stringify({
-            contents: [{ role: "user", parts: [{ text: prompt }] }],
-            generationConfig: { responseModalities: ["IMAGE"] },
-          }),
-        });
-        if (!res.ok) {
-          throw new HttpStatusError(res.status, `Gemini image API error ${res.status}: ${await res.text()}`);
-        }
-        return (await res.json()) as any;
-      });
+      const data = await withRetry(async () =>
+        withKeyRotation(keyPool, async (apiKey) => {
+          const res = await fetch(url, {
+            method: "POST",
+            headers: {
+              "Content-Type": "application/json",
+              "x-goog-api-key": apiKey,
+            },
+            body: JSON.stringify({
+              contents: [{ role: "user", parts: [{ text: prompt }] }],
+              generationConfig: { responseModalities: ["IMAGE"] },
+            }),
+          });
+          if (!res.ok) {
+            throw new HttpStatusError(res.status, `Gemini image API error ${res.status}: ${await res.text()}`);
+          }
+          return (await res.json()) as any;
+        }),
+      );
 
       const parts: any[] = data?.candidates?.[0]?.content?.parts ?? [];
       const imagePart = parts.find((p) => p?.inlineData?.data);

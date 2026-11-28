@@ -4,19 +4,149 @@
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>AI Agent Company</title>
+  <script>document.documentElement.dataset.theme = localStorage.getItem("dash-theme") || "dark";</script>
   <link rel="stylesheet" href="style.css" />
 </head>
 <body>
   <header class="topbar">
-    <h1>AI Agent Company — 10 Khung Hình Độc Lập</h1>
-    <div class="topbar-controls">
-      <input id="goal-input" type="text" placeholder="Xây dựng hệ thống phân tích dữ liệu &amp; dashboard theo dõi vận hành" />
-      <button id="run-all-btn" class="btn btn-primary">▶ Chạy luồng cả công ty</button>
-      <button id="reset-btn" class="btn btn-ghost">Reset</button>
+    <div class="brand">
+      <div class="logo" aria-hidden="true">AI</div>
+      <div class="brand-text">
+        <h1>AI Agent Company</h1>
+        <p class="topbar-sub">Sếp lập cây việc → Gemini thẩm định → bạn duyệt → cả đội chạy song song → bạn chốt kết quả.</p>
+      </div>
+    </div>
+    <div class="controls">
+      <span id="review-badges" class="review-badges"></span>
+      <button id="approve-all-btn" class="btn btn-approve" hidden></button>
+      <div class="btn-group" role="group" aria-label="Điều khiển luồng chạy">
+        <button id="pause-btn" class="btn btn-ghost" title="Không bắt đầu bước mới; các lượt đang chạy được làm nốt">⏸ Pause</button>
+        <button id="stop-btn" class="btn btn-ghost btn-danger-ghost" title="Huỷ ngay mọi lượt đang chạy (bước đó sẽ chạy lại khi Resume)">⏹ Stop</button>
+        <button id="reset-btn" class="btn btn-ghost" title="Bỏ gán task, xoá chỉ thị, huỷ kế hoạch đang chờ">↺ Reset</button>
+      </div>
+      <button id="composer-toggle" class="btn btn-soft" aria-expanded="true" aria-controls="composer">＋ Dự án mới</button>
+      <button id="theme-btn" class="btn btn-ghost btn-square" title="Đổi giao diện sáng / tối" aria-label="Đổi giao diện sáng / tối">◐</button>
+      <span id="conn" class="conn"></span>
     </div>
   </header>
 
-  <main id="grid" class="grid"></main>
+  <section class="composer collapsed no-anim" id="composer" aria-label="Tạo dự án mới">
+    <div class="composer-inner">
+      <div class="composer-head">
+        <span class="composer-title">Dự án mới</span>
+        <span class="muted small">Gõ mục tiêu — Sếp sẽ lập cây việc để bạn duyệt trước khi cả đội bắt tay vào làm.</span>
+      </div>
+      <textarea id="goal-input" class="input-lg" rows="2" placeholder="Mục tiêu, ví dụ: Xây dựng hệ thống phân tích dữ liệu & dashboard theo dõi vận hành"></textarea>
+      <div class="composer-row">
+        <input id="project-dir-input" type="text" placeholder="Thư mục dự án (đường dẫn tuyệt đối, nên là thư mục riêng)" title="Nơi Muse ghi code và nơi chạy lệnh build/test của kế hoạch này" />
+        <button id="run-all-btn" class="btn btn-primary btn-lg">▶ Chạy luồng cả công ty</button>
+      </div>
+      <div class="goal-options">
+        <label class="check" title="Task qua kiểm tra, được Gemini & Claude duyệt và không có cảnh báo đỏ sẽ tự ship; task có cảnh báo vẫn chờ bạn. Dự án có git thì mỗi task là một commit, hoàn tác được."><input type="checkbox" id="opt-autoapprove" /> ⚡ Tự duyệt khi xanh</label>
+        <label class="check" id="opt-github-label" title="Khi duyệt kế hoạch: tạo repo GitHub riêng tư cho dự án; mỗi task được duyệt sẽ được commit và push lên đó."><input type="checkbox" id="opt-github" checked /> Tạo repo GitHub riêng</label>
+        <label class="check" title="Subtask mà Gemini đã duyệt, không có cảnh báo đỏ thì bỏ bước Claude review (task nghiệm thu và yêu cầu sửa của bạn luôn qua Claude). Tiết kiệm quota Claude."><input type="checkbox" id="opt-skipreview" /> Bỏ Claude review khi Gemini duyệt &amp; xanh</label>
+      </div>
+    </div>
+  </section>
+
+  <section id="done-banner" class="done-banner" hidden aria-live="polite"></section>
+
+  <section class="telemetry" id="telemetry" aria-label="Tóm tắt luồng chạy"></section>
+
+  <section class="steer-bar">
+    <span class="bar-label">Chỉ thị cả đội</span>
+    <input id="company-steer" type="text" placeholder="Ví dụ: Mọi giao diện viết bằng tiếng Việt; ưu tiên hiệu năng hơn tính năng phụ" />
+    <label class="check"><input type="checkbox" id="company-redo" /> làm lại phần đã thiết kế</label>
+    <button id="company-steer-btn" class="btn btn-small-inline">Gửi chỉ thị</button>
+    <div id="company-directives" class="directive-chips"></div>
+  </section>
+
+  <nav class="viewbar">
+    <div class="tabs" role="tablist">
+      <button class="tab active" data-action="view" data-view="org">Sơ đồ tổ chức</button>
+      <button class="tab" data-action="view" data-view="flow">Dòng chảy</button>
+      <button class="tab" data-action="view" data-view="timeline">Timeline</button>
+      <button class="tab" data-action="view" data-view="roles">Năng lực vị trí <span id="lessons-tab-badge" class="side-badge" hidden></span></button>
+      <button class="tab" data-action="view" data-view="artifacts">Sản phẩm</button>
+      <button class="tab" data-action="view" data-view="seo">Auto Content SEO</button>
+      <button class="tab" data-action="view" data-view="video">Auto Video</button>
+    </div>
+    <div class="filters" id="filters">
+      <span class="bar-label">Lọc</span>
+      <button class="filter active" data-action="filter" data-filter="all">Tất cả</button>
+      <button class="filter" data-action="filter" data-filter="running">Đang chạy</button>
+      <button class="filter" data-action="filter" data-filter="attention">Cần duyệt / Lỗi</button>
+      <button class="filter" data-action="filter" data-filter="done">Đã xong</button>
+      <span class="filter-sep"></span>
+      <button class="filter toggle" id="edges-toggle" data-action="toggle-edges" aria-pressed="false" title="Hiện mọi đường giao việc/bàn giao giữa các nhân sự">↔ Đường nối: <b>Tắt</b></button>
+      <span id="focus-chip" class="focus-chip" hidden></span>
+    </div>
+  </nav>
+
+  <main>
+    <section id="view-org" class="view">
+      <div class="org-layout">
+        <div class="org-main">
+          <div class="org-toolbar">
+            <div class="seg-group" role="group" aria-label="Kiểu thẻ">
+              <span class="bar-label">Kiểu thẻ</span>
+              <button class="seg" data-action="org-density" data-value="compact">Gọn</button>
+              <button class="seg" data-action="org-density" data-value="detailed">Chi tiết</button>
+            </div>
+            <div class="org-legend" aria-hidden="true">
+              <span><i class="lg lg-tree"></i>cấp bậc</span>
+              <span><i class="lg lg-flow"></i>bàn giao (rê chuột vào một người để xem)</span>
+              <span><i class="lg lg-live"></i>đang chạy</span>
+            </div>
+          </div>
+          <div id="org" class="org compact">
+            <svg id="edges" class="edges" aria-hidden="true">
+              <defs>
+                <marker id="arrow-done" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="m-done" /></marker>
+                <marker id="arrow-pending" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="m-pending" /></marker>
+                <marker id="arrow-assign" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="m-assign" /></marker>
+              </defs>
+            </svg>
+            <div class="org-level level-ceo" id="row-0"></div>
+            <div class="org-level level-boss" id="row-1"></div>
+            <div class="org-level level-teams" id="row-2"></div>
+            <div class="org-level level-loose" id="row-3"></div>
+          </div>
+        </div>
+        <aside class="org-side" aria-label="Kế hoạch và luồng bàn giao">
+          <div class="side-tabs" role="tablist">
+            <button class="side-tab" data-action="side-tab" data-tab="plan">Cây việc</button>
+            <button class="side-tab" data-action="side-tab" data-tab="flow">Bàn giao &amp; nghẽn <span id="flow-tab-badge" class="side-badge" hidden></span></button>
+          </div>
+          <aside id="plan-panel" class="side-panel plan-panel"></aside>
+          <aside id="flow-panel" class="side-panel flow-panel" hidden></aside>
+        </aside>
+      </div>
+    </section>
+
+    <section id="view-flow" class="view" hidden></section>
+    <section id="view-timeline" class="view" hidden></section>
+    <section id="view-roles" class="view" hidden></section>
+    <section id="view-artifacts" class="view" hidden></section>
+    <section id="view-seo" class="view" hidden></section>
+    <section id="view-video" class="view" hidden></section>
+  </main>
+
+  <div id="drawer-backdrop" class="backdrop" hidden></div>
+  <aside id="drawer" class="drawer" hidden aria-label="Chi tiết task"></aside>
+
+  <div id="role-backdrop" class="backdrop" hidden></div>
+  <aside id="role-drawer" class="drawer role-drawer" hidden aria-label="Playbook và bài học của vị trí"></aside>
+
+  <div id="inbox-backdrop" class="backdrop" hidden></div>
+  <aside id="inbox" class="drawer inbox" hidden aria-label="Hộp duyệt"></aside>
+
+  <div id="g-tip" class="g-tip" hidden></div>
+
+  <div id="modal-backdrop" class="backdrop" hidden></div>
+  <div id="modal" class="modal" hidden role="dialog"></div>
+
+  <div id="toast" class="toast" hidden></div>
 
   <script src="app.js"></script>
 </body>

@@ -9,6 +9,8 @@ export interface VerifyConfig {
   cwd: string;
   /** Shell commands run in sequence, e.g. ["npm install", "npm run build", "npm test"]. */
   commands: string[];
+  /** Per command; a hung test must not hold the workspace lock forever. Default VERIFY_COMMAND_TIMEOUT_SEC or 1800. */
+  timeoutSec?: number;
 }
 
 /**
@@ -17,18 +19,27 @@ export interface VerifyConfig {
  * claim of success is trusted.
  */
 export async function runVerification(config: VerifyConfig): Promise<VerificationResult> {
+  if (!config.commands.length) {
+    return {
+      passed: false,
+      log: "No verification commands are configured for this task — nothing proves the code builds or its tests pass. Set the project's build/test commands on the plan (or VERIFY_COMMANDS for a single task).",
+    };
+  }
   const logs: string[] = [];
+  const timeoutSec = config.timeoutSec ?? (Number(process.env.VERIFY_COMMAND_TIMEOUT_SEC) || 1800);
   for (const command of config.commands) {
     logs.push(`$ ${command}`);
     try {
       const { stdout, stderr } = await execAsync(command, {
         cwd: config.cwd,
         maxBuffer: 10 * 1024 * 1024,
+        timeout: timeoutSec * 1000,
+        killSignal: "SIGKILL",
       });
       if (stdout) logs.push(stdout.trim());
       if (stderr) logs.push(stderr.trim());
     } catch (err: any) {
-      logs.push(`FAILED: ${err.message}`);
+      logs.push(err.killed && err.signal === "SIGKILL" ? `FAILED: timed out after ${timeoutSec}s (VERIFY_COMMAND_TIMEOUT_SEC) — killed.` : `FAILED: ${err.message}`);
       if (err.stdout) logs.push(String(err.stdout).trim());
       if (err.stderr) logs.push(String(err.stderr).trim());
       return { passed: false, log: logs.join("\n") };

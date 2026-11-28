@@ -1,0 +1,589 @@
+import { readdir } from "node:fs/promises";
+import path from "node:path";
+import type { Agent, ProjectConfig, SendOptions, TaskRecord } from "../types.js";
+import { sendReview, VERDICT_INSTRUCTION } from "../agents/verdict.js";
+import { createPlannedTask, FAKE_TOOL_CALL_RE, trace } from "./pipeline.js";
+
+export interface Department {
+  id: string;
+  name: string;
+  tier: 1 | 2 | 3;
+  /** Team name; when departments carry teams, epics stay inside their lead's team. */
+  team?: string;
+  /** What the team is responsible for. */
+  teamMission?: string;
+  /** One line on this role's specialty. */
+  summary?: string;
+}
+
+/** "Kỹ thuật — mission. Lead: AG-05 (Tech Lead: …). Staff: AG-13 (…), …" per team, for the planner and the rebalancer. */
+export function teamRoster(departments: Department[]): string[] {
+  const teams = [...new Set(departments.filter((d) => d.tier > 1 && d.team).map((d) => d.team!))];
+  const who = (d: Department) => `${d.id} (${d.name.replace(/^AI /, "")}${d.summary ? `: ${d.summary}` : ""})`;
+  return teams.map((team) => {
+    const members = departments.filter((d) => d.team === team);
+    const lead = members.find((d) => d.tier === 2);
+    const staff = members.filter((d) => d.tier === 3);
+    const mission = members.find((d) => d.teamMission)?.teamMission;
+    return `  * Team "${team}"${mission ? ` — ${mission}` : ""} Lead: ${lead ? who(lead) : "(none)"}. Staff: ${staff.map(who).join("; ") || "(none)"}.`;
+  });
+}
+
+export interface PlanSubtask {
+  id: string;
+  title: string;
+  owner: string;
+  description: string;
+  acceptanceCriteria: string[];
+  dependsOn: string[];
+  /** The boss's reason for giving this subtask to this owner. */
+  rationale: string;
+  /** What this subtask builds on (goal parts, upstream outputs). */
+  inputs: string;
+  /** Extra commands that exercise this subtask's own files, run after the plan's baseline commands. */
+  verifyCommands?: string[];
+  taskId?: string;
+}
+
+export interface PlanEpic {
+  id: string;
+  title: string;
+  owner: string;
+  goal: string;
+  acceptanceCriteria: string[];
+  rationale: string;
+  /** Extra commands for the epic's integration task, run after the plan's baseline commands. */
+  verifyCommands?: string[];
+  subtasks: PlanSubtask[];
+  /** The lead's integration task, depending on all of this epic's subtasks. */
+  taskId?: string;
+}
+
+export interface WorkPlan {
+  summary: string;
+  epics: PlanEpic[];
+  /** Claude's proposal for how to build and test this goal's project; the CEO confirms or edits it. */
+  verifyCommands?: string[];
+}
+
+/**
+ * Where this plan's code lives and how it is verified. Every task the plan
+ * creates runs exactly these commands in exactly this directory — a plan
+ * can't be approved without them, so no task falls back to a global
+ * command that may be testing some other project.
+ */
+export interface PlanProject {
+  dir: string;
+  verifyCommands: string[];
+  /** Set once the CEO edits the commands — a later redraft then keeps them instead of Claude's new proposal. */
+  commandsByCeo?: boolean;
+  /** Vietnamese notes about the directory (e.g. it already holds other files). */
+  warnings: string[];
+  /** Vietnamese notes about the verification commands (e.g. an iOS build that isn't what Xcode's Run does). */
+  commandWarnings?: string[];
+  /**
+   * When a task's dependents may start. "done" = only after the CEO
+   * approved it — the default when repairing an existing project, where
+   * building on an unapproved fix spreads its mistakes.
+   */
+  handoffOn?: "checkpoint_final" | "done";
+  /**
+   * Results with no red warning, approved by the reviewers, ship without
+   * waiting for the CEO; red-warning ones still wait. Off unless the CEO
+   * turns it on for the plan.
+   */
+  autoApprove?: boolean;
+  /** Skip Claude's final review on a subtask Gemini approved with nothing flagged (integration tasks and CEO revisions always get it). */
+  skipClaudeReviewWhenGreen?: boolean;
+  /** Give the project its own (private) GitHub repository on approval and push every approved task to it. */
+  githubRepo?: boolean;
+  /** That repository, once created (or the folder's existing origin). */
+  githubUrl?: string;
+}
+
+/** Every verification command in a plan: the baseline, plus each epic's and subtask's own. */
+export function allPlanCommands(baseline: string[], epics: PlanEpic[] = []): string[] {
+  return [...baseline, ...epics.flatMap((e) => [...(e.verifyCommands ?? []), ...e.subtasks.flatMap((s) => s.verifyCommands ?? [])])];
+}
+
+/**
+ * Commands that check the wrong thing: an iOS build for "generic/platform=iOS
+ * Simulator" succeeded while Xcode's Run (a concrete simulator) failed, and
+ * "python3 -I -m <package>" can never import the project's own code.
+ */
+export function commandWarnings(commands: string[]): string[] {
+  const out: string[] = [];
+  const builds = commands.filter((c) => /\bxcodebuild\b/.test(c) && /\b(build|test)\b/.test(c) && /iOS Simulator/i.test(c));
+  if (builds.length && builds.every((c) => /generic\/platform=iOS Simulator/i.test(c))) {
+    out.push(
+      'Lệnh build iOS chỉ dùng "generic/platform=iOS Simulator" — khác với khi bấm Run trong Xcode (một máy cụ thể), có lỗi chỉ hiện ở máy cụ thể. Nên thêm một lệnh build với -destination \'platform=iOS Simulator,name=<tên iPhone>\'.',
+    );
+  }
+  const isolated = commands.filter((c) => /\bpython3?(\.\d+)?\s+(-\w+\s+)*-[a-zA-Z]*[IP]/.test(c) && /\s-(m|c)\s/.test(c));
+  if (isolated.length) {
+    out.push(
+      `Lệnh Python chạy ở chế độ cô lập (-I/-P) sẽ không import được mã của chính dự án, kể cả khi code đúng — bỏ cờ đó: ${isolated.join(" · ")}`,
+    );
+  }
+  return out;
+}
+
+export type PlanStatus = "drafting" | "awaiting_approval" | "approved" | "failed" | "discarded";
+
+export interface WorkPlanRecord extends Partial<WorkPlan> {
+  id: string;
+  goal: string;
+  status: PlanStatus;
+  createdAt: string;
+  updatedAt: string;
+  /** Owner reassignments, dropped dependencies and similar fixes made while validating the draft. */
+  notes?: string[];
+  reviewRounds?: number;
+  /** Gemini's last objection, if the round limit ran out before it approved — shown to the CEO. */
+  unresolvedReview?: string;
+  revisionFeedback?: string;
+  error?: string;
+  project?: PlanProject;
+  /** Tokens/cost spent drafting and reviewing this plan. */
+  usage?: { input: number; output: number; costUsd: number };
+}
+
+export interface PlanLimits {
+  maxEpics: number;
+  maxSubtasks: number;
+}
+
+export const DEFAULT_PLAN_LIMITS: PlanLimits = { maxEpics: 3, maxSubtasks: 8 };
+
+const IGNORED_ENTRIES = new Set([".DS_Store", ".git", ".gitignore", ".gitkeep"]);
+
+/** What the CEO should know about a plan's project directory before approving: does it exist, and what's already in it. */
+export async function projectDirWarnings(dir: string): Promise<string[]> {
+  if (!path.isAbsolute(dir)) return [`"${dir}" không phải đường dẫn tuyệt đối.`];
+  let entries: string[];
+  try {
+    entries = (await readdir(dir)).filter((e) => !IGNORED_ENTRIES.has(e));
+  } catch {
+    return [`Thư mục chưa tồn tại — sẽ được tạo khi Muse ghi file đầu tiên.`];
+  }
+  if (!entries.length) return [];
+  const shown = entries.slice(0, 8).join(", ");
+  return [
+    `Thư mục đã có ${entries.length} mục (${shown}${entries.length > 8 ? ", …" : ""}). Nếu đó là dự án khác, code mới sẽ trộn vào và lệnh kiểm tra có thể chạy nhầm sang code cũ — nên dùng một thư mục riêng.`,
+  ];
+}
+
+/** A folder name for a goal: lowercase ASCII (Vietnamese accents dropped), words joined by dashes. */
+export function slugForGoal(goal: string, max = 50): string {
+  const slug = goal
+    .toLowerCase()
+    .normalize("NFD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .replace(/đ/g, "d")
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/^-+|-+$/g, "")
+    .slice(0, max)
+    .replace(/-+$/g, "");
+  return slug || "du-an";
+}
+
+/** A new, not-yet-existing folder under `root` named after the goal (adds -2, -3, ... instead of reusing one). */
+export async function newProjectDir(root: string, goal: string): Promise<string> {
+  const base = path.join(root, slugForGoal(goal));
+  for (let n = 1; ; n++) {
+    const candidate = n === 1 ? base : `${base}-${n}`;
+    try {
+      await readdir(candidate);
+    } catch {
+      return candidate;
+    }
+  }
+}
+
+export function newPlanId(): string {
+  return `plan-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`;
+}
+
+export function buildPlanPrompt(
+  goal: string,
+  departments: Department[],
+  limits: PlanLimits,
+  revision?: { previous?: WorkPlan; feedback: string },
+  environment?: string,
+  survey?: string,
+  playbook?: string,
+): string {
+  const leads = departments.filter((d) => d.tier === 2).map((d) => `${d.id} (${d.name})`).join(", ");
+  const roster = teamRoster(departments);
+  const staff = departments.filter((d) => d.tier === 3).map((d) => `${d.id} (${d.name})`).join(", ");
+  const parts = [
+    "PLAN: You are the boss (AG-01) of an AI software company. Break the company-wide goal below into a structured work tree BEFORE anyone starts work, so every task traces back to the goal instead of departments working on disconnected things.",
+    "Rules:",
+    `- 1 to ${limits.maxEpics} epics. Each epic is owned by exactly one team lead: ${leads}. The lead later integrates and verifies the epic as a whole.`,
+    `- Each epic has 1-4 subtasks, at most ${limits.maxSubtasks} subtasks in total. Each subtask is owned by one staff member whose specialty fits: ${staff}. A staff member may own more than one subtask.`,
+    ...(roster.length
+      ? [
+          "- The company is organised in teams. Give each epic to the lead of the team whose responsibility it is, and each of its subtasks to a staff member of THAT team whose specialty fits. Borrow someone from another team only when the epic's own team has no one with the needed specialty, and say so in that subtask's rationale. The quality team checks and hardens the others' work; don't give it new features to build.",
+          "- Teams:",
+          ...roster,
+        ]
+      : []),
+    "- Every subtask must be concrete, implementable and verifiable in code, and contribute directly to the goal. No vague research or documentation subtasks unless the goal itself needs them.",
+    "- acceptanceCriteria: 2-5 specific, testable statements per epic and per subtask — things a reviewer can check by running the code or its tests.",
+    "- dependsOn: ids of subtasks (in any epic) that must finish first because this one consumes their output. No cycles. Leave it empty whenever work can proceed in parallel.",
+    "- rationale: one sentence per epic and subtask on why that owner is the right one (their specialty vs. what the work needs). inputs: what the subtask builds on — which part of the goal, which other subtask's output.",
+    "- Write titles, descriptions, criteria, rationale and inputs in the same language as the goal.",
+    "- verifyCommands (top level): the BASELINE shell commands, in order, that every task runs from the project's root directory to build this goal's project and run its tests for real (e.g. \"swift build\", \"swift test\", \"npm test\"). They are the only proof the code works, so they must exercise this goal's own code and its tests — never a placeholder like echo or true. Every task must be able to pass them once its own work is done, so don't put a check here that only a later task can make pass.",
+    "- verifyCommands on a subtask or epic: extra commands, run after the baseline, that exercise exactly the files that task writes and the baseline doesn't cover — e.g. \"python3 -m pytest -q content/scripts/test_x.py\", \"bash -n scripts/run.sh\", running a generator script and building what it produces. Every kind of file a task writes (Python, shell, generators, configs) must be exercised by the baseline or by its own commands. All commands run in a disposable copy of the project, so commands with side effects are safe.",
+    "- Never use python3 -I (or -P) in a command that runs or imports the project's own code (python3 -m <package>, python3 -c \"import <package>...\"): isolated mode drops the project directory from sys.path, so the import fails however correct the code is — a task once failed 15 attempts on this alone. Plain python3 runs from the project root, which is what these commands need.",
+    "- An iOS app build must target a concrete simulator, the way Xcode's Run does: xcodebuild ... build -destination 'platform=iOS Simulator,name=<an installed iPhone simulator>'. \"generic/platform=iOS Simulator\" alone is not enough — it passed while Run on a real simulator failed.",
+    "You have no tools in this step and cannot read any files: plan from the goal text alone. If the goal says files must be read or inspected, that is work for the tasks — each task's architecture step can open the project's files — so put it into their descriptions instead of trying to do it now.",
+    "Reply with ONLY one JSON object, no prose before or after, in exactly this shape:",
+    '{"summary": "...", "epics": [{"id": "E1", "title": "...", "owner": "AG-05", "goal": "...", "rationale": "...", "acceptanceCriteria": ["..."], "subtasks": [{"id": "E1.S1", "title": "...", "owner": "AG-03", "description": "...", "rationale": "...", "inputs": "...", "acceptanceCriteria": ["..."], "dependsOn": [], "verifyCommands": []}], "verifyCommands": []}], "verifyCommands": ["..."]}',
+    ...(environment ? ["", `This machine: ${environment}`] : []),
+    ...(survey
+      ? [
+          "",
+          "Automatic survey of the existing project directory (you cannot read files, this is what's there). Every file it reports as failing its checks, and every test file with no tests, must be fixed by some subtask — name those files in the subtasks' descriptions:",
+          survey,
+        ]
+      : []),
+    ...(playbook ? [playbook.trim()] : []),
+    "",
+    `Company-wide goal: ${goal}`,
+  ];
+  if (revision) {
+    if (revision.previous) parts.push("", `Your previous plan:\n${JSON.stringify(revision.previous)}`);
+    parts.push("", `Revise it to address this feedback (keep what wasn't criticized):\n${revision.feedback}`);
+  }
+  return parts.join("\n");
+}
+
+const PLAN_REVIEW_PROMPT =
+  "REVIEW: You are reviewing the boss's work plan before the CEO sees it and before any team starts. Check that: the epics and subtasks together actually achieve the goal (nothing important missing, nothing off-goal); each subtask is concrete and owned by a fitting specialist; acceptance criteria are specific and testable; dependencies are real and don't serialize work that could run in parallel. " +
+  "Also check verifyCommands: they must really build and test this goal's code (not a placeholder, not some other project). " +
+  "Approve if it's sound. Otherwise reject and list exactly what to change (which epic/subtask, what to add/remove/reword). " +
+  VERDICT_INSTRUCTION;
+
+function extractJson(text: string): string {
+  const fenced = text.match(/```(?:json)?\s*\n([\s\S]*?)\n```/);
+  if (fenced) return fenced[1];
+  const start = text.indexOf("{");
+  const end = text.lastIndexOf("}");
+  if (start === -1 || end <= start) throw new Error("no JSON object found in the reply");
+  return text.slice(start, end + 1);
+}
+
+function asStringArray(value: unknown, where: string): string[] {
+  if (typeof value === "string" && value.trim()) return [value.trim()];
+  if (!Array.isArray(value)) throw new Error(`${where}: acceptanceCriteria must be a list of strings`);
+  const items = value.filter((v): v is string => typeof v === "string" && v.trim().length > 0).map((v) => v.trim());
+  if (items.length === 0) throw new Error(`${where}: acceptanceCriteria is empty`);
+  return items;
+}
+
+function commandList(value: unknown): string[] {
+  return Array.isArray(value)
+    ? value.filter((c: unknown): c is string => typeof c === "string" && c.trim().length > 0).map((c: string) => c.trim())
+    : [];
+}
+
+function requireString(value: unknown, where: string): string {
+  if (typeof value !== "string" || !value.trim()) throw new Error(`${where} is missing`);
+  return value.trim();
+}
+
+/** Throws (with a message meant to be sent back to the planner) if `deps` has a cycle. */
+function assertAcyclic(deps: Map<string, string[]>): void {
+  const state = new Map<string, "visiting" | "done">();
+  const visit = (id: string, trail: string[]): void => {
+    if (state.get(id) === "done") return;
+    if (state.get(id) === "visiting") throw new Error(`dependency cycle: ${[...trail, id].join(" -> ")}`);
+    state.set(id, "visiting");
+    for (const next of deps.get(id) ?? []) visit(next, [...trail, id]);
+    state.set(id, "done");
+  };
+  for (const id of deps.keys()) visit(id, []);
+}
+
+/**
+ * Parses and validates the planner's reply. Structural problems the planner
+ * should fix itself (bad JSON, missing fields, cycles, too many subtasks)
+ * throw, so the caller can send the message back for another attempt.
+ * Problems with an obvious safe fix (an owner from the wrong tier, a
+ * dependency on an id that doesn't exist) are fixed here and listed in
+ * `notes` so the CEO sees what was changed.
+ */
+export function parsePlan(text: string, departments: Department[], limits: PlanLimits = DEFAULT_PLAN_LIMITS): { plan: WorkPlan; notes: string[] } {
+  let raw: any;
+  try {
+    raw = JSON.parse(extractJson(text));
+  } catch (err) {
+    throw new Error(`reply was not valid JSON (${(err as Error).message})`);
+  }
+  if (!Array.isArray(raw?.epics) || raw.epics.length === 0) throw new Error("plan has no epics");
+  if (raw.epics.length > limits.maxEpics) throw new Error(`plan has ${raw.epics.length} epics, the limit is ${limits.maxEpics}`);
+
+  const leads = departments.filter((d) => d.tier === 2).map((d) => d.id);
+  const staff = departments.filter((d) => d.tier === 3).map((d) => d.id);
+  const notes: string[] = [];
+  let leadTurn = 0;
+  let staffTurn = 0;
+  const seen = new Set<string>();
+
+  const epics: PlanEpic[] = raw.epics.map((e: any, ei: number) => {
+    const epicId = requireString(e?.id, `epic #${ei + 1} id`);
+    if (seen.has(epicId)) throw new Error(`duplicate id ${epicId}`);
+    seen.add(epicId);
+    let owner = typeof e?.owner === "string" ? e.owner.trim() : "";
+    if (!leads.includes(owner)) {
+      const fixed = leads[leadTurn++ % leads.length];
+      notes.push(`Epic ${epicId}: owner "${owner || "(none)"}" is not a team lead — reassigned to ${fixed}.`);
+      owner = fixed;
+    }
+    if (!Array.isArray(e?.subtasks) || e.subtasks.length === 0) throw new Error(`epic ${epicId} has no subtasks`);
+    const subtasks: PlanSubtask[] = e.subtasks.map((s: any, si: number) => {
+      const subId = requireString(s?.id, `subtask #${si + 1} of ${epicId} id`);
+      if (seen.has(subId)) throw new Error(`duplicate id ${subId}`);
+      seen.add(subId);
+      let subOwner = typeof s?.owner === "string" ? s.owner.trim() : "";
+      const epicTeam = departments.find((d) => d.id === owner)?.team;
+      if (!staff.includes(subOwner)) {
+        // Prefer someone from the epic's own team.
+        const own = epicTeam ? staff.filter((id) => departments.find((d) => d.id === id)?.team === epicTeam) : [];
+        const pool = own.length ? own : staff;
+        const fixed = pool[staffTurn++ % pool.length];
+        notes.push(`Subtask ${subId}: owner "${subOwner || "(none)"}" is not a staff member — reassigned to ${fixed}.`);
+        subOwner = fixed;
+      } else if (epicTeam) {
+        const subTeam = departments.find((d) => d.id === subOwner)?.team;
+        if (subTeam && subTeam !== epicTeam) notes.push(`Subtask ${subId}: ${subOwner} is borrowed from team "${subTeam}" for epic ${epicId} (team "${epicTeam}").`);
+      }
+      return {
+        id: subId,
+        title: requireString(s?.title, `subtask ${subId} title`),
+        owner: subOwner,
+        description: typeof s?.description === "string" && s.description.trim() ? s.description.trim() : requireString(s?.title, `subtask ${subId} title`),
+        acceptanceCriteria: asStringArray(s?.acceptanceCriteria, `subtask ${subId}`),
+        dependsOn: Array.isArray(s?.dependsOn) ? s.dependsOn.filter((d: unknown): d is string => typeof d === "string").map((d: string) => d.trim()) : [],
+        rationale: typeof s?.rationale === "string" ? s.rationale.trim() : "",
+        inputs: typeof s?.inputs === "string" ? s.inputs.trim() : "",
+        verifyCommands: commandList(s?.verifyCommands),
+      };
+    });
+    return {
+      id: epicId,
+      title: requireString(e?.title, `epic ${epicId} title`),
+      owner,
+      goal: typeof e?.goal === "string" ? e.goal.trim() : "",
+      acceptanceCriteria: asStringArray(e?.acceptanceCriteria, `epic ${epicId}`),
+      rationale: typeof e?.rationale === "string" ? e.rationale.trim() : "",
+      verifyCommands: commandList(e?.verifyCommands),
+      subtasks,
+    };
+  });
+
+  const allSubtasks = epics.flatMap((e) => e.subtasks);
+  if (allSubtasks.length > limits.maxSubtasks) throw new Error(`plan has ${allSubtasks.length} subtasks, the limit is ${limits.maxSubtasks}`);
+  const subIds = new Set(allSubtasks.map((s) => s.id));
+  for (const s of allSubtasks) {
+    const kept = s.dependsOn.filter((d) => d !== s.id && subIds.has(d));
+    const dropped = s.dependsOn.filter((d) => !kept.includes(d));
+    if (dropped.length) notes.push(`Subtask ${s.id}: dropped unknown/self dependencies ${dropped.join(", ")}.`);
+    s.dependsOn = [...new Set(kept)];
+  }
+  assertAcyclic(new Map(allSubtasks.map((s) => [s.id, s.dependsOn])));
+
+  const verifyCommands = commandList(raw.verifyCommands);
+  if (!verifyCommands.length) notes.push("Plan: Claude proposed no verification commands — set them before approving.");
+  return { plan: { summary: typeof raw.summary === "string" ? raw.summary.trim() : "", epics, verifyCommands }, notes };
+}
+
+/** Plain-text rendering of a plan, for the reviewer. */
+export function renderPlan(plan: WorkPlan): string {
+  const lines = [`Summary: ${plan.summary}`];
+  for (const e of plan.epics) {
+    lines.push("", `${e.id} [lead ${e.owner}] ${e.title} — ${e.goal}`, `  Why this lead: ${e.rationale || "(not given)"}`, ...e.acceptanceCriteria.map((c) => `  AC: ${c}`));
+    for (const s of e.subtasks) {
+      lines.push(`  ${s.id} [${s.owner}] ${s.title}${s.dependsOn.length ? ` (after ${s.dependsOn.join(", ")})` : ""}`, `    ${s.description}`, `    Why this owner: ${s.rationale || "(not given)"} · Builds on: ${s.inputs || "(not given)"}`);
+      lines.push(...s.acceptanceCriteria.map((c) => `    AC: ${c}`));
+      if (s.verifyCommands?.length) lines.push(`    Own verifyCommands: ${s.verifyCommands.join(" && ")}`);
+    }
+  }
+  lines.push("", `Baseline verifyCommands (every task): ${plan.verifyCommands?.length ? plan.verifyCommands.join(" && ") : "(none proposed)"}`);
+  for (const e of plan.epics) if (e.verifyCommands?.length) lines.push(`${e.id} integration verifyCommands: ${e.verifyCommands.join(" && ")}`);
+  return lines.join("\n");
+}
+
+export interface PlanDraftResult {
+  plan: WorkPlan;
+  notes: string[];
+  rounds: number;
+  unresolvedReview?: string;
+}
+
+/**
+ * Claude drafts, Gemini reviews, Claude revises — up to maxRounds — so the
+ * plan is cross-checked by another bot before the CEO sees it. If the
+ * rounds run out with Gemini still objecting, the latest plan goes to the
+ * CEO anyway with Gemini's objection attached, rather than blocking.
+ */
+export async function draftAndReviewPlan(
+  agents: { claude: Agent; gemini: Agent },
+  goal: string,
+  departments: Department[],
+  opts: {
+    maxRounds: number;
+    limits?: PlanLimits;
+    revisionFeedback?: string;
+    previous?: WorkPlan;
+    send?: SendOptions;
+    onRound?: (round: number, phase: "draft" | "review") => void;
+    /** Facts about this machine the plan's commands depend on (e.g. installed iOS simulators). */
+    environment?: string;
+    /** formatSurvey() of the project directory, when it already has files. */
+    survey?: string;
+    /** The boss's playbook (planning standards and lessons), added to every draft prompt. */
+    playbook?: string;
+  },
+): Promise<PlanDraftResult> {
+  const limits = opts.limits ?? DEFAULT_PLAN_LIMITS;
+  let feedback = opts.revisionFeedback;
+  let previous = opts.previous;
+  let last: { plan: WorkPlan; notes: string[] } | undefined;
+  let lastObjection: string | undefined;
+
+  for (let round = 1; round <= opts.maxRounds; round++) {
+    opts.onRound?.(round, "draft");
+    const prompt = buildPlanPrompt(goal, departments, limits, feedback ? { previous, feedback } : undefined, opts.environment, opts.survey, opts.playbook);
+    const draft = await agents.claude.send(prompt, { title: goal }, opts.send);
+    if (FAKE_TOOL_CALL_RE.test(draft.content)) {
+      feedback =
+        "Your previous reply tried to run a tool or command. You have no tools in this step and cannot read files — plan from the goal text alone, and leave any file reading to the tasks' architecture step. Reply with only the JSON object in the required shape.";
+      continue;
+    }
+    try {
+      last = parsePlan(draft.content, departments, limits);
+    } catch (err) {
+      feedback = `Your previous reply could not be used: ${(err as Error).message}. Reply with only the JSON object in the required shape.`;
+      continue;
+    }
+
+    opts.onRound?.(round, "review");
+    let verdict: "approve" | "reject" | undefined;
+    let reviewText = "";
+    try {
+      const review = await sendReview(agents.gemini, PLAN_REVIEW_PROMPT, { title: goal, ideaBrief: renderPlan(last.plan) }, opts.send);
+      verdict = review.verdict;
+      reviewText = review.content;
+    } catch (err) {
+      return { ...last, rounds: round, unresolvedReview: `Gemini could not review the plan (${(err as Error).message}).` };
+    }
+    if (verdict === "approve") return { ...last, rounds: round };
+    lastObjection = reviewText;
+    feedback = `Gemini (independent reviewer) rejected the plan:\n${reviewText}`;
+    previous = last.plan;
+  }
+
+  if (!last) throw new Error(`Claude did not produce a usable plan in ${opts.maxRounds} attempt(s): ${feedback ?? ""}`);
+  return { ...last, rounds: opts.maxRounds, unresolvedReview: lastObjection };
+}
+
+function sharedBriefFor(record: WorkPlanRecord, plan: WorkPlan, epic: PlanEpic, ownId?: string): string {
+  const others = plan.epics
+    .flatMap((e) => e.subtasks.map((s) => ({ e, s })))
+    .filter(({ s }) => s.id !== ownId)
+    .map(({ s }) => `- ${s.id} (${s.owner}): ${s.title}`);
+  return [
+    `Company goal: ${record.goal}`,
+    plan.summary ? `Plan summary: ${plan.summary}` : "",
+    `Your epic: ${epic.id} — ${epic.title}${epic.goal ? `: ${epic.goal}` : ""}`,
+    `Epic acceptance criteria:\n${epic.acceptanceCriteria.map((c) => `- ${c}`).join("\n")}`,
+    others.length ? `Other work in this plan, owned by teammates (don't duplicate it):\n${others.join("\n")}` : "",
+  ]
+    .filter(Boolean)
+    .join("\n\n");
+}
+
+/**
+ * Turns an approved plan into tasks: one per subtask (owned by its staff
+ * member, depending on the tasks for its dependsOn subtasks) plus one
+ * integration task per epic (owned by its lead, depending on every subtask
+ * in the epic). Writes the created task ids back into the plan.
+ */
+export function materializePlan(record: WorkPlanRecord, projectConfig?: ProjectConfig): TaskRecord[] {
+  if (!record.epics) throw new Error("plan has no epics to materialize");
+  // Each task runs the plan's baseline plus its own commands, so a task's
+  // Python or shell files are actually exercised — the baseline alone
+  // (e.g. only Swift/Xcode builds) let broken ones through.
+  const forTask = (own?: string[]): ProjectConfig | undefined =>
+    projectConfig && { ...projectConfig, verifyCommands: [...new Set([...projectConfig.verifyCommands, ...(own ?? [])])] };
+  const plan: WorkPlan = { summary: record.summary ?? "", epics: record.epics };
+  const tasks: TaskRecord[] = [];
+  const taskIdBySubtask = new Map<string, string>();
+  const pending: { task: TaskRecord; deps: string[] }[] = [];
+
+  for (const epic of plan.epics) {
+    for (const s of epic.subtasks) {
+      const task = createPlannedTask(
+        {
+          title: `${s.id} · ${s.title}`,
+          slotId: s.owner,
+          ideaBrief: s.description,
+          acceptanceCriteria: s.acceptanceCriteria,
+          sharedBrief: sharedBriefFor(record, plan, epic, s.id),
+          planRef: { planId: record.id, epicId: epic.id, subtaskId: s.id },
+        },
+        forTask(s.verifyCommands),
+      );
+      s.taskId = task.id;
+      taskIdBySubtask.set(s.id, task.id);
+      pending.push({ task, deps: s.dependsOn });
+      tasks.push(task);
+      trace(
+        task,
+        "AG-01 (Claude)",
+        "assign",
+        `Assigned ${s.id} to ${s.owner}: ${s.rationale || "(no reason given)"}` +
+          `${s.inputs ? ` · Builds on: ${s.inputs}` : ""}${s.dependsOn.length ? ` · Waits for: ${s.dependsOn.join(", ")}` : ""}`,
+      );
+      for (const note of notesFor(record, s.id)) trace(task, "System", "note", note);
+    }
+  }
+  for (const { task, deps } of pending) {
+    task.dependsOn = deps.map((d) => taskIdBySubtask.get(d)!).filter(Boolean);
+  }
+
+  for (const epic of plan.epics) {
+    const task = createPlannedTask(
+      {
+        title: `${epic.id} · Nghiệm thu & tích hợp: ${epic.title}`,
+        slotId: epic.owner,
+        ideaBrief:
+          `Integrate and verify epic ${epic.id} (${epic.title}) as a whole: make the subtasks' outputs (see upstream handoffs) work together, ` +
+          "fix any seams between them, and add integration tests proving the epic's acceptance criteria end to end. Do not rebuild what the subtasks already delivered.",
+        acceptanceCriteria: epic.acceptanceCriteria,
+        sharedBrief: sharedBriefFor(record, plan, epic),
+        planRef: { planId: record.id, epicId: epic.id },
+      },
+      forTask(epic.verifyCommands),
+    );
+    task.dependsOn = epic.subtasks.map((s) => s.taskId!).filter(Boolean);
+    epic.taskId = task.id;
+    tasks.push(task);
+    trace(
+      task,
+      "AG-01 (Claude)",
+      "assign",
+      `Integration of ${epic.id} assigned to its lead ${epic.owner}: ${epic.rationale || "(no reason given)"} · Waits for: ${epic.subtasks.map((s) => s.id).join(", ")}`,
+    );
+    for (const note of notesFor(record, epic.id)) trace(task, "System", "note", note);
+  }
+  for (const t of tasks) trace(t, "CEO", "gate", `Plan ${record.id} approved by the CEO.`);
+  return tasks;
+}
+
+/** Validation notes ("Subtask E1.S1: owner ... reassigned") that concern one plan item. */
+function notesFor(record: WorkPlanRecord, id: string): string[] {
+  return (record.notes ?? []).filter((n) => n.startsWith(`Subtask ${id}:`) || n.startsWith(`Epic ${id}:`));
+}
