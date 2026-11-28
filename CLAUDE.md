@@ -30,6 +30,22 @@ Công ty 16 vị trí / 5 khối (`src/org/roles.ts`): AG-01 Sếp; trưởng nh
 | `integrations/video/` | Tab "Auto Video": `service.ts` (máy trạng thái: nghiên cứu → kịch bản → **CEO duyệt** → giọng + ảnh → Remotion → **CEO xem** → đăng; một video mỗi lúc; file đặt tên theo hash để làm lại không vẽ lại ảnh cũ), `script.ts` (prompt + kiểm JSON), `providers.ts` (VieNeu-TTS chạy trên máy, tự bật server và nhớ giọng nhái · FLUX.2-klein-4B qua mflux: một tiến trình `mflux_worker.py` giữ model, mỗi lúc một ảnh · Openverse CC0 · Gemini ảnh · giả lập), `remotion/` (bố cục video + thumbnail), `lumreels.ts` (kiểu dựng thứ hai cho video giải thích: gửi lời đọc đã duyệt sang server LumReels, đợi MP4, đối chiếu lời đọc), `publish.ts` (YouTube resumable + Facebook Graph), dữ liệu ở `data/video/`. Đăng nhập YouTube: `npm run video:youtube-auth` |
 | `store/` | Ghi file nguyên tử vào `data/` (không commit) |
 
+## Repo bên ngoài của tab Auto Video
+
+Tab Auto Video chạy bằng các dự án mã nguồn mở dưới đây, đều cho dùng thương mại và đều chạy trên máy này (trừ dịch vụ web ở cuối). Phiên bản ghi là bản đã kiểm thử ngày 28/11/2026.
+
+| Việc | Repo / model | License | Nằm ở đâu trên máy | Phiên bản | Dashboard dùng thế nào |
+|---|---|---|---|---|---|
+| Giọng đọc tiếng Việt + nhái giọng | [pnnbao97/VieNeu-TTS](https://github.com/pnnbao97/VieNeu-TTS), model `pnnbao-ump/VieNeu-TTS-v3-Turbo` | Apache-2.0 (code + model) | Code `~/VieNeu-TTS` (cài bằng `uv sync`); model trong `~/.cache/huggingface/hub` | commit `2e3532f` | `VIENEU_DIR` → tự bật `uv run python -m apps.openai_speech` ở cổng 8765; giọng nhái lưu ở `data/video/voices/` |
+| Ảnh AI (phim + minh hoạ) | [mflux-community/mflux](https://github.com/mflux-community/mflux) + model [black-forest-labs/FLUX.2-klein-4B](https://huggingface.co/black-forest-labs/FLUX.2-klein-4B) | MIT (mflux) · Apache-2.0 (model) | mflux: `uv tool install mflux` (`~/.local/share/uv/tools/mflux`); model ~15 GB trong `~/.cache/huggingface/hub` | mflux 0.24.0 | `VIDEO_IMAGES=mflux` → tiến trình `src/integrations/video/mflux_worker.py`, 8-bit, giữ model trong RAM. **Không** dùng FLUX.2-klein-9B (giấy phép phi thương mại) |
+| Motion graphics cho video giải thích | [lumtekvn/lumreels](https://github.com/lumtekvn/lumreels) (bên trong dùng HyperFrames Apache-2.0, GSAP giấy phép riêng miễn phí) | MIT | `~/lumreels` (`npm install`, cần `ffmpeg` từ Homebrew) | commit `3e19833` | `LUMREELS_DIR` → tự bật `node server/server.mjs` cổng 4400 với `LUMREELS_SKIP_UPDATE=1`, Python của VieNeu. **Không cài edge-tts** |
+| Dựng video (kiểu ảnh + chuyển động) | [remotion-dev/remotion](https://github.com/remotion-dev/remotion) | Riêng: miễn phí cho cá nhân / công ty ≤ 3 người | `node_modules` của dự án này; Chrome headless tự tải lần đầu | `^4.0.547` (khoá trong `package-lock.json`) | `src/integrations/video/render.ts` + `remotion/` |
+| Ảnh thật cho video giải thích | [Openverse API](https://api.openverse.org) (WordPress) | Chỉ lấy ảnh CC0 / miền công cộng | Dịch vụ web, không cài | — | Bật mặc định, không key; `VIDEO_STOCK=none` để tắt |
+
+Đã cân nhắc và **không dùng**: Google TTS (tốn phí), Pexels (ngừng cấp key mới), edge-tts (dịch vụ Microsoft không chính thức), VieGem-ASR · viet-tts · v-tts · F5-TTS-Vietnamese · viXTTS · fish-speech · FLUX.2-klein-9B (model cấm thương mại).
+
+Cập nhật một repo: vào thư mục của nó `git pull` (hoặc `uv tool upgrade mflux`), chạy thử một video, rồi sửa cột phiên bản ở bảng này. Model đã tải nằm trong `~/.cache/huggingface/hub`: xoá thư mục đó là phải tải lại từ Hugging Face.
+
 ## Quy ước và bẫy
 
 - Store lấy `data/` từ `process.cwd()` lúc import: test dùng `process.chdir(tmp)` + `vi.resetModules()` + `import()` động (xem `test/scheduler.test.ts`).
